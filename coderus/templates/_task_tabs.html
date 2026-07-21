@@ -1,0 +1,4 @@
+<nav class="task-tabs" aria-label="任务类型">
+  <a{% if request.url.path.startswith('/tasks') %} class="active" aria-current="page"{% endif %} href="/tasks{% if selected_repository_id %}?repository={{ selected_repository_id }}{% endif %}">Issue 处理</a>
+  <a{% if request.url.path.startswith('/reviews') %} class="active" aria-current="page"{% endif %} href="/reviews{% if selected_repository_id %}?repository={{ selected_repository_id }}{% endif %}">代码检视</a>
+</nav>

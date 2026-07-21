@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% block title %}Issue · Coderus{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div><h1>Issue 收件箱</h1><p class="muted">{{ selected_repository.owner ~ '/' ~ selected_repository.name if selected_repository else '全部仓库' }} · {{ total_issues }} 条记录</p></div>
+  <form method="get" class="inline-form filter-form">
+    {% if selected_repository_id %}<input type="hidden" name="repository" value="{{ selected_repository_id }}">{% endif %}
+    <input type="search" name="q" value="{{ search_query }}" placeholder="搜索编号、标题或仓库" aria-label="搜索 Issue">
+    <select name="triage" aria-label="分诊状态" onchange="this.form.submit()">
+      <option value="discovered" {% if selected_triage == 'discovered' %}selected{% endif %}>待处理</option>
+      <option value="dispatched" {% if selected_triage == 'dispatched' %}selected{% endif %}>已派发</option>
+      <option value="ignored" {% if selected_triage == 'ignored' %}selected{% endif %}>已忽略</option>
+      <option value="all" {% if selected_triage == 'all' %}selected{% endif %}>全部</option>
+    </select>
+    <button class="button secondary" type="submit">搜索</button>
+  </form>
+</div>
+<nav class="repository-tabs" aria-label="仓库范围">
+  <a{% if not selected_repository %} class="active" aria-current="page"{% endif %} href="/issues?{{ repository_tab_query|safe }}">全部仓库</a>
+  {% for repository in repositories %}
+  <a{% if selected_repository and selected_repository.id == repository.id %} class="active" aria-current="page"{% endif %} href="/issues?{{ repository_tab_query|safe }}&repository={{ repository.id }}"><span>{{ forge_status[repository.provider].label }}</span> · {{ repository.owner }}/{{ repository.name }}</a>
+  {% endfor %}
+</nav>
+<section class="form-band">
+  <form method="post" action="/issues/manual" class="horizontal-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label>手动添加 Issue<input type="url" name="url" placeholder="https://github.com/owner/repository/issues/123 或 https://gitcode.com/owner/repository/issues/123" required></label>
+    <button class="button secondary" type="submit">添加</button>
+  </form>
+</section>
+<section class="workspace-section">
+  {% if issues %}
+  <div class="table-wrap"><table class="issue-table">
+    <thead><tr>{% if not selected_repository %}<th>仓库</th>{% endif %}<th>Issue</th><th>内容</th><th>状态</th><th>操作</th></tr></thead>
+    <tbody>
+    {% for issue in issues %}
+    <tr>
+      {% if not selected_repository %}<td>{{ issue.repository.owner }}/{{ issue.repository.name }}</td>{% endif %}
+      <td><a href="{{ issue.source_url }}" target="_blank" rel="noreferrer">#{{ issue.number }}</a></td>
+      <td class="title-cell"><a href="{{ issue.source_url }}" target="_blank" rel="noreferrer"><strong>{{ issue.title }}</strong></a>{% if issue.labels %}<div class="tag-line">{% for label in issue.labels %}<span class="tag">{{ label }}</span>{% endfor %}</div>{% endif %}</td>
+      <td>{% if issue.state != 'open' %}<span class="status neutral">Issue 已关闭</span>{% else %}<span class="status {{ status_tone(issue.triage_state) }}">{{ status_label(issue.triage_state) }}</span>{% endif %}</td>
+      <td>
+        {% if issue.triage_state == 'discovered' and issue.state == 'open' %}
+        <div class="issue-actions">
+          <details class="action-menu">
+            <summary class="button primary">派发</summary>
+            <form method="post" action="/issues/{{ issue.id }}/dispatch" class="compact-form">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              {% if selected_repository_id %}<input type="hidden" name="repository" value="{{ selected_repository_id }}">{% endif %}
+              <textarea name="instructions" rows="3" aria-label="补充说明" placeholder="补充说明（可选）"></textarea>
+              <button class="button primary" type="submit">确认派发</button>
+            </form>
+          </details>
+          {% if current_user.role == 'admin' %}
+          <details class="action-menu">
+            <summary class="button secondary danger-text">忽略</summary>
+            <form method="post" action="/issues/{{ issue.id }}/ignore" class="compact-form">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              {% if selected_repository_id %}<input type="hidden" name="repository" value="{{ selected_repository_id }}">{% endif %}
+              <textarea name="reason" rows="3" aria-label="忽略原因" placeholder="忽略原因（可选）"></textarea>
+              <button class="button danger" type="submit">确认忽略</button>
+            </form>
+          </details>
+          {% endif %}
+        </div>
+        {% elif issue.triage_state == 'ignored' and current_user.role == 'admin' %}
+        <form method="post" action="/issues/{{ issue.id }}/restore">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          {% if selected_repository_id %}<input type="hidden" name="repository" value="{{ selected_repository_id }}">{% endif %}
+          <button class="button secondary" type="submit">恢复</button>
+        </form>
+        {% else %}-{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}<p class="empty">当前筛选下没有 Issue</p>{% endif %}
+  {% if total_pages > 1 %}
+  <nav class="pagination" aria-label="Issue 分页">
+    {% if page > 1 %}<a class="button secondary" href="/issues?{{ pagination_query|safe }}&page={{ page - 1 }}">上一页</a>{% else %}<span></span>{% endif %}
+    <span>第 {{ page }} / {{ total_pages }} 页</span>
+    {% if page < total_pages %}<a class="button secondary" href="/issues?{{ pagination_query|safe }}&page={{ page + 1 }}">下一页</a>{% else %}<span></span>{% endif %}
+  </nav>
+  {% endif %}
+</section>
+{% endblock %}

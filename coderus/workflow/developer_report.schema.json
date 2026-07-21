@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "problem_description": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "[一-龥]"
+    },
+    "problem_reproduction": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "[一-龥]"
+    },
+    "solution": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "[一-龥]"
+    },
+    "change_validation": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "[一-龥]"
+    },
+    "regression_tests": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "[一-龥]"
+    },
+    "remaining_issues": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "[一-龥]"
+    }
+  },
+  "required": [
+    "problem_description",
+    "problem_reproduction",
+    "solution",
+    "change_validation",
+    "regression_tests",
+    "remaining_issues"
+  ],
+  "additionalProperties": false
+}

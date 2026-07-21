@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Coderus{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}?v=20260721.1">
+</head>
+<body class="{% if current_user %}app-shell{% else %}login-shell{% endif %}">
+  {% if current_user %}
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Coderus 工作台">
+      <span class="brand-mark" aria-hidden="true">C</span>
+      <span class="brand-word">Coderus</span>
+      <span class="brand-signal" aria-hidden="true"></span>
+    </a>
+    <nav aria-label="主导航">
+      <a{% if request.url.path == '/' %} class="active"{% endif %} href="/">工作台</a>
+      <a{% if request.url.path.startswith('/issues') %} class="active"{% endif %} href="/issues">Issue</a>
+      <a{% if request.url.path.startswith('/tasks') or request.url.path.startswith('/reviews') %} class="active"{% endif %} href="/tasks">任务</a>
+      {% if current_user.role == 'admin' %}
+      <a{% if request.url.path.startswith('/repositories') %} class="active"{% endif %} href="/repositories">仓库</a>
+      <a{% if request.url.path.startswith('/users') %} class="active"{% endif %} href="/users">用户</a>
+      <a{% if request.url.path.startswith('/system') %} class="active"{% endif %} href="/system">系统</a>
+      {% endif %}
+    </nav>
+    <div class="account">
+      <a href="/account" class="account-link">{{ current_user.username }}</a>
+      <form method="post" action="/logout">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button class="button quiet" type="submit">退出</button>
+      </form>
+    </div>
+  </header>
+  {% endif %}
+  <main class="page {% if not current_user %}auth-page{% endif %}">
+    {% if flash %}<div class="notice {{ flash.tone }}" role="status">{{ flash.message }}</div>{% endif %}
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

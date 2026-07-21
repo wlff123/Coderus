@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block title %}账号 · Coderus{% endblock %}
+{% block content %}
+<div class="page-head"><div><h1>账号</h1><p class="muted">{{ current_user.username }}</p></div></div>
+{% if error %}<p class="alert">{{ error }}</p>{% endif %}
+<section class="form-panel narrow-panel"><h2>修改密码</h2><form method="post" action="/account/password" class="stack-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label>当前密码<input type="password" name="current_password" autocomplete="current-password" required></label><label>新密码<input type="password" name="new_password" minlength="8" autocomplete="new-password" required></label><button class="button primary" type="submit">更新密码</button></form></section>
+{% endblock %}

@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% block title %}系统 · Coderus{% endblock %}
+{% block content %}
+{% set github = forge_status['github'] %}
+{% set gitcode = forge_status['gitcode'] %}
+<div class="page-head"><div><h1>系统</h1><p class="muted">运行配置与服务状态</p></div></div>
+<section class="workspace-section">
+  <div class="section-head"><h2>运行环境</h2></div>
+  <dl class="facts system-facts">
+    <div><dt>访问模式</dt><dd><span class="status {{ status_tone(checks.server_mode) }}">{{ status_label(checks.server_mode) }}</span></dd></div>
+    <div><dt>Codex 命令</dt><dd class="mono">{{ checks.codex_binary }}</dd></div>
+    <div><dt>模型认证</dt><dd><span class="status {{ 'ok' if checks.model_proxy else 'neutral' }}">{{ 'API 代理已配置' if checks.model_proxy else '使用本机 Codex 登录' }}</span></dd></div>
+    <div><dt>GitHub 发布</dt><dd><span class="status {{ 'ok' if github.publish else 'warning' }}">{{ '已就绪' if github.publish else '未配置 Token' }}</span></dd></div>
+    <div><dt>GitCode 发布</dt><dd><span class="status {{ 'ok' if gitcode.publish else ('warning' if gitcode.configured else 'neutral') }}">{{ '已就绪' if gitcode.publish else ('仅可同步 Issue' if gitcode.configured else '未配置 Token') }}</span></dd></div>
+    <div><dt>飞书通知</dt><dd><span class="status {{ 'ok' if checks.feishu else 'neutral' }}">{{ '已启用' if checks.feishu else '未启用' }}</span></dd></div>
+    <div><dt>当前版本</dt><dd class="mono">{{ release_status.current.release_id if release_status.current else '未启用版本化发布' }}</dd></div>
+    <div><dt>上一版本</dt><dd class="mono">{{ release_status.previous.release_id if release_status.previous else '未启用版本化发布' }}</dd></div>
+  </dl>
+</section>
+<section class="workspace-section">
+  <div class="section-head"><h2>GitHub 发布凭据</h2></div>
+  {% if github_credential.error %}<div class="credential-notice"><span class="status danger">不可用</span><span>{{ github_credential.error }}</span></div>{% endif %}
+  <dl class="facts system-facts">
+    <div><dt>保存状态</dt><dd><span class="status {{ 'ok' if github_credential.source == 'database' else 'neutral' }}">{{ '已加密保存' if github_credential.source == 'database' else ('使用环境变量' if github_credential.source == 'environment' else '未保存') }}</span></dd></div>
+    <div><dt>GitHub 用户</dt><dd>{{ github_credential.account_name or '-' }}</dd></div>
+    {% if github_credential.updated_at %}<div><dt>更新时间</dt><dd>{{ github_credential.updated_at.strftime('%Y-%m-%d %H:%M') }}</dd></div>{% endif %}
+  </dl>
+  {% if not github_credential.encryption_ready %}<div class="credential-notice warning"><span>{{ github_credential.encryption_error or '请先在 secrets.env 配置 CODERUS_CREDENTIAL_ENCRYPTION_KEY 并重启服务。' }}</span></div>{% endif %}
+  <form method="post" action="/system/github-credential" class="credential-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label>GitHub 用户名<input type="text" name="account_name" value="{{ github_credential.account_name or '' }}" autocomplete="username" required{% if not github_credential.encryption_ready %} disabled{% endif %}></label>
+    <label>Token<input type="password" name="token" autocomplete="new-password" required{% if not github_credential.encryption_ready %} disabled{% endif %}></label>
+    <button class="button primary" type="submit"{% if not github_credential.encryption_ready %} disabled{% endif %}>验证并保存</button>
+  </form>
+</section>
+<section class="workspace-section">
+  <div class="section-head"><h2>GitCode 凭据</h2></div>
+  {% if gitcode_credential.error %}<div class="credential-notice"><span class="status danger">不可用</span><span>{{ gitcode_credential.error }}</span></div>{% endif %}
+  <dl class="facts system-facts">
+    <div><dt>保存状态</dt><dd><span class="status {{ 'ok' if gitcode_credential.source == 'database' else 'neutral' }}">{{ '已加密保存' if gitcode_credential.source == 'database' else ('使用环境变量' if gitcode_credential.source == 'environment' else '未保存') }}</span></dd></div>
+    <div><dt>GitCode 用户</dt><dd>{{ gitcode_credential.account_name or '-' }}</dd></div>
+    {% if gitcode_credential.updated_at %}<div><dt>更新时间</dt><dd>{{ gitcode_credential.updated_at.strftime('%Y-%m-%d %H:%M') }}</dd></div>{% endif %}
+  </dl>
+  {% if not gitcode_credential.encryption_ready %}<div class="credential-notice warning"><span>{{ gitcode_credential.encryption_error or '请先在 secrets.env 配置 CODERUS_CREDENTIAL_ENCRYPTION_KEY 并重启服务。' }}</span></div>{% endif %}
+  <form method="post" action="/system/gitcode-credential" class="credential-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label>GitCode 用户名<input type="text" name="account_name" value="{{ gitcode_credential.account_name or '' }}" autocomplete="username" required{% if not gitcode_credential.encryption_ready %} disabled{% endif %}></label>
+    <label>Token<input type="password" name="token" autocomplete="new-password" required{% if not gitcode_credential.encryption_ready %} disabled{% endif %}></label>
+    <button class="button primary" type="submit"{% if not gitcode_credential.encryption_ready %} disabled{% endif %}>验证并保存</button>
+  </form>
+</section>
+<section class="workspace-section">
+  <div class="section-head"><h2>飞书机器人</h2></div>
+  {% if feishu_settings.error %}<div class="credential-notice"><span class="status danger">不可用</span><span>{{ feishu_settings.error }}</span></div>{% endif %}
+  <dl class="facts system-facts">
+    <div><dt>配置状态</dt><dd><span class="status {{ 'ok' if feishu_settings.app_id and feishu_settings.has_secret else 'neutral' }}">{{ '已配置' if feishu_settings.app_id and feishu_settings.has_secret else '未配置' }}</span></dd></div>
+    <div><dt>启用状态</dt><dd><span class="status {{ 'ok' if feishu_settings.enabled else 'neutral' }}">{{ '已启用' if feishu_settings.enabled else '未启用' }}</span></dd></div>
+    <div><dt>连接状态</dt><dd><span class="status {{ 'ok' if feishu_settings.running else ('warning' if feishu_settings.enabled else 'neutral') }}">{{ '运行中' if feishu_settings.running else ('等待重启' if feishu_settings.enabled else '未运行') }}</span></dd></div>
+    <div><dt>重启状态</dt><dd><span class="status {{ 'warning' if feishu_settings.restart_required else 'neutral' }}">{{ '需要重启' if feishu_settings.restart_required else '无需重启' }}</span></dd></div>
+    <div><dt>最近连接错误</dt><dd>{{ feishu_settings.connection_error or '-' }}</dd></div>
+    {% if feishu_settings.updated_at %}<div><dt>更新时间</dt><dd>{{ feishu_settings.updated_at.strftime('%Y-%m-%d %H:%M') }}</dd></div>{% endif %}
+  </dl>
+  {% if not feishu_settings.encryption_ready %}<div class="credential-notice warning"><span>{{ feishu_settings.encryption_error or '请先在 secrets.env 配置 CODERUS_CREDENTIAL_ENCRYPTION_KEY 并重启服务。' }}</span></div>{% endif %}
+  <form method="post" action="/system/feishu-bot" class="feishu-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label class="toggle-field"><input type="checkbox" name="enabled" value="true"{% if feishu_settings.enabled %} checked{% endif %}{% if not feishu_settings.encryption_ready %} disabled{% endif %}><span>启用机器人</span></label>
+    <label>App ID<input type="text" name="app_id" value="{{ feishu_settings.app_id or '' }}" autocomplete="off"{% if not feishu_settings.encryption_ready %} disabled{% endif %}></label>
+    <label>App Secret<input type="password" name="app_secret" autocomplete="new-password" placeholder="{{ '已配置，留空则保持不变' if feishu_settings.has_secret else '输入 App Secret' }}"{% if not feishu_settings.encryption_ready %} disabled{% endif %}></label>
+    <label>默认通知群 chat_id<input type="text" name="default_chat_id" value="{{ feishu_settings.default_chat_id or '' }}" autocomplete="off"{% if not feishu_settings.encryption_ready %} disabled{% endif %}></label>
+    <div class="feishu-actions"><button class="button primary" type="submit"{% if not feishu_settings.encryption_ready %} disabled{% endif %}>验证并保存</button></div>
+  </form>
+  <form method="post" action="/system/feishu-bot/test" class="feishu-test-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="button" type="submit"{% if not feishu_settings.app_id or not feishu_settings.has_secret or not feishu_settings.default_chat_id %} disabled{% endif %}>发送测试消息</button>
+  </form>
+</section>
+<section class="metrics" aria-label="并发配置"><div><strong>{{ request.app.state.settings.scheduler.global_task_limit }}</strong><span>全局并行任务</span></div><div><strong>{{ request.app.state.settings.scheduler.per_user_task_limit }}</strong><span>单用户并行任务</span></div><div><strong>{{ request.app.state.settings.scheduler.max_agent_processes }}</strong><span>Agent 进程上限</span></div></section>
+<section class="workspace-section">
+  <div class="section-head"><h2>运行诊断</h2></div>
+  <dl class="facts system-facts">
+    <div><dt>服务地址</dt><dd class="mono">{{ checks.service_url }}</dd></div>
+    <div><dt>任务调度</dt><dd><span class="status {{ 'ok' if checks.scheduler else 'warning' }}">{{ '运行中' if checks.scheduler else '未启动' }}</span></dd></div>
+    <div><dt>数据库</dt><dd class="mono">{{ checks.database_path }}</dd></div>
+    <div><dt>工作区</dt><dd class="mono">{{ checks.workspace_path }}</dd></div>
+    <div><dt>可用空间</dt><dd>{{ '%.1f'|format(checks.workspace_free_gib) }} GiB</dd></div>
+    <div><dt>任务状态</dt><dd>{{ checks.running_tasks }} 个运行中任务，{{ checks.queued_tasks }} 个排队任务</dd></div>
+  </dl>
+</section>
+{% endblock %}

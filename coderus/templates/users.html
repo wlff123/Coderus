@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}用户 · Coderus{% endblock %}
+{% block content %}
+<div class="page-head"><div><h1>用户</h1><p class="muted">账号与访问状态</p></div></div>
+<section class="split-layout">
+  <div class="workspace-section">
+    <div class="section-head"><h2>用户列表</h2></div>
+    <div class="table-wrap"><table><thead><tr><th>用户名</th><th>角色</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead>
+    <tbody>{% for user in users %}<tr><td>{{ user.username }}</td><td>{{ '管理员' if user.role == 'admin' else '用户' }}</td><td><span class="status {{ 'ok' if user.is_active else 'danger' }}">{{ '启用' if user.is_active else '停用' }}</span></td><td>{{ user.created_at.strftime('%Y-%m-%d %H:%M') }}</td><td>{% if user.id != current_user.id %}<div class="row-actions"><form method="post" action="/users/{{ user.id }}/toggle"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="button secondary{% if user.is_active %} danger-text{% endif %}" type="submit">{{ '停用' if user.is_active else '启用' }}</button></form><details class="action-menu"><summary class="button secondary">重置密码</summary><form method="post" action="/users/{{ user.id }}/reset-password" class="compact-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="password" name="password" minlength="8" placeholder="输入新密码" autocomplete="new-password" required><button class="button primary" type="submit">确认重置</button></form></details></div>{% else %}-{% endif %}</td></tr>{% endfor %}</tbody></table></div>
+  </div>
+  <aside class="form-panel">
+    <h2>添加用户</h2>
+    <form method="post" action="/users" class="stack-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label>用户名<input name="username" minlength="3" maxlength="80" required></label>
+      <label>初始密码<input type="password" name="password" minlength="8" autocomplete="new-password" required></label>
+      <button class="button primary" type="submit">添加</button>
+    </form>
+  </aside>
+</section>
+{% endblock %}

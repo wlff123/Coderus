@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}仓库 · Coderus{% endblock %}
+{% block content %}
+{% set running_repositories = repositories|selectattr('sync_status', 'equalto', 'running')|list %}
+<div class="page-head">
+  <div><h1>仓库</h1><p class="muted">管理员授权的公共代码仓</p></div>
+  <form method="post" action="/repositories/sync-all"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="button secondary" type="submit"{% if running_repositories %} disabled{% endif %}>{{ '同步中' if running_repositories else '刷新全部' }}</button></form>
+</div>
+<section class="split-layout">
+  <div class="workspace-section">
+    <div class="section-head"><h2>授权仓库</h2></div>
+    {% if repositories %}<div class="table-wrap"><table>
+      <thead><tr><th>仓库</th><th>默认分支</th><th>Fork</th><th>发布能力</th><th>同步状态</th><th>最后同步</th><th>操作</th></tr></thead>
+      <tbody>{% for repository in repositories %}{% set forge = forge_status[repository.provider] %}<tr>
+        <td><a href="{{ repository.canonical_url }}" target="_blank" rel="noreferrer"><strong>{{ repository.owner }}/{{ repository.name }}</strong></a>{% if not repository.is_enabled %} <span class="status danger">已停用</span>{% endif %}<div class="tag-line">{{ forge.label }}</div></td>
+        <td>{{ repository.default_branch }}</td>
+        <td>{% if repository.fork_url %}<a href="{{ repository.fork_url }}" target="_blank" rel="noreferrer">{{ repository.fork_owner }}</a>{% else %}<span class="muted">尚未创建</span>{% endif %}</td>
+        <td>{% if forge.publish %}<span class="status ok">可推送并创建 PR</span>{% else %}<span class="muted">{{ forge.label }} 发布未配置，无法推送或创建 PR。</span>{% endif %}</td>
+        <td><span class="status {{ status_tone(repository.sync_status) }}">{{ '同步中' if repository.sync_status == 'running' else status_label(repository.sync_status) }}</span>{% if repository.last_sync_error %}<div class="error-detail">{{ provider_error(repository.last_sync_error) }}</div>{% endif %}</td>
+        <td>{{ repository.last_synced_at.strftime('%Y-%m-%d %H:%M') if repository.last_synced_at else '-' }}</td>
+        <td><div class="row-actions">{% if repository.sync_status == 'running' %}<button class="button secondary" type="button" disabled aria-label="仓库正在同步">同步中</button><button class="button secondary" type="button" disabled>{{ '停用' if repository.is_enabled else '启用' }}</button>{% else %}<form method="post" action="/repositories/{{ repository.id }}/sync"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="button secondary" type="submit">刷新</button></form><form method="post" action="/repositories/{{ repository.id }}/toggle"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="button secondary" type="submit">{{ '停用' if repository.is_enabled else '启用' }}</button></form>{% endif %}</div></td>
+      </tr>{% endfor %}</tbody>
+    </table></div>{% else %}<p class="empty">尚未授权仓库</p>{% endif %}
+  </div>
+  <aside class="form-panel"><h2>添加公共仓库</h2><form method="post" action="/repositories" class="stack-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label>仓库链接<input type="url" name="url" placeholder="https://github.com/owner/repository 或 https://gitcode.com/owner/repository" required></label><button class="button primary" type="submit">验证并添加</button></form></aside>
+</section>
+{% endblock %}

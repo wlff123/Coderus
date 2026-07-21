@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}RV-{{ review.id }} · Coderus{% endblock %}
+{% block content %}
+{% include "_task_tabs.html" %}
+<div class="page-head">
+  <div><h1>RV-{{ review.id }}</h1><p class="muted">{{ review.repository.owner }}/{{ review.repository.name }} · PR #{{ review.pr_number }}</p></div>
+  <span class="status {{ review_status_tone(review.status) }}">{{ review_status_label(review.status) }}</span>
+</div>
+<section class="workspace-section">
+  <div class="section-head"><h2>检视信息</h2><a href="{{ review.pr_url }}" target="_blank" rel="noreferrer">查看 PR</a></div>
+  <dl class="facts review-facts">
+    <div><dt>平台</dt><dd>{{ forge_status[review.repository.provider].label }}</dd></div>
+    <div><dt>仓库</dt><dd>{{ review.repository.owner }}/{{ review.repository.name }}</dd></div>
+    <div><dt>PR</dt><dd><a href="{{ review.pr_url }}" target="_blank" rel="noreferrer">#{{ review.pr_number }}</a></dd></div>
+    <div><dt>基线提交</dt><dd class="mono">{{ review.base_sha or '-' }}</dd></div>
+    <div><dt>检视提交</dt><dd class="mono">{{ review.head_sha or '-' }}</dd></div>
+    <div><dt>创建时间</dt><dd>{{ review.created_at.strftime('%Y-%m-%d %H:%M') }}</dd></div>
+    <div><dt>开始时间</dt><dd>{{ review.started_at.strftime('%Y-%m-%d %H:%M') if review.started_at else '-' }}</dd></div>
+    <div><dt>完成时间</dt><dd>{{ review.finished_at.strftime('%Y-%m-%d %H:%M') if review.finished_at else '-' }}</dd></div>
+    <div><dt>发布结果</dt><dd>{% if review.comment_url %}<a href="{{ review.comment_url }}" target="_blank" rel="noreferrer">查看 PR 评论</a>{% else %}-{% endif %}</dd></div>
+  </dl>
+</section>
+{% if review.failure_code or review.failure_summary %}
+<section class="task-banner danger review-failure">
+  <div class="task-banner-copy"><strong>检视失败{% if review.failure_code %} · {{ review.failure_code }}{% endif %}</strong><span>{{ review.failure_summary or '未提供失败详情' }}</span></div>
+</section>
+{% endif %}
+<section class="workspace-section">
+  <div class="section-head"><h2>检视意见</h2><span class="muted">{{ findings|length }} 条</span></div>
+  {% if findings %}<div class="review-findings">
+    {% for finding in findings %}
+    <article class="review-finding">
+      <div class="review-finding-head"><span class="status {{ 'danger' if finding.get('priority') in ['P0', 'P1'] else 'warning' }}">{{ finding.get('priority', '未知') }}</span><strong>{{ finding.get('title', '未命名问题') }}</strong></div>
+      <p class="review-location mono">{{ finding.get('file_path', '-') }}:{{ finding.get('line_start', '-') }}-{{ finding.get('line_end', '-') }}</p>
+      <dl class="review-finding-body">
+        <div><dt>问题</dt><dd>{{ finding.get('problem', '-') }}</dd></div>
+        <div><dt>影响</dt><dd>{{ finding.get('impact', '-') }}</dd></div>
+        <div><dt>建议</dt><dd>{{ finding.get('suggestion', '-') }}</dd></div>
+      </dl>
+    </article>
+    {% endfor %}
+  </div>
+  {% elif review.status == 'completed' %}<p class="empty">未发现需要处理的代码问题</p>
+  {% elif review.status == 'failed' %}<p class="empty">检视失败，未生成可用意见</p>
+  {% else %}<p class="empty">检视结果尚未生成</p>{% endif %}
+</section>
+{% endblock %}

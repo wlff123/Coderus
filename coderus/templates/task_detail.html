@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block title %}RE-{{ task.id }} · Coderus{% endblock %}
+{% block content %}
+{% if task.status in ['queued','preparing','developer_working','reviewing','developer_revising','sealing','publishing','cancelling'] %}<script>setTimeout(function(){ location.reload(); }, 5000);</script>{% endif %}
+{% include "_task_tabs.html" %}
+{% set forge = forge_status[provider] %}
+<div class="page-head">
+  <div><h1>RE-{{ task.id }}</h1><p class="muted">{{ task.issue.repository.owner }}/{{ task.issue.repository.name }} #{{ task.issue.number }}</p></div>
+  {% if (current_user.role == 'admin' or current_user.id == task.created_by) and task.status in ['queued','preparing','developer_working','reviewing','developer_revising','sealing','publishing','failed','manual_intervention','cancelled','awaiting_human_review'] %}
+  <div class="row-actions">
+    {% if task.status in ['queued','preparing','developer_working','reviewing','developer_revising','sealing','publishing'] %}<form method="post" action="/tasks/{{ task.id }}/cancel"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="button secondary" type="submit">取消</button></form>
+    {% else %}<form method="post" action="/tasks/{{ task.id }}/close"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="button secondary" type="submit" onclick="return confirm('关闭后仅归档 Coderus 任务并停止跟踪 PR，不会关闭或修改远端 PR。确定继续？')">关闭任务</button></form>{% endif %}
+  </div>
+  {% endif %}
+</div>
+<div class="task-banner {{ status_tone(task.status) }}">
+  <div class="task-banner-copy">
+    <strong>{{ status_label(task.status) }}</strong>
+    <span>{{ task_failure(task.failure_summary) if task.failure_summary and task.status != 'dismissed' else task_summary(task.status) }}</span>
+    {% if task.status in ['failed','manual_intervention'] and task.commit_sha and not forge.publish %}<small>{{ forge.label }} 发布未配置，请配置 Token 后再发布现有提交。</small>
+    {% elif task.status in ['failed','manual_intervention'] and not task.commit_sha %}<small>当前没有可发布的开发提交，请重新派发 Issue 或人工检查工作区。</small>
+    {% elif can_publish_wip %}<small>已有可发布提交，可以按现状创建 PR。</small>{% endif %}
+  </div>
+  {% if can_publish_wip and (current_user.role == 'admin' or current_user.id == task.created_by) %}<form method="post" action="/tasks/{{ task.id }}/publish-wip"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="button primary" type="submit">按现状发布 PR</button></form>{% endif %}
+</div>
+<section class="detail-grid">
+  <div class="workspace-section">
+    <div class="section-head"><h2>{{ task.issue.title }}</h2><a href="{{ task.issue.source_url }}" target="_blank" rel="noreferrer">查看 Issue</a></div>
+    <dl class="facts">
+      <div><dt>创建人</dt><dd>{{ task.creator.username }}</dd></div>
+      <div><dt>分支</dt><dd>{{ task.branch_name or '-' }}</dd></div>
+      <div><dt>基线提交</dt><dd class="mono">{{ task.base_commit_sha or '-' }}</dd></div>
+      <div><dt>开发提交</dt><dd class="mono">{{ task.commit_sha or '-' }}</dd></div>
+      <div><dt>PR</dt><dd>{% if task.pr_url %}<a href="{{ task.pr_url }}" target="_blank" rel="noreferrer">PR 已提交 #{{ task.pr_number }}</a>{% else %}-{% endif %}</dd></div>
+      <div><dt>开始时间</dt><dd>{{ task.started_at.strftime('%Y-%m-%d %H:%M') if task.started_at else '-' }}</dd></div>
+    </dl>
+  </div>
+  <aside class="form-panel">
+    <h2>执行进度</h2>
+    <ol class="stage-list">
+      <li class="{{ 'done' if task.agent_runs|selectattr('role', 'equalto', 'developer')|list else '' }}">开发与自测</li>
+      <li class="{{ 'done' if task.reviews else '' }}">代码检视</li>
+      <li class="{{ 'done' if task.agent_runs|selectattr('role', 'equalto', 'developer')|list|length > 1 or task.status in ['sealing','publishing','awaiting_human_review','completed'] else '' }}">集中修正</li>
+      <li class="{{ 'done' if task.pr_url else '' }}">提交PR</li>
+    </ol>
+  </aside>
+</section>
+<section class="workspace-section">
+  <div class="section-head"><h2>当前 Agent 运行</h2></div>
+  {% if latest_agent_runs %}
+  <div class="table-wrap"><table><thead><tr><th>角色</th><th>次数</th><th>状态</th><th>耗时</th></tr></thead><tbody>
+    {% for run in latest_agent_runs %}<tr><td>{{ role_label(run.role) }}</td><td>{{ run.attempt }}</td><td><span class="status {{ status_tone(run.status) }}">{{ status_label(run.status) }}</span></td><td>{% if run.started_at and run.finished_at %}{{ (run.finished_at - run.started_at).total_seconds()|round(1) }} 秒{% else %}-{% endif %}</td></tr>{% endfor %}
+  </tbody></table></div>
+  {% else %}<p class="empty">等待 Agent 启动</p>{% endif %}
+</section>
+<section class="workspace-section">
+  <div class="section-head"><h2>最新检视结论</h2></div>
+  {% if latest_reviews %}<div class="review-list">
+    {% for review in latest_reviews %}
+    <article class="review-item">
+      <div><strong>{{ role_label(review.reviewer_role) }}</strong> <span class="status {{ status_tone(review.decision) }}">{{ status_label(review.decision) }}</span></div>
+      {% if review.findings %}<ul>{% for finding in review.findings %}<li>{% if finding.get('severity') %}<span class="severity">{{ severity_label(finding.get('severity')) }}</span>{% endif %}{{ finding.get('message', finding) }}</li>{% endfor %}</ul>{% else %}<p class="muted">无具体问题</p>{% endif %}
+    </article>
+    {% endfor %}
+  </div>{% else %}<p class="empty">尚无检视结果</p>{% endif %}
+</section>
+{% if historical_agent_runs or historical_reviews %}
+<details class="history-panel">
+  <summary>历史记录（{{ historical_agent_runs|length }} 次运行，{{ historical_reviews|length }} 次检视）</summary>
+  {% if historical_agent_runs %}<div class="table-wrap"><table><thead><tr><th>角色</th><th>次数</th><th>状态</th></tr></thead><tbody>{% for run in historical_agent_runs|sort(attribute='id', reverse=true) %}<tr><td>{{ role_label(run.role) }}</td><td>{{ run.attempt }}</td><td><span class="status {{ status_tone(run.status) }}">{{ status_label(run.status) }}</span></td></tr>{% endfor %}</tbody></table></div>{% endif %}
+  {% if historical_reviews %}<div class="history-reviews">{% for review in historical_reviews|sort(attribute='id', reverse=true) %}<p><strong>{{ role_label(review.reviewer_role) }}</strong> · {{ status_label(review.decision) }}{% if review.findings %} · {{ review.findings|length }} 条意见{% endif %}</p>{% endfor %}</div>{% endif %}
+</details>
+{% endif %}
+{% if task.pr_url and (current_user.role == 'admin' or current_user.id == task.created_by) %}
+<section class="workspace-section">
+  <div class="section-head"><h2>PR 人工意见</h2>{% if can_sync_pr_feedback %}<form method="post" action="/tasks/{{ task.id }}/feedback/sync"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="button secondary" type="submit">同步 PR 意见</button></form>{% endif %}</div>
+  {% if task.pr_feedback %}
+  <form method="post" action="/tasks/{{ task.id }}/feedback/handle" class="feedback-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    {% for feedback in task.pr_feedback|sort(attribute='id') %}
+    <div class="feedback-item">{% if feedback.author_association in ['OWNER','MEMBER','COLLABORATOR'] and not feedback.processed_at %}<input type="checkbox" name="feedback_ids" value="{{ feedback.id }}">{% endif %}<div><strong>{{ feedback.author }}</strong> · {{ feedback.kind }}{% if feedback.path %} · <span class="mono">{{ feedback.path }}{% if feedback.line %}:{{ feedback.line }}{% endif %}</span>{% endif %}<p>{{ feedback.body }}</p>{% if feedback.processed_at %}<span class="muted">已处理</span>{% elif feedback.author_association not in ['OWNER','MEMBER','COLLABORATOR'] %}<span class="muted">非维护者意见</span>{% endif %}</div></div>
+    {% endfor %}
+    {% if task.status == 'awaiting_human_review' %}<button class="button primary" type="submit">处理选中意见</button>{% endif %}
+  </form>
+  {% else %}<p class="empty">尚未同步 PR 意见</p>{% endif %}
+</section>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,38 @@
+# 集成凭据请在“系统”网页配置；网页配置优先于可选的环境变量回退。
+# 不要在此文件写入 Token。CODERUS_GITHUB_TOKEN 可回退支持 GitHub 完整流程。
+# 无已验证用户名时，CODERUS_GITCODE_TOKEN 只支持 GitCode 公开 Issue 同步；Fork、PR 和 RV 检视必须网页保存用户名与 Token。
+server:
+  mode: local
+  bind: 127.0.0.1
+  port: 18082
+  public_url: null
+
+database:
+  path: data/coderus.db
+
+workspace:
+  root: data/workspaces
+
+artifacts:
+  root: data/artifacts
+
+runner:
+  network_access: true
+
+scheduler:
+  issue_poll_seconds: 300
+  global_task_limit: 8
+  per_user_task_limit: 2
+  max_agent_processes: 16
+
+codex:
+  binary: codex
+  model: null
+  base_url: null
+  proxy_port: 18083
+  stage_timeout_seconds: 3600
+  sandbox_mode: workspace-write
+
+git:
+  user_name: Coderus Bot
+  user_email: coderus@example.com

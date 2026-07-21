@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}任务 · Coderus{% endblock %}
+{% block content %}
+{% include "_task_tabs.html" %}
+<div class="page-head">
+  <div><h1>任务</h1><p class="muted">全部用户的研发任务</p></div>
+  <form method="get" class="inline-form">
+    {% if selected_repository_id %}<input type="hidden" name="repository" value="{{ selected_repository_id }}">{% endif %}
+    <select name="owner" aria-label="创建人">
+      <option value="">全部创建人</option>
+      <option value="{{ current_user.username }}"{% if owner_filter == current_user.username %} selected{% endif %}>我的任务 ({{ current_user.username }})</option>
+      {% for user in users %}{% if user.id != current_user.id %}<option value="{{ user.username }}"{% if owner_filter == user.username %} selected{% endif %}>{{ user.username }}</option>{% endif %}{% endfor %}
+    </select>
+    <select name="status" aria-label="任务状态">
+      <option value="active" {% if status_filter == 'active' %}selected{% endif %}>进行中</option>
+      <option value="all" {% if status_filter == 'all' %}selected{% endif %}>全部状态</option>
+      <option value="queued" {% if status_filter == 'queued' %}selected{% endif %}>排队中</option>
+      <option value="preparing" {% if status_filter == 'preparing' %}selected{% endif %}>准备工作区</option>
+      <option value="developer_working" {% if status_filter == 'developer_working' %}selected{% endif %}>开发中</option>
+      <option value="reviewing" {% if status_filter == 'reviewing' %}selected{% endif %}>检视中</option>
+      <option value="developer_revising" {% if status_filter == 'developer_revising' %}selected{% endif %}>集中修正</option>
+      <option value="sealing" {% if status_filter == 'sealing' %}selected{% endif %}>确认提交</option>
+      <option value="publishing" {% if status_filter == 'publishing' %}selected{% endif %}>发布 PR</option>
+      <option value="awaiting_human_review" {% if status_filter == 'awaiting_human_review' %}selected{% endif %}>等待人工审核</option>
+      <option value="manual_intervention" {% if status_filter == 'manual_intervention' %}selected{% endif %}>需要人工处理</option>
+      <option value="completed" {% if status_filter == 'completed' %}selected{% endif %}>完成</option>
+      <option value="closed" {% if status_filter == 'closed' %}selected{% endif %}>PR 已关闭</option>
+      <option value="dismissed" {% if status_filter == 'dismissed' %}selected{% endif %}>已关闭</option>
+      <option value="failed" {% if status_filter == 'failed' %}selected{% endif %}>失败</option>
+      <option value="cancelling" {% if status_filter == 'cancelling' %}selected{% endif %}>正在取消</option>
+      <option value="cancelled" {% if status_filter == 'cancelled' %}selected{% endif %}>已取消</option>
+    </select>
+    <button class="button secondary" type="submit">筛选</button>
+  </form>
+</div>
+<section class="workspace-section">
+  {% if tasks %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>任务</th><th>创建人</th><th>仓库</th><th>Issue</th><th>当前阶段</th><th>PR</th><th>创建时间</th></tr></thead>
+    <tbody>
+    {% for task in tasks %}
+    <tr>
+      <td><a href="/tasks/{{ task.id }}"><strong>RE-{{ task.id }}</strong></a></td>
+      <td>{{ task.creator.username }}</td>
+      <td>{{ task.issue.repository.owner }}/{{ task.issue.repository.name }}</td>
+      <td class="title-cell"><a href="/tasks/{{ task.id }}">#{{ task.issue.number }} {{ task.issue.title }}</a></td>
+      <td><span class="status {{ status_tone(task.status) }}">{{ status_label(task.status) }}</span></td>
+      <td>{% if task.pr_url %}<a href="{{ task.pr_url }}" target="_blank" rel="noreferrer">PR #{{ task.pr_number }}</a>{% else %}-{% endif %}</td>
+      <td>{{ task.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}<p class="empty">暂无任务</p>{% endif %}
+</section>
+{% endblock %}

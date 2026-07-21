@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}代码检视 · Coderus{% endblock %}
+{% block content %}
+{% include "_task_tabs.html" %}
+<div class="page-head">
+  <div><h1>代码检视任务</h1><p class="muted">全部用户发起的 PR 代码检视</p></div>
+  <form method="get" class="inline-form">
+    {% if selected_repository_id %}<input type="hidden" name="repository" value="{{ selected_repository_id }}">{% endif %}
+    <select name="status" aria-label="检视状态">
+      <option value="all"{% if status_filter == 'all' %} selected{% endif %}>全部状态</option>
+      <option value="queued"{% if status_filter == 'queued' %} selected{% endif %}>排队中</option>
+      <option value="running"{% if status_filter == 'running' %} selected{% endif %}>执行中</option>
+      <option value="completed"{% if status_filter == 'completed' %} selected{% endif %}>已完成</option>
+      <option value="failed"{% if status_filter == 'failed' %} selected{% endif %}>失败</option>
+    </select>
+    <button class="button secondary" type="submit">筛选</button>
+  </form>
+</div>
+<section class="workspace-section">
+  <form method="post" action="/reviews" class="inline-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label for="pr-url">PR URL</label>
+    <input id="pr-url" name="pr_url" type="url" required placeholder="https://github.com/owner/repository/pull/123 或 https://gitcode.com/owner/repository/pulls/123">
+    <button class="button primary" type="submit">创建检视</button>
+  </form>
+</section>
+<section class="workspace-section">
+  {% if reviews %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>任务</th><th>平台</th><th>仓库</th><th>PR</th><th>状态</th><th>创建时间</th><th>完成时间</th><th>结果</th></tr></thead>
+    <tbody>
+    {% for review in reviews %}
+    <tr>
+      <td><a href="/reviews/{{ review.id }}"><strong>RV-{{ review.id }}</strong></a></td>
+      <td>{{ forge_status[review.repository.provider].label }}</td>
+      <td>{{ review.repository.owner }}/{{ review.repository.name }}</td>
+      <td><a href="{{ review.pr_url }}" target="_blank" rel="noreferrer">PR #{{ review.pr_number }}</a></td>
+      <td><span class="status {{ review_status_tone(review.status) }}">{{ review_status_label(review.status) }}</span></td>
+      <td>{{ review.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+      <td>{{ review.finished_at.strftime('%Y-%m-%d %H:%M') if review.finished_at else '-' }}</td>
+      <td>{% if review.comment_url %}<a href="{{ review.comment_url }}" target="_blank" rel="noreferrer">查看 PR 评论</a>{% else %}-{% endif %}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}<p class="empty">当前筛选下没有代码检视任务</p>{% endif %}
+  {% if total_pages > 1 %}
+  <nav class="pagination" aria-label="代码检视任务分页">
+    {% if page > 1 %}<a class="button secondary" href="/reviews?{{ pagination_query|safe }}&page={{ page - 1 }}">上一页</a>{% else %}<span></span>{% endif %}
+    <span>第 {{ page }} / {{ total_pages }} 页</span>
+    {% if page < total_pages %}<a class="button secondary" href="/reviews?{{ pagination_query|safe }}&page={{ page + 1 }}">下一页</a>{% else %}<span></span>{% endif %}
+  </nav>
+  {% endif %}
+</section>
+{% endblock %}

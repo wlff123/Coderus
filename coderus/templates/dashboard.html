@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head">
+  <div><h1>工作台</h1><p class="muted">{{ selected_repository.owner ~ '/' ~ selected_repository.name if selected_repository else '全部仓库' }} · 研发队列</p></div>
+</div>
+<nav class="repository-tabs" aria-label="仓库范围">
+  <a{% if not selected_repository %} class="active" aria-current="page"{% endif %} href="/">全部仓库</a>
+  {% for repository in repositories %}
+  <a{% if selected_repository and selected_repository.id == repository.id %} class="active" aria-current="page"{% endif %} href="/?repository={{ repository.id }}"><span>{{ forge_status[repository.provider].label }}</span> · {{ repository.owner }}/{{ repository.name }}</a>
+  {% endfor %}
+</nav>
+<section class="metrics" aria-label="系统概况">
+  <div><strong>{{ counts.issues }}</strong><span>待处理 Issue</span></div>
+  <div><strong>{{ counts.issue_tasks }}</strong><span>Issue 处理任务</span></div>
+  <div><strong>{{ counts.review_tasks }}</strong><span>代码检视任务</span></div>
+  <div><strong>{{ counts.attention }}</strong><span>需要关注</span></div>
+</section>
+<section class="workspace-section">
+  <div class="section-head"><h2>Issue 收件箱</h2><a href="/issues{% if selected_repository_id %}?repository={{ selected_repository_id }}{% endif %}">查看全部</a></div>
+  {% if issues %}
+  <div class="table-wrap"><table><thead><tr>{% if not selected_repository %}<th>仓库</th>{% endif %}<th>Issue</th><th>标题</th><th>状态</th></tr></thead>
+  <tbody>{% for issue in issues %}<tr>{% if not selected_repository %}<td>{{ issue.repository.owner }}/{{ issue.repository.name }}</td>{% endif %}<td><a href="{{ issue.source_url }}" target="_blank" rel="noreferrer">#{{ issue.number }}</a></td><td class="title-cell"><a href="/issues{% if selected_repository_id %}?repository={{ selected_repository_id }}{% endif %}">{{ issue.title }}</a></td><td><span class="status neutral">待处理</span></td></tr>{% endfor %}</tbody></table></div>
+  {% else %}<p class="empty">暂无待处理 Issue</p>{% endif %}
+</section>
+<section class="workspace-section">
+  <div class="section-head"><h2>任务</h2><div class="section-actions"><a href="/tasks{% if selected_repository_id %}?repository={{ selected_repository_id }}{% endif %}">Issue 处理</a><a href="/reviews{% if selected_repository_id %}?repository={{ selected_repository_id }}{% endif %}">代码检视</a></div></div>
+  {% if tasks %}
+  <div class="table-wrap"><table><thead><tr><th>任务</th><th>类型</th>{% if not selected_repository %}<th>仓库</th>{% endif %}<th>处理对象</th><th>状态</th><th>创建时间</th></tr></thead>
+  <tbody>{% for task in tasks %}<tr><td><a href="{{ task.detail_url }}"><strong>{{ task.key }}</strong></a></td><td><span class="task-type">{{ task.type }}</span></td>{% if not selected_repository %}<td>{{ task.repository.owner }}/{{ task.repository.name }}</td>{% endif %}<td class="title-cell"><a href="{{ task.detail_url }}">{{ task.target }}</a></td><td><span class="status {{ task.status_tone }}">{{ task.status_label }}</span></td><td>{{ task.created_at.strftime('%Y-%m-%d %H:%M') }}</td></tr>{% endfor %}</tbody></table></div>
+  {% else %}<p class="empty">暂无任务</p>{% endif %}
+</section>
+{% endblock %}
