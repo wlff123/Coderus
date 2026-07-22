@@ -35,6 +35,7 @@ site/
 *_ed25519
 
 .superpowers/
+.worktrees/
 dist/
 .idea/
 .vscode/
