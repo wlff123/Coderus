@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
 
@@ -10,6 +11,8 @@ from sqlalchemy.orm import Session
 from coderus.forge import ForgeCapability, ForgeRegistry
 from coderus.models import Issue, Repository, Task
 from coderus.workflow.task_state import cas_task_status
+
+logger = logging.getLogger(__name__)
 
 
 class PRStatusPoller:
@@ -64,9 +67,30 @@ class PRStatusPoller:
             forge = self.forges.require(provider)
             try:
                 status = await forge.get_pr_status(owner, name, number)
-            except Exception:
+            except Exception as exc:
+                now = datetime.now(UTC)
+                with self.sessions() as session:
+                    task = session.get(Task, task_id)
+                    if task is not None and task.status == "awaiting_human_review":
+                        task.pr_status_error = f"{type(exc).__name__}: {exc}"[:1000]
+                        task.pr_status_checked_at = now
+                        session.commit()
+                logger.warning(
+                    "pr_status_poll_failed",
+                    extra={
+                        "provider": provider,
+                        "task_id": task_id,
+                        "error_type": type(exc).__name__,
+                    },
+                )
                 continue
             if status not in {"merged", "closed"}:
+                with self.sessions() as session:
+                    task = session.get(Task, task_id)
+                    if task is not None and task.status == "awaiting_human_review":
+                        task.pr_status_error = None
+                        task.pr_status_checked_at = datetime.now(UTC)
+                        session.commit()
                 continue
             with self.sessions() as session:
                 if cas_task_status(
@@ -76,6 +100,8 @@ class PRStatusPoller:
                     new_status="completed" if status == "merged" else "closed",
                     updates={
                         "pr_state": status,
+                        "pr_status_error": None,
+                        "pr_status_checked_at": datetime.now(UTC),
                         "finished_at": datetime.now(UTC),
                     },
                 ):

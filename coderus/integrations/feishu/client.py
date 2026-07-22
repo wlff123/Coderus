@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
 from typing import Any, Protocol
 
 from .errors import FeishuRequestError
@@ -11,6 +12,8 @@ TOKEN_URL = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/intern
 MESSAGE_URL = "https://open.feishu.cn/open-apis/im/v1/messages"
 JSON_HEADERS = {"Content-Type": "application/json; charset=utf-8"}
 RETRYABLE_API_CODES = {230049, 1000004, 1000005, 99991400}
+INVALID_TOKEN_API_CODES = {99991663, 99991664}
+TOKEN_REFRESH_SKEW_SECONDS = 60
 
 
 class HttpResponse(Protocol):
@@ -42,9 +45,13 @@ class FeishuClient:
         config: FeishuConfig,
         *,
         http_client: HttpClient | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._config = config
         self._http_client = http_client if http_client is not None else default_http_client()
+        self._clock = clock
+        self._cached_token: str | None = None
+        self._token_refresh_at = 0.0
 
     def __repr__(self) -> str:
         return "FeishuClient()"
@@ -58,14 +65,7 @@ class FeishuClient:
         receive_id_type: ReceiveIdType,
         text: str,
     ) -> SendResult:
-        token = self._tenant_access_token()
-        response = self._post(
-            "send_message",
-            MESSAGE_URL,
-            headers={
-                "Authorization": f"Bearer {token}",
-                **JSON_HEADERS,
-            },
+        payload, status_code = self._send_message(
             payload={
                 "receive_id": receive_id,
                 "msg_type": "text",
@@ -77,11 +77,10 @@ class FeishuClient:
             },
             params={"receive_id_type": receive_id_type},
         )
-        payload = self._successful_payload("send_message", response)
         data = payload.get("data")
         message_id = data.get("message_id") if isinstance(data, Mapping) else None
         if not isinstance(message_id, str) or not message_id:
-            raise self._invalid_response("send_message", response.status_code)
+            raise self._invalid_response("send_message", status_code)
         return SendResult(message_id=message_id)
 
     def send_task_completed(
@@ -95,15 +94,8 @@ class FeishuClient:
         if message_type not in {"interactive", "text"}:
             raise ValueError("message_type must be 'interactive' or 'text'")
 
-        token = self._tenant_access_token()
         content = self._content(message, message_type)
-        response = self._post(
-            "send_message",
-            MESSAGE_URL,
-            headers={
-                "Authorization": f"Bearer {token}",
-                **JSON_HEADERS,
-            },
+        payload, status_code = self._send_message(
             payload={
                 "receive_id": receive_id,
                 "msg_type": message_type,
@@ -111,14 +103,15 @@ class FeishuClient:
             },
             params={"receive_id_type": receive_id_type},
         )
-        payload = self._successful_payload("send_message", response)
         data = payload.get("data")
         message_id = data.get("message_id") if isinstance(data, Mapping) else None
         if not isinstance(message_id, str) or not message_id:
-            raise self._invalid_response("send_message", response.status_code)
+            raise self._invalid_response("send_message", status_code)
         return SendResult(message_id=message_id)
 
     def _tenant_access_token(self) -> str:
+        if self._cached_token is not None and self._clock() < self._token_refresh_at:
+            return self._cached_token
         response = self._post(
             "tenant_access_token",
             TOKEN_URL,
@@ -132,7 +125,46 @@ class FeishuClient:
         token = payload.get("tenant_access_token")
         if not isinstance(token, str) or not token:
             raise self._invalid_response("tenant_access_token", response.status_code)
+        expires_in = payload.get("expires_in", payload.get("expire", 7200))
+        if (
+            isinstance(expires_in, bool)
+            or not isinstance(expires_in, (int, float))
+            or expires_in <= 0
+        ):
+            raise self._invalid_response("tenant_access_token", response.status_code)
+        self._cached_token = token
+        self._token_refresh_at = self._clock() + max(
+            0.0, float(expires_in) - TOKEN_REFRESH_SKEW_SECONDS
+        )
         return token
+
+    def _send_message(
+        self,
+        *,
+        payload: Mapping[str, object],
+        params: Mapping[str, str],
+    ) -> tuple[Mapping[str, object], int]:
+        for attempt in range(2):
+            token = self._tenant_access_token()
+            response = self._post(
+                "send_message",
+                MESSAGE_URL,
+                headers={"Authorization": f"Bearer {token}", **JSON_HEADERS},
+                payload=payload,
+                params=params,
+            )
+            try:
+                return self._successful_payload("send_message", response), response.status_code
+            except FeishuRequestError as exc:
+                invalid_token = (
+                    exc.status_code == 401 or exc.api_code in INVALID_TOKEN_API_CODES
+                )
+                if attempt == 0 and invalid_token:
+                    self._cached_token = None
+                    self._token_refresh_at = 0.0
+                    continue
+                raise
+        raise AssertionError("unreachable")
 
     def _post(
         self,

@@ -119,6 +119,61 @@ def test_send_text_routes_message_to_requested_recipient() -> None:
     }
 
 
+def test_tenant_token_is_cached_until_refresh_window() -> None:
+    client = FakeHttpClient(
+        FakeResponse(
+            200,
+            {"code": 0, "tenant_access_token": "tenant-token", "expire": 7200},
+        ),
+        FakeResponse(200, {"code": 0, "data": {"message_id": "om_1"}}),
+        FakeResponse(200, {"code": 0, "data": {"message_id": "om_2"}}),
+    )
+    feishu = FeishuClient(make_config(), http_client=client, clock=lambda: 0)
+
+    feishu.send_text("oc_default", "chat_id", "first")
+    feishu.send_text("oc_default", "chat_id", "second")
+
+    assert [call["url"] for call in client.calls].count(TOKEN_URL) == 1
+
+
+def test_tenant_token_refreshes_before_expiry() -> None:
+    now = [0.0]
+    client = FakeHttpClient(
+        FakeResponse(200, {"code": 0, "tenant_access_token": "old", "expires_in": 120}),
+        FakeResponse(200, {"code": 0, "data": {"message_id": "om_1"}}),
+        FakeResponse(200, {"code": 0, "tenant_access_token": "new", "expires_in": 120}),
+        FakeResponse(200, {"code": 0, "data": {"message_id": "om_2"}}),
+    )
+    feishu = FeishuClient(make_config(), http_client=client, clock=lambda: now[0])
+
+    feishu.send_text("oc_default", "chat_id", "first")
+    now[0] = 61
+    feishu.send_text("oc_default", "chat_id", "second")
+
+    assert [call["url"] for call in client.calls].count(TOKEN_URL) == 2
+    assert client.calls[-1]["headers"]["Authorization"] == "Bearer new"
+
+
+def test_message_401_clears_token_and_retries_once() -> None:
+    client = FakeHttpClient(
+        FakeResponse(200, {"code": 0, "tenant_access_token": "old", "expire": 7200}),
+        FakeResponse(401, {"code": 99991663}),
+        FakeResponse(200, {"code": 0, "tenant_access_token": "new", "expire": 7200}),
+        FakeResponse(200, {"code": 0, "data": {"message_id": "om_ok"}}),
+    )
+    feishu = FeishuClient(make_config(), http_client=client)
+
+    result = feishu.send_text("oc_default", "chat_id", "retry")
+
+    assert result == SendResult(message_id="om_ok")
+    assert [call["url"] for call in client.calls] == [
+        TOKEN_URL,
+        MESSAGE_URL,
+        TOKEN_URL,
+        MESSAGE_URL,
+    ]
+
+
 def test_send_fetches_token_and_sends_task_completed_card() -> None:
     client = FakeHttpClient(
         FakeResponse(200, {"code": 0, "tenant_access_token": "tenant-token", "expire": 7200}),

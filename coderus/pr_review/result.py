@@ -72,6 +72,7 @@ def validate_findings(output: ReviewOutput, ranges: ChangedRanges) -> ReviewOutp
             finding.line_end,
         ):
             raise ReviewOutputError("意见位置不在 PR 变更范围")
+    output._comparison_sha = ranges.comparison_sha
     return output
 
 
@@ -85,6 +86,7 @@ def render_pr_comment(
     review_key: str,
     *,
     changed_file_count: int | None = None,
+    comparison_sha: str | None = None,
 ) -> tuple[str, str]:
     hosts = {"github": "github.com", "gitcode": "gitcode.com"}
     if provider not in hosts:
@@ -110,7 +112,11 @@ def render_pr_comment(
     sections.append(f"- 结论：{summary}")
 
     for index, finding in enumerate(findings, start=1):
-        sha = base_sha if finding.line_side == "LEFT" else head_sha
+        sha = (
+            (comparison_sha or output._comparison_sha or base_sha)
+            if finding.line_side == "LEFT"
+            else head_sha
+        )
         version_label = "原版本" if finding.line_side == "LEFT" else "新版本"
         path = quote(finding.file_path, safe="/")
         url = (
@@ -157,7 +163,7 @@ def _extract_fenced_json(stdout: str) -> object:
 
 
 def _unique_findings(output: ReviewOutput) -> list:
-    seen: set[tuple[str, str, int, int]] = set()
+    seen: set[tuple[str, str, int, int, str, str, str]] = set()
     findings = []
     for finding in output.findings:
         location = (
@@ -165,6 +171,9 @@ def _unique_findings(output: ReviewOutput) -> list:
             finding.line_side,
             finding.line_start,
             finding.line_end,
+            finding.priority,
+            finding.title,
+            finding.problem,
         )
         if location not in seen:
             seen.add(location)

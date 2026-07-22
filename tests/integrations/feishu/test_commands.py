@@ -38,6 +38,23 @@ from coderus.integrations.feishu.commands import BotCommand, parse_command
                 "https://gitcode.com/acme/widgets/merge_requests/17",
             ),
         ),
+        (
+            "检视https://gitcode.com/acme/widgets/pull/17",
+            BotCommand("review", "https://gitcode.com/acme/widgets/pull/17"),
+        ),
+        (
+            "检视[https://gitcode.com/acme/widgets/pull/17]"
+            "(https://gitcode.com/acme/widgets/pull/17)",
+            BotCommand("review", "https://gitcode.com/acme/widgets/pull/17"),
+        ),
+        (
+            "派发https://github.com/volcengine/OpenViking/issues/1487",
+            BotCommand(
+                "dispatch",
+                "https://github.com/volcengine/OpenViking/issues/1487",
+            ),
+        ),
+        ("任务RE-5", BotCommand("task", "RE-5")),
     ],
 )
 def test_parse_supported_commands(text: str, expected: BotCommand) -> None:

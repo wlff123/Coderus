@@ -5,7 +5,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
 _WINDOWS_ABSOLUTE_PATH = re.compile(r"^[A-Za-z]:/")
 
@@ -29,6 +29,7 @@ def normalize_repository_path(file_path: str) -> str | None:
 @dataclass(frozen=True, slots=True)
 class ChangedRanges:
     ranges: Mapping[tuple[str, str], tuple[tuple[int, int], ...]]
+    comparison_sha: str | None = None
 
     def contains(self, file_path: str, side: str, start: int, end: int) -> bool:
         path = normalize_repository_path(file_path)
@@ -77,6 +78,8 @@ class ReviewFinding(BaseModel):
 
 class ReviewOutput(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
+
+    _comparison_sha: str | None = PrivateAttr(default=None)
 
     change_summary: list[str] = Field(min_length=1, max_length=5)
     findings: list[ReviewFinding]

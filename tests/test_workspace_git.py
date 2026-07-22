@@ -193,3 +193,75 @@ async def test_workspace_git_ignores_global_hooks_and_removes_local_executable_c
 
     assert sealed.patch_path.exists()
     assert not executable_marker.exists()
+
+
+def initialize_source(path: Path) -> None:
+    path.mkdir()
+    git(path, "init", "-b", "main")
+    (path / "README.md").write_text("before\n", encoding="utf-8")
+    git(path, "add", "README.md")
+    git(
+        path,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-m",
+        "init",
+    )
+
+
+@pytest.mark.asyncio
+async def test_seal_rejects_workspace_over_size_limit(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    initialize_source(source)
+    workspace_root = tmp_path / "workspaces"
+    prepared = await WorkspaceGit(workspace_root).prepare(
+        1, str(source), "main", "coderus/issue-1-1"
+    )
+    manager = WorkspaceGit(workspace_root, max_workspace_bytes=64)
+    (prepared.workspace / "large.bin").write_bytes(b"x" * 65)
+
+    with pytest.raises(ValueError, match="workspace size limit"):
+        await manager.seal(prepared.workspace, tmp_path / "fixed.patch")
+
+
+@pytest.mark.asyncio
+async def test_prepare_removes_partial_clone_when_workspace_limit_is_exceeded(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    initialize_source(source)
+    workspace_root = tmp_path / "workspaces"
+    manager = WorkspaceGit(workspace_root, max_workspace_bytes=64)
+
+    with pytest.raises(RuntimeError, match="workspace size limit"):
+        await manager.prepare(1, str(source), "main", "coderus/issue-1-1")
+
+    assert not (workspace_root / "task-1").exists()
+
+
+@pytest.mark.asyncio
+async def test_seal_rejects_too_many_changed_files(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    initialize_source(source)
+    manager = WorkspaceGit(tmp_path / "workspaces", max_changed_files=1)
+    prepared = await manager.prepare(1, str(source), "main", "coderus/issue-1-1")
+    (prepared.workspace / "one.txt").write_text("one", encoding="utf-8")
+    (prepared.workspace / "two.txt").write_text("two", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="changed file limit"):
+        await manager.seal(prepared.workspace, tmp_path / "fixed.patch")
+
+
+@pytest.mark.asyncio
+async def test_seal_rejects_patch_over_size_limit(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    initialize_source(source)
+    manager = WorkspaceGit(tmp_path / "workspaces", max_patch_bytes=32)
+    prepared = await manager.prepare(1, str(source), "main", "coderus/issue-1-1")
+    (prepared.workspace / "README.md").write_text("after " + "x" * 100, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="patch size limit"):
+        await manager.seal(prepared.workspace, tmp_path / "fixed.patch")

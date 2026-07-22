@@ -1,7 +1,7 @@
 import pytest
 from sqlalchemy.exc import IntegrityError
 
-from coderus.models import FeishuBotSettings, FeishuEvent, User
+from coderus.models import CoderusSchema, FeishuBotSettings, FeishuEvent, User
 
 
 def add_user(session) -> User:
@@ -63,6 +63,15 @@ def test_feishu_event_message_id_is_unique(session) -> None:
             status="queued",
         )
     )
+
+    with pytest.raises(IntegrityError):
+        session.flush()
+
+
+def test_coderus_schema_accepts_only_singleton_id(session) -> None:
+    session.add(CoderusSchema(singleton=1, version=1))
+    session.commit()
+    session.add(CoderusSchema(singleton=2, version=1))
 
     with pytest.raises(IntegrityError):
         session.flush()

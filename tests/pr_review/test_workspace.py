@@ -406,6 +406,8 @@ async def test_changed_ranges_reads_verified_git_diff(
         calls.append(command)
         if command == ("git", "rev-parse", "HEAD^{commit}"):
             return "b" * 40
+        if command == ("git", "merge-base", "a" * 40, "b" * 40):
+            return "c" * 40
         if command[:4] == ("git", "diff", "--no-ext-diff", "--binary"):
             return "\n".join(
                 (
@@ -424,7 +426,11 @@ async def test_changed_ranges_reads_verified_git_diff(
 
     assert ranges.contains("src/app.py", "LEFT", 1, 1)
     assert ranges.contains("src/app.py", "RIGHT", 1, 1)
+    assert ranges.comparison_sha == "c" * 40
     assert ("git", "cat-file", "-e", f"{'a' * 40}^{{commit}}") in calls
+    assert ("git", "merge-base", "a" * 40, "b" * 40) in calls
+    diff_call = next(call for call in calls if call[:2] == ("git", "diff"))
+    assert diff_call[-3:-1] == ("c" * 40, "b" * 40)
 
 
 @pytest.mark.asyncio

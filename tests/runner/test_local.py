@@ -12,9 +12,11 @@ import pytest
 import coderus.runner.local as local_runner_module
 from coderus.runner import (
     AgentRole,
+    JobResult,
     JobSpec,
     JobStatus,
     LocalCodexRunner,
+    RetryableAgentError,
     RunnerConfig,
     Stage,
 )
@@ -110,6 +112,11 @@ elif prompt == "sleep":
 elif prompt == "large-output":
     sys.stdout.write("stdout-prefix-" + "a" * 100 + "-stdout-tail")
     sys.stderr.write("stderr-prefix-" + "b" * 100 + "-stderr-tail")
+elif prompt == "large-workspace":
+    with open("large-workspace.bin", "wb") as output:
+        output.write(b"x" * 4096)
+        output.flush()
+    time.sleep(30)
 elif prompt == "large-native-review":
     sys.stderr.write("native-review-" + "n" * 300_000)
 else:
@@ -302,6 +309,55 @@ async def test_pr_review_sends_large_formatter_prompt_over_stdin(
     assert len(payload["prompt"]) > 300_000
 
 
+@pytest.mark.asyncio
+async def test_pr_review_formatter_uses_only_remaining_total_timeout(
+    fake_cli: tuple[str, ...], review_spec: JobSpec, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = 100.0
+    observed_timeouts: list[float] = []
+
+    class TimedRunner(LocalCodexRunner):
+        async def _run_process(self, spec, *args, **kwargs):
+            nonlocal clock
+            observed_timeouts.append(spec.timeout_seconds)
+            if len(observed_timeouts) == 1:
+                clock += 6.0
+                return JobResult(
+                    job_id=spec.job_id,
+                    status=JobStatus.SUCCEEDED,
+                    exit_code=0,
+                    stdout="native review",
+                    stderr="",
+                    output_truncated=False,
+                    duration_seconds=6.0,
+                )
+            return JobResult(
+                job_id=spec.job_id,
+                status=JobStatus.SUCCEEDED,
+                exit_code=0,
+                stdout="{}",
+                stderr="",
+                output_truncated=False,
+                duration_seconds=6.1,
+            )
+
+    monkeypatch.setattr(local_runner_module.time, "monotonic", lambda: clock)
+    runner = TimedRunner(RunnerConfig(review_spec.workspace.parent, fake_cli))
+    spec = make_spec(
+        review_spec.workspace,
+        review_spec.prompt,
+        stage=Stage.PR_REVIEW,
+        role=AgentRole.PR_REVIEWER,
+        review_base=review_spec.review_base,
+        timeout_seconds=10,
+    )
+
+    result = await runner.run(spec)
+
+    assert result.status is JobStatus.SUCCEEDED
+    assert observed_timeouts == [10, 4]
+
+
 def test_build_command_uses_separate_arguments_and_role_sandbox(
     tmp_path: Path, fake_cli: tuple[str, ...]
 ) -> None:
@@ -479,7 +535,7 @@ async def test_run_passes_only_allowlisted_environment_and_proxy_credentials(
 
 
 @pytest.mark.asyncio
-async def test_run_uses_private_home_and_copies_only_minimum_codex_auth(
+async def test_run_does_not_copy_implicit_manager_codex_auth(
     tmp_path: Path, fake_cli: tuple[str, ...]
 ) -> None:
     root, workspace = make_workspace(tmp_path)
@@ -504,7 +560,7 @@ async def test_run_uses_private_home_and_copies_only_minimum_codex_auth(
     environment = runtime["environment"]
 
     assert result.status is JobStatus.SUCCEEDED
-    assert runtime["codex_home_entries"] == ["auth.json", "tmp"]
+    assert runtime["codex_home_entries"] == ["tmp"]
     assert environment["HOME"] != str(manager_home)
     assert environment["CODEX_HOME"] != str(manager_codex_home)
     assert Path(environment["HOME"]).parent.parent == runtime_root.resolve()
@@ -753,7 +809,54 @@ async def test_run_cancels_when_event_is_set(tmp_path: Path, fake_cli: tuple[str
 
 
 @pytest.mark.asyncio
-async def test_run_truncates_combined_output_bytes(
+async def test_run_does_not_start_process_when_already_cancelled(
+    tmp_path: Path,
+    fake_cli: tuple[str, ...],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, workspace = make_workspace(tmp_path)
+    runner = LocalCodexRunner(RunnerConfig(root, fake_cli, "http://127.0.0.1:9999/v1"))
+    cancel_event = asyncio.Event()
+    cancel_event.set()
+    starts = 0
+    original = local_runner_module.asyncio.create_subprocess_exec
+
+    async def counted_start(*args, **kwargs):
+        nonlocal starts
+        starts += 1
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(local_runner_module.asyncio, "create_subprocess_exec", counted_start)
+
+    result = await runner.run(
+        make_spec(workspace, "show-env"), cancel_event=cancel_event
+    )
+
+    assert result.status is JobStatus.CANCELLED
+    assert starts == 0
+
+
+@pytest.mark.asyncio
+async def test_run_classifies_process_resource_exhaustion_as_retryable(
+    tmp_path: Path,
+    fake_cli: tuple[str, ...],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, workspace = make_workspace(tmp_path)
+    runner = LocalCodexRunner(RunnerConfig(root, fake_cli, "http://127.0.0.1:9999/v1"))
+
+    async def exhausted(*args, **kwargs):
+        del args, kwargs
+        raise BlockingIOError("process table temporarily full")
+
+    monkeypatch.setattr(local_runner_module.asyncio, "create_subprocess_exec", exhausted)
+
+    with pytest.raises(RetryableAgentError, match="unable to start Agent process"):
+        await runner.run(make_spec(workspace, "show-env"))
+
+
+@pytest.mark.asyncio
+async def test_run_fails_and_terminates_when_combined_output_exceeds_limit(
     tmp_path: Path, fake_cli: tuple[str, ...]
 ) -> None:
     root, workspace = make_workspace(tmp_path)
@@ -762,8 +865,94 @@ async def test_run_truncates_combined_output_bytes(
     result = await runner.run(make_spec(workspace, "large-output", max_output_bytes=64))
 
     output_size = len(result.stdout.encode()) + len(result.stderr.encode())
-    assert result.status is JobStatus.SUCCEEDED
+    assert result.status is JobStatus.FAILED
     assert result.output_truncated is True
     assert output_size <= 64
-    assert result.stdout.endswith("-stdout-tail")
-    assert result.stderr.endswith("-stderr-tail")
+    assert "output limit" in result.stderr.lower()
+
+
+@pytest.mark.asyncio
+async def test_run_terminates_agent_when_workspace_exceeds_limit(
+    tmp_path: Path, fake_cli: tuple[str, ...]
+) -> None:
+    root, workspace = make_workspace(tmp_path)
+    current_size = sum(path.stat().st_size for path in workspace.rglob("*") if path.is_file())
+    runner = LocalCodexRunner(
+        RunnerConfig(
+            root,
+            fake_cli,
+            max_workspace_bytes=current_size + 1024,
+        )
+    )
+
+    result = await runner.run(make_spec(workspace, "large-workspace"))
+
+    assert result.status is JobStatus.FAILED
+    assert result.stderr == "workspace size limit exceeded"
+    assert result.output_truncated is False
+
+
+@pytest.mark.asyncio
+async def test_windows_termination_uses_taskkill_for_the_process_tree(
+    tmp_path: Path,
+    fake_cli: tuple[str, ...],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _ = make_workspace(tmp_path)
+    runner = LocalCodexRunner(RunnerConfig(root, fake_cli, "http://127.0.0.1:9999/v1"))
+    killed: list[int] = []
+
+    class Process:
+        pid = 42
+        returncode = None
+
+        async def wait(self):
+            self.returncode = 1
+            return 1
+
+    monkeypatch.setattr(local_runner_module.os, "name", "nt")
+    monkeypatch.setattr(local_runner_module, "_taskkill", killed.append)
+
+    await runner._terminate(Process())
+
+    assert killed == [42]
+
+
+@pytest.mark.asyncio
+async def test_windows_termination_falls_back_to_killing_parent_when_taskkill_fails(
+    tmp_path: Path,
+    fake_cli: tuple[str, ...],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _ = make_workspace(tmp_path)
+    runner = LocalCodexRunner(
+        RunnerConfig(
+            root,
+            fake_cli,
+            "http://127.0.0.1:9999/v1",
+            termination_grace_seconds=0.01,
+        )
+    )
+
+    class Process:
+        pid = 42
+        returncode = None
+        killed = False
+        exited = asyncio.Event()
+
+        async def wait(self):
+            await self.exited.wait()
+            return 1
+
+        def kill(self):
+            self.killed = True
+            self.returncode = 1
+            self.exited.set()
+
+    process = Process()
+    monkeypatch.setattr(local_runner_module.os, "name", "nt")
+    monkeypatch.setattr(local_runner_module, "_taskkill", lambda pid: None)
+
+    await asyncio.wait_for(runner._terminate(process), timeout=0.1)
+
+    assert process.killed is True

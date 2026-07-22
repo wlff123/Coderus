@@ -4,6 +4,9 @@ set -euo pipefail
 umask 077
 ROOT="${CODERUS_ROOT:-/opt/coderus}"
 UV="${CODERUS_UV:-}"
+PUBLIC_KEY="${CODERUS_RELEASE_PUBLIC_KEY:-$ROOT/release-public-key.pem}"
+BOOTSTRAP="${CODERUS_RELEASE_BOOTSTRAP:-$ROOT/bootstrap/release-bootstrap.py}"
+BOOTSTRAP_PYTHON="${CODERUS_BOOTSTRAP_PYTHON:-python3}"
 
 if [[ -z "$UV" ]]; then
   UV="$(command -v uv || true)"
@@ -12,24 +15,26 @@ fi
 
 [[ $# -eq 1 ]] || { echo "Usage: $0 <release.tar.gz>" >&2; exit 2; }
 ARCHIVE="$(realpath "$1")"
-if [[ -n "${CODERUS_INSTALL_PYTHON:-}" ]]; then
-  PYTHON="$CODERUS_INSTALL_PYTHON"
-elif [[ -x "$ROOT/current/.venv/bin/python" ]]; then
-  PYTHON="$ROOT/current/.venv/bin/python"
-else
-  PYTHON="$ROOT/.venv/bin/python"
-fi
+BOOTSTRAP_PYTHON="$(command -v "$BOOTSTRAP_PYTHON" || true)"
 
 [[ -f "$ARCHIVE" ]] || { echo "Release archive not found: $ARCHIVE" >&2; exit 1; }
-[[ -x "$PYTHON" ]] || { echo "Installer Python not found: $PYTHON" >&2; exit 1; }
+[[ -f "$PUBLIC_KEY" ]] || { echo "Release public key not found: $PUBLIC_KEY" >&2; exit 1; }
+[[ -f "$BOOTSTRAP" && ! -L "$BOOTSTRAP" ]] || {
+  echo "Trusted release bootstrap not found: $BOOTSTRAP" >&2
+  exit 1
+}
+[[ -n "$BOOTSTRAP_PYTHON" && -x "$BOOTSTRAP_PYTHON" ]] || {
+  echo "Bootstrap Python was not found" >&2
+  exit 1
+}
+"$BOOTSTRAP_PYTHON" -c "import cryptography" || {
+  echo "Bootstrap Python requires cryptography" >&2
+  exit 1
+}
 mkdir -p "$ROOT/releases"
 
-if [[ -d "$ROOT/current" ]]; then
-  cd "$ROOT/current"
-else
-  cd "$ROOT"
-fi
-RELEASE="$($PYTHON -m coderus.release_install "$ARCHIVE" --root "$ROOT")"
+RELEASE="$("$BOOTSTRAP_PYTHON" "$BOOTSTRAP" "$ARCHIVE" --root "$ROOT" \
+  --public-key "$PUBLIC_KEY")"
 [[ "$RELEASE" == "$ROOT/releases/"* ]] || {
   echo "Installer returned an unexpected path: $RELEASE" >&2
   exit 1
@@ -37,7 +42,7 @@ RELEASE="$($PYTHON -m coderus.release_install "$ARCHIVE" --root "$ROOT")"
 
 cd "$RELEASE"
 "$UV" sync --locked --extra dev
-CODEX_BINARY="$("$PYTHON" -c '
+CODEX_BINARY="$("$UV" run python -c '
 import sys
 from pathlib import Path
 
@@ -50,5 +55,5 @@ if [[ "$CODEX_BINARY" == */* && -x "$CODEX_BINARY" ]]; then
   export PATH="$(dirname "$CODEX_BINARY"):$PATH"
 fi
 "$UV" run ruff check coderus tests
-"$UV" run pytest -q
+env -u CODERUS_ROOT "$UV" run pytest -q
 echo "$RELEASE"

@@ -2,17 +2,25 @@ from datetime import datetime
 from typing import Any, Literal, cast
 
 from .errors import ProviderRemoteError
-from .http import HttpClient, default_http_client, get_json
+from .http import DEFAULT_RETRY_POLICY, HttpClient, RetryPolicy, default_http_client, get_json
 from .models import Issue, ProviderName, Repository
 from .urls import parse_issue_url, parse_repository_url
 
 
 class GitCodeProvider:
     name: ProviderName = "gitcode"
+    _MAX_ISSUE_PAGES = 1000
 
-    def __init__(self, *, client: HttpClient | None = None, token: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        client: HttpClient | None = None,
+        token: str | None = None,
+        retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
+    ) -> None:
         self.client = client
         self.token = token or None
+        self.retry_policy = retry_policy
 
     def parse_repository_url(self, url: str) -> Repository:
         return parse_repository_url(url, expected_provider=self.name)
@@ -28,6 +36,7 @@ class GitCodeProvider:
             self.name,
             self._api_url(repository),
             headers=self._headers(),
+            retry_policy=self.retry_policy,
         )
         try:
             if not isinstance(payload, dict):
@@ -59,29 +68,59 @@ class GitCodeProvider:
     def list_open_issues(self, repository: Repository) -> list[Issue]:
         return self.list_issues(repository, state="open")
 
-    def list_issues(self, repository: Repository, *, state: str = "all") -> list[Issue]:
+    def list_issues(
+        self,
+        repository: Repository,
+        *,
+        state: str = "all",
+        updated_since: datetime | None = None,
+    ) -> list[Issue]:
         if state not in {"open", "closed", "all"}:
             raise ValueError("issue state must be open, closed, or all")
         client = self._configured_client()
         repository = self._validated_repository(repository)
+        if updated_since is not None and updated_since.tzinfo is None:
+            raise ValueError("updated_since must include a timezone")
         url = f"{self._api_url(repository)}/issues"
         issues: list[Issue] = []
         page = 1
+        seen_issue_ids: set[str] = set()
         while True:
+            if page > self._MAX_ISSUE_PAGES:
+                raise ProviderRemoteError(self.name, "gitcode returned invalid pagination")
+            params: dict[str, object] = {
+                "state": state,
+                "per_page": 100,
+                "page": page,
+            }
+            if updated_since is not None:
+                params.update({"sort": "updated", "direction": "desc"})
             payload = get_json(
                 client,
                 self.name,
                 url,
                 headers=self._headers(),
-                params={
-                    "state": state,
-                    "per_page": 100,
-                    "page": page,
-                },
+                params=params,
+                retry_policy=self.retry_policy,
             )
             if not isinstance(payload, list):
                 raise ProviderRemoteError(self.name, "gitcode returned an invalid response")
-            issues.extend(self._issue_from_payload(repository, item) for item in payload)
+            page_issues = [self._issue_from_payload(repository, item) for item in payload]
+            page_ids = {issue.external_id for issue in page_issues}
+            if len(page_ids) != len(page_issues) or page_ids & seen_issue_ids:
+                raise ProviderRemoteError(self.name, "gitcode returned invalid pagination")
+            seen_issue_ids.update(page_ids)
+            if updated_since is not None:
+                newer = [
+                    issue
+                    for issue in page_issues
+                    if issue.updated_at is None or issue.updated_at >= updated_since
+                ]
+                issues.extend(newer)
+                if len(newer) != len(page_issues):
+                    return issues
+            else:
+                issues.extend(page_issues)
             if len(payload) < 100:
                 return issues
             page += 1
@@ -96,6 +135,7 @@ class GitCodeProvider:
             self.name,
             f"{self._api_url(repository)}/issues/{number}",
             headers=self._headers(),
+            retry_policy=self.retry_policy,
         )
         return self._issue_from_payload(repository, payload)
 

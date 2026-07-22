@@ -122,3 +122,67 @@ def test_lease_caps_request_count_and_concurrency() -> None:
     with pytest.raises(LeaseRejected) as exhausted_error:
         broker.acquire(token, endpoint="/v1/responses", requested_model="test-model")
     assert exhausted_error.value.status_code == 429
+
+
+def test_lease_caps_cumulative_output_bytes() -> None:
+    broker = CredentialBroker(configured_model="test-model")
+    token = broker.issue(
+        task_id="task-1",
+        stage="develop",
+        max_requests=2,
+        max_output_bytes=10,
+    )
+    first = broker.acquire(token, endpoint="/v1/responses", requested_model="test-model")
+    first.record_output(6)
+    first.release()
+    second = broker.acquire(token, endpoint="/v1/responses", requested_model="test-model")
+
+    with pytest.raises(LeaseRejected, match="output limit") as exhausted:
+        second.record_output(5)
+
+    assert exhausted.value.status_code == 429
+    second.release()
+
+
+def test_output_budget_rejects_invalid_values() -> None:
+    broker = CredentialBroker(configured_model="test-model")
+
+    with pytest.raises(ValueError, match="max_output_bytes"):
+        broker.issue(task_id="task-1", stage="develop", max_output_bytes=0)
+
+
+def test_reissuing_token_does_not_reset_task_stage_budgets() -> None:
+    broker = CredentialBroker(configured_model="test-model")
+    first_token = broker.issue(
+        task_id="task-1", stage="develop", max_requests=1, max_output_bytes=4
+    )
+    first = broker.acquire(
+        first_token, endpoint="/v1/responses", requested_model="test-model"
+    )
+    first.record_output(4)
+    first.release()
+    second_token = broker.issue(
+        task_id="task-1", stage="develop", max_requests=1, max_output_bytes=4
+    )
+
+    with pytest.raises(LeaseRejected, match="request limit"):
+        broker.acquire(
+            second_token, endpoint="/v1/responses", requested_model="test-model"
+        )
+
+
+def test_revoke_last_token_releases_task_stage_budget() -> None:
+    broker = CredentialBroker(configured_model="test-model")
+    first_token = broker.issue(task_id="task-1", stage="develop", max_requests=1)
+    permit = broker.acquire(
+        first_token, endpoint="/v1/responses", requested_model="test-model"
+    )
+    permit.release()
+
+    assert broker.revoke(first_token)
+
+    second_token = broker.issue(task_id="task-1", stage="develop", max_requests=1)
+    second = broker.acquire(
+        second_token, endpoint="/v1/responses", requested_model="test-model"
+    )
+    second.release()

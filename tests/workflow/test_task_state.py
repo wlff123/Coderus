@@ -1,8 +1,10 @@
+from datetime import UTC, datetime, timedelta
+
 from sqlalchemy import select
 
 from coderus.db import create_session_factory
-from coderus.models import Issue, Repository, Task, User
-from coderus.workflow.task_state import cas_task_status
+from coderus.models import Issue, Repository, Task, TaskTransition, User
+from coderus.workflow.task_state import cas_task_status, claim_queued_task
 
 
 def _task(session) -> Task:
@@ -73,3 +75,90 @@ def test_cas_updates_only_an_expected_state(engine) -> None:
     assert changed is True
     with sessions() as session:
         assert session.scalar(select(Task.status)) == "dismissed"
+
+
+def test_claim_queued_task_is_atomic_and_records_a_lease(engine) -> None:
+    sessions = create_session_factory(engine)
+    with sessions() as session:
+        task_id = _task(session).id
+        task = session.get(Task, task_id)
+        task.status = "queued"
+        session.commit()
+
+    with sessions() as first_session:
+        first_token = claim_queued_task(
+            first_session,
+            task_id,
+            global_limit=8,
+            per_user_limit=2,
+            lease_seconds=120,
+        )
+        first_session.commit()
+    with sessions() as second_session:
+        second_token = claim_queued_task(
+            second_session,
+            task_id,
+            global_limit=8,
+            per_user_limit=2,
+            lease_seconds=120,
+        )
+        second_session.commit()
+
+    assert first_token is not None
+    assert second_token is None
+    with sessions() as session:
+        task = session.get(Task, task_id)
+        assert task.status == "preparing"
+        assert task.claim_token == first_token
+        assert task.claim_expires_at > datetime.now(UTC).replace(tzinfo=None)
+
+
+def test_stale_claim_cannot_transition_a_new_owner_task(engine) -> None:
+    sessions = create_session_factory(engine)
+    with sessions() as session:
+        task_id = _task(session).id
+        task = session.get(Task, task_id)
+        task.status = "preparing"
+        task.claim_token = "fresh-owner"
+        task.claim_expires_at = datetime.now(UTC) + timedelta(minutes=2)
+        session.commit()
+
+    with sessions() as session:
+        changed = cas_task_status(
+            session,
+            task_id,
+            expected="preparing",
+            new_status="failed",
+            claim_token="stale-owner",
+        )
+        session.commit()
+
+    assert changed is False
+    with sessions() as session:
+        task = session.get(Task, task_id)
+        assert task.status == "preparing"
+        assert task.claim_token == "fresh-owner"
+
+
+def test_successful_cas_appends_a_versioned_transition(engine) -> None:
+    sessions = create_session_factory(engine)
+    with sessions() as session:
+        task_id = _task(session).id
+        changed = cas_task_status(
+            session,
+            task_id,
+            expected="awaiting_human_review",
+            new_status="closed",
+            actor="test",
+        )
+        session.commit()
+
+    assert changed is True
+    with sessions() as session:
+        transition = session.scalar(
+            select(TaskTransition).where(TaskTransition.task_id == task_id)
+        )
+        assert transition.from_status == "awaiting_human_review"
+        assert transition.to_status == "closed"
+        assert transition.actor == "test"
+        assert transition.contract_version == 1

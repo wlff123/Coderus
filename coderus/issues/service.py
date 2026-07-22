@@ -89,17 +89,34 @@ def add_and_dispatch_issue(
     return dispatch_issue(session, issue, creator, commit=commit)
 
 
-def sync_repository(session: Session, repository: Repository, provider: IssueProvider) -> int:
+def sync_repository(
+    session: Session,
+    repository: Repository,
+    provider: IssueProvider,
+    *,
+    full: bool = True,
+) -> int:
     if repository.sync_status == "running":
         return 0
     repository.sync_status = "running"
-    repository.sync_started_at = datetime.now(UTC)
+    sync_started_at = datetime.now(UTC)
+    repository.sync_started_at = sync_started_at
     repository.last_sync_error = None
     session.commit()
     try:
         source_repository = provider_repository(repository)
         if hasattr(provider, "list_issues"):
-            sources = provider.list_issues(source_repository, state="all")
+            if full:
+                sources = provider.list_issues(source_repository, state="all")
+            else:
+                cursor = repository.sync_cursor_updated_at
+                if cursor is not None and cursor.tzinfo is None:
+                    cursor = cursor.replace(tzinfo=UTC)
+                sources = provider.list_issues(
+                    source_repository,
+                    state="all",
+                    updated_since=cursor,
+                )
         else:
             sources = provider.list_open_issues(source_repository)
         for source in sources:
@@ -111,6 +128,7 @@ def sync_repository(session: Session, repository: Repository, provider: IssuePro
         raise
     repository.sync_status = "succeeded"
     repository.last_synced_at = datetime.now(UTC)
+    repository.sync_cursor_updated_at = sync_started_at
     session.flush()
     return len(sources)
 

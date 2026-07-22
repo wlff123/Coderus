@@ -77,14 +77,14 @@ if [[ -f "$RELEASE/LEGACY_RUNTIME" ]]; then
   nohup "$PYTHON" -m coderus serve \
     --config "$ROOT/config.yaml" \
     --secrets "$ROOT/secrets.env" \
-    >>"$LOG_FILE" 2>&1 </dev/null &
+    >>"$LOG_FILE" 2>&1 </dev/null 9>&- &
 else
   nohup "$PYTHON" -m coderus serve \
     --runtime active \
     --config "$ROOT/config.yaml" \
     --secrets "$ROOT/secrets.env" \
     --port "$PORT" \
-    >>"$LOG_FILE" 2>&1 </dev/null &
+    >>"$LOG_FILE" 2>&1 </dev/null 9>&- &
 fi
 pid=$!
 printf '%s\n' "$pid" > "$PID_FILE"

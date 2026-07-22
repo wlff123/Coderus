@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "contract_version": {
+      "type": "integer",
+      "const": 1,
+      "default": 1
+    },
+    "decision": {
+      "type": "string",
+      "enum": ["approve", "changes_requested"]
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": ["critical", "high", "medium", "low"]
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4000
+          }
+        },
+        "required": ["severity", "message"]
+      }
+    }
+  },
+  "required": ["decision", "findings"],
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {"decision": {"const": "approve"}},
+        "required": ["decision"]
+      },
+      "then": {"properties": {"findings": {"maxItems": 0}}}
+    },
+    {
+      "if": {
+        "properties": {"decision": {"const": "changes_requested"}},
+        "required": ["decision"]
+      },
+      "then": {"properties": {"findings": {"minItems": 1}}}
+    }
+  ]
+}

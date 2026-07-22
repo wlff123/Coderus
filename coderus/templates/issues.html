@@ -15,6 +15,7 @@
     <button class="button secondary" type="submit">搜索</button>
   </form>
 </div>
+{% if not codex_auth.ready %}<div class="credential-notice warning"><span class="status warning">Agent 执行已阻止</span><span>{{ codex_auth.detail }}</span></div>{% endif %}
 <nav class="repository-tabs" aria-label="仓库范围">
   <a{% if not selected_repository %} class="active" aria-current="page"{% endif %} href="/issues?{{ repository_tab_query|safe }}">全部仓库</a>
   {% for repository in repositories %}
@@ -48,7 +49,7 @@
               <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
               {% if selected_repository_id %}<input type="hidden" name="repository" value="{{ selected_repository_id }}">{% endif %}
               <textarea name="instructions" rows="3" aria-label="补充说明" placeholder="补充说明（可选）"></textarea>
-              <button class="button primary" type="submit">确认派发</button>
+              <button class="button primary" type="submit"{% if not codex_auth.ready %} disabled{% endif %}>确认派发</button>
             </form>
           </details>
           {% if current_user.role == 'admin' %}

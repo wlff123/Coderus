@@ -22,6 +22,7 @@ def test_container_start_script_has_safe_idempotent_contract() -> None:
     assert 'readlink -f "/proc/$pid/cwd"' in script
     assert '"--config $ROOT/config.yaml"' in script
     assert 'nohup "$PYTHON" -m coderus serve' in script
+    assert script.count("9>&-") >= 2
     assert "--runtime active" in script
     assert 'READY_URL="http://127.0.0.1:${PORT}/readyz"' in script
     assert '[[ -f "$RELEASE/LEGACY_RUNTIME" ]]' in script
@@ -96,10 +97,14 @@ def test_release_install_and_preview_scripts_are_isolated() -> None:
     assert 'ROOT="${CODERUS_ROOT:-/opt/coderus}"' in install
     assert 'UV="${CODERUS_UV:-}"' in install
     assert 'command -v uv' in install
-    assert "coderus.release_install" in install
+    assert "coderus.release_install" not in install
+    assert "CODERUS_RELEASE_BOOTSTRAP" in install
+    assert "CODERUS_BOOTSTRAP_PYTHON" in install
+    assert "CODERUS_RELEASE_PUBLIC_KEY" in install
     assert "sync --locked --extra dev" in install
     assert "yaml.safe_load" in install
     assert 'export PATH="$(dirname "$CODEX_BINARY"):$PATH"' in install
+    assert 'env -u CODERUS_ROOT "$UV" run pytest -q' in install
     assert "touch \"$RELEASE/VERIFIED\"" not in install
     assert "coderus.release_ops backup" in preview
     assert 'cleanup() { bash "$ROOT/scripts/stop-preview.sh" "$RELEASE_ID"; }' in preview
@@ -118,13 +123,17 @@ def test_promotion_script_drains_then_switches_with_automatic_rollback() -> None
     rollback = (ROOT / "scripts" / "rollback-release.sh").read_text(encoding="utf-8")
 
     assert "flock" in promote
+    assert 'CUTOVER_TIMEOUT="${CODERUS_CUTOVER_TIMEOUT:-30}"' in promote
     assert 'touch "$DRAIN_GATE"' in promote
     assert "coderus.release_ops check-idle" in promote
     assert "--verify-release" in promote
+    assert "coderus.release_ops check-schema" in promote
     assert 'bash "$ROOT/scripts/container-stop.sh"' in promote
     assert "coderus.release_ops backup" in promote
+    assert "coderus.release_ops migrate" in promote
     assert 'mv -Tf "$ROOT/$pointer.new" "$ROOT/$pointer"' in promote
     assert "--runtime maintenance" in promote
+    assert "9>&-" in promote
     assert 'bash "$ROOT/scripts/container-start.sh"' in promote
     assert "rollback_failed_promotion" in promote
     assert 'timeout --foreground "${remaining}s"' in promote
@@ -136,6 +145,8 @@ def test_promotion_script_drains_then_switches_with_automatic_rollback() -> None
         ROOT / "scripts" / "container-stop.sh"
     ).read_text(encoding="utf-8")
     assert 'rm -f "$DRAIN_GATE"' in promote
+    assert "coderus.release_ops write-history" in promote
+    assert "coderus.release_ops prune-artifacts" in promote
     assert "current" in rollback
     assert "previous" in rollback
 
@@ -147,6 +158,9 @@ def test_legacy_promotion_stops_ingress_before_final_idle_check() -> None:
     assert cutover.index('bash "$ROOT/scripts/container-stop.sh"') < cutover.index(
         "coderus.release_ops check-idle"
     )
+    assert cutover.index("coderus.release_ops backup") < cutover.index(
+        "coderus.release_ops migrate"
+    ) < cutover.index("atomic_link current")
     assert 'OLD_RELEASE/LEGACY_RUNTIME' not in cutover
 
 
@@ -210,3 +224,5 @@ def test_bootstrap_script_preserves_current_runtime_as_rollback_release() -> Non
     assert 'touch "$RELEASE/VERIFIED"' in script
     assert 'touch "$RELEASE/LEGACY_RUNTIME"' in script
     assert 'touch "$RELEASE/LEGACY_ROOT_CWD"' in script
+    assert '"$ROOT/bootstrap/release-bootstrap.py"' in script
+    assert '"$ROOT/coderus/release_bootstrap.py"' in script

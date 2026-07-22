@@ -6,6 +6,7 @@ import logging
 import os
 import secrets
 import shutil
+import weakref
 from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from datetime import UTC, datetime
@@ -81,7 +82,8 @@ from coderus.readiness import readiness_report
 from coderus.release_gate import ReleaseGate
 from coderus.release_status import load_release_status
 from coderus.runner import LocalCodexRunner, RunnerConfig, resolve_codex_command
-from coderus.security.credentials import CredentialCipher
+from coderus.runtime_lock import ActiveManagerLock
+from coderus.security import CredentialCipher, inspect_codex_auth
 from coderus.tasks.statuses import RUNNING_TASK_STATES
 from coderus.web.forge_runtime import (
     build_gitcode_runtime,
@@ -192,6 +194,7 @@ def create_app(
     | None = None,
     start_scheduler: bool | None = None,
     runtime: RuntimeMode | None = None,
+    preview_isolated: bool = False,
 ) -> FastAPI:
     if settings is None:
         config_path = Path(os.environ.get("CODERUS_CONFIG", "config.yaml"))
@@ -206,41 +209,62 @@ def create_app(
     runtime_mode: RuntimeMode = runtime or (
         "active" if start_scheduler is not False else "preview"
     )
+    if runtime == "preview" and not preview_isolated:
+        raise ValueError("explicit preview requires isolated preview paths")
     if runtime_mode == "maintenance":
         return create_maintenance_app(settings)
     background_enabled = runtime_mode == "active"
     start_scheduler = background_enabled
 
-    engine = create_engine_from_settings(settings.database)
-    settings.workspace.root.mkdir(parents=True, exist_ok=True)
-    Base.metadata.create_all(engine)
-    ensure_schema_compatibility(engine)
-    sessions = create_session_factory(engine)
-    with sessions() as session:
-        ensure_bootstrap_admin(session, "admin", settings.bootstrap_admin_password)
-        interrupted_repositories = session.scalars(
-            select(Repository).where(Repository.sync_status == "running")
-        ).all()
-        for repository in interrupted_repositories:
-            repository.sync_status = "failed"
-            repository.sync_started_at = None
-            repository.last_sync_error = "同步被服务重启中断，请重新刷新"
-        interrupted_feishu_events = session.scalars(
-            select(FeishuEvent).where(FeishuEvent.status == "processing")
-        ).all()
-        for event in interrupted_feishu_events:
-            event.status = "failed"
-            event.error_summary = "服务重启中断了飞书命令"
-            event.processed_at = datetime.now(UTC)
-        session.commit()
+    manager_lock = None
+    if runtime_mode == "active":
+        database_path = settings.database.path.expanduser().resolve()
+        manager_lock = ActiveManagerLock(
+            database_path.with_name(f"{database_path.name}.manager.lock")
+        )
+        manager_lock.acquire()
+    try:
+        engine = create_engine_from_settings(settings.database)
+        settings.workspace.root.mkdir(parents=True, exist_ok=True)
+        Base.metadata.create_all(engine)
+        ensure_schema_compatibility(engine)
+        sessions = create_session_factory(engine)
+        with sessions() as session:
+            ensure_bootstrap_admin(session, "admin", settings.bootstrap_admin_password)
+            if runtime != "preview":
+                interrupted_repositories = session.scalars(
+                    select(Repository).where(Repository.sync_status == "running")
+                ).all()
+                for repository in interrupted_repositories:
+                    repository.sync_status = "failed"
+                    repository.sync_started_at = None
+                    repository.last_sync_error = "同步被服务重启中断，请重新刷新"
+                interrupted_feishu_events = session.scalars(
+                    select(FeishuEvent).where(FeishuEvent.status == "processing")
+                ).all()
+                for event in interrupted_feishu_events:
+                    event.status = "failed"
+                    event.error_summary = "服务重启中断了飞书命令"
+                    event.processed_at = datetime.now(UTC)
+                    event.reply_text = "命令被服务重启中断，请重新发送"
+                    event.reply_status = "pending"
+            session.commit()
+    except BaseException:
+        if manager_lock is not None:
+            manager_lock.release()
+        raise
 
     app = FastAPI(title="Coderus", docs_url=None, redoc_url=None)
     app.state.settings = settings
     app.state.runtime_mode = runtime_mode
     app.state.background_enabled = background_enabled
+    app.state.manager_lock = manager_lock
+    if manager_lock is not None:
+        weakref.finalize(app, manager_lock.release)
     release_gate = ReleaseGate.from_settings(settings)
     app.state.release_gate = release_gate
     app.state.release_status = load_release_status(settings)
+    app.state.codex_auth = inspect_codex_auth(settings)
 
     @app.middleware("http")
     async def reject_mutations_while_draining(request: Request, call_next):
@@ -421,7 +445,6 @@ def create_app(
                     http_client=feishu_http_client,
                 )
                 notifier = FeishuTaskNotifier(
-                    feishu_client,
                     session_factory=sessions,
                     default_chat_id=resolved_feishu.default_chat_id,
                 )
@@ -429,7 +452,14 @@ def create_app(
                     session_factory=sessions,
                     providers=app.state.providers,
                     forges=app.state.forges,
-                    can_mutate=release_gate.allows_work,
+                    can_mutate=lambda: (
+                        release_gate.allows_work() and app.state.codex_auth.ready
+                    ),
+                    mutation_block_reason=lambda: (
+                        app.state.codex_auth.detail
+                        if not app.state.codex_auth.ready
+                        else "系统正在发布新版本，暂不接收新任务，请稍后重试"
+                    ),
                 )
 
                 def build_gateway(callback: Callable[[IncomingFeishuMessage], None]):
@@ -505,7 +535,7 @@ def create_app(
         global_limit=settings.scheduler.global_task_limit,
         per_user_limit=settings.scheduler.per_user_task_limit,
         poll_seconds=2,
-        can_claim=release_gate.allows_work,
+        can_claim=lambda: release_gate.allows_work() and app.state.codex_auth.ready,
     )
     app.state.orchestrator = orchestrator
     app.state.scheduler = scheduler
@@ -536,7 +566,7 @@ def create_app(
         session_factory=sessions,
         orchestrator=pr_review_orchestrator,
         poll_seconds=2,
-        can_claim=release_gate.allows_work,
+        can_claim=lambda: release_gate.allows_work() and app.state.codex_auth.ready,
     )
     app.state.pr_review_orchestrator = pr_review_orchestrator
     app.state.pr_review_scheduler = pr_review_scheduler
@@ -672,6 +702,8 @@ def create_app(
     app.router.add_event_handler("shutdown", close_github_http_client)
     app.router.add_event_handler("shutdown", close_feishu_http_client)
     app.router.add_event_handler("shutdown", dispose_engine)
+    if manager_lock is not None:
+        app.router.add_event_handler("shutdown", manager_lock.release)
 
     app.add_middleware(
         SessionMiddleware,
@@ -1012,7 +1044,7 @@ def create_app(
             checks = {
                 "server_mode": settings.server.mode,
                 "codex_binary": settings.codex.binary,
-                "model_proxy": settings.model_api_key is not None,
+                "codex_auth": app.state.codex_auth,
                 "feishu": resolved_feishu.enabled,
                 "service_url": settings.server.public_url
                 or f"http://{settings.server.bind}:{settings.server.port}",
@@ -1628,6 +1660,7 @@ def create_app(
                         {"triage": triage, **({"q": q} if q else {})}
                     ),
                     forge_status=forge_status(),
+                    codex_auth=app.state.codex_auth,
                 ),
             )
 
@@ -1684,10 +1717,17 @@ def create_app(
                 return HTMLResponse("Not found", status_code=404)
             repository_id = issue.repository_id if repository == issue.repository_id else None
             try:
-                task = dispatch_issue(session, issue, current, instructions)
+                task = dispatch_issue(
+                    session, issue, current, instructions, commit=False
+                )
             except ValueError as exc:
                 flash(request, str(exc), "danger")
                 return redirect(repository_scoped_path("/issues", repository_id))
+            if not app.state.codex_auth.ready:
+                session.rollback()
+                flash(request, app.state.codex_auth.detail, "danger")
+                return redirect(repository_scoped_path("/issues", repository_id))
+            session.commit()
             flash(request, f"Issue #{issue.number} 已派发为 RE-{task.id}")
         return redirect(repository_scoped_path("/tasks", repository_id))
 
@@ -1955,6 +1995,7 @@ def create_app(
                         }
                     ),
                     forge_status=forge_status(),
+                    codex_auth=app.state.codex_auth,
                 ),
             )
 
@@ -2005,6 +2046,9 @@ def create_app(
                 return redirect("/login")
             if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
                 return HTMLResponse("Invalid CSRF token", status_code=400)
+            if not app.state.codex_auth.ready:
+                flash(request, app.state.codex_auth.detail, "danger")
+                return redirect("/reviews")
             try:
                 source_repository, _ = parse_pull_request_url(pr_url)
                 if not app.state.forges.supports(

@@ -23,6 +23,7 @@ Coderus 使用两个本地文件：
 | `scheduler.per_user_task_limit` | `2` | 单用户并行任务数 |
 | `scheduler.max_agent_processes` | `16` | Codex 子进程上限 |
 | `codex.binary` | `codex` | Codex CLI 路径或命令名 |
+| `codex.auth_mode` | `api_proxy` | 仅支持任务级短期 API 代理 |
 | `codex.sandbox_mode` | `workspace-write` | Issue Agent 沙箱策略 |
 
 ## 密钥
@@ -60,13 +61,7 @@ GitCode 的 Fork、PR 发布和代码检视要求网页中保存经过用户名�
 
 ## Codex 与模型服务
 
-默认使用当前服务用户的 Codex CLI 登录态。先执行：
-
-```bash
-codex login status
-```
-
-使用兼容 OpenAI Responses API 的服务时，同时配置：
+默认使用模型 API 代理。配置：
 
 ```text
 CODERUS_MODEL_BASE_URL=https://api.example.com/v1
@@ -74,6 +69,10 @@ CODERUS_MODEL_API_KEY=<model-api-key>
 ```
 
 并在 `config.yaml` 中设置 `codex.model`。Coderus 通过仅监听回环地址的短期凭据代理向 Codex 提供访问能力，真实模型 Key 不进入任务环境。
+
+Coderus 不支持把 Codex CLI 长期登录态交给 Agent。原因是 Agent 需要执行仓库命令并联网，同一进程可读取的长期凭据无法形成可靠安全边界。未配置模型 API Key 时，控制面板仍可访问，但 Issue 派发、PR 检视、飞书派发和后台 Agent 领取均被阻止。
+
+默认保护上限包括：单个工作区 2 GiB、单任务最多 500 个变更文件、补丁 8 MiB、单个 Agent 输出 1 MiB；模型代理单任务阶段最多 256 个请求、1 个并发请求和 10 MiB 响应数据。这些是当前版本的安全常量，不通过网页或配置文件放宽。
 
 ## 飞书
 

@@ -22,6 +22,17 @@ _HOP_BY_HOP_HEADERS = {
     "upgrade",
 }
 _MAX_REQUEST_BYTES = 10 * 1024 * 1024
+_MAX_OUTPUT_TOKENS = 32_768
+_MAX_TOOLS = 64
+_TOOL_FIELDS = {
+    "function": frozenset({"type", "name", "description", "parameters", "strict"}),
+    "custom": frozenset({"type", "name", "description", "format"}),
+    "local_shell": frozenset({"type"}),
+}
+
+
+class _RequestTooLarge(Exception):
+    pass
 
 
 def create_proxy_app(
@@ -51,7 +62,15 @@ def create_proxy_app(
         if request.url.query:
             return JSONResponse({"detail": "Endpoint is not permitted"}, status_code=403)
 
-        raw_body = await request.body()
+        content_length = _content_length(request.headers.get("content-length"))
+        if content_length is None and request.headers.get("content-length") is not None:
+            return JSONResponse({"detail": "Invalid Content-Length"}, status_code=400)
+        if content_length is not None and content_length > _MAX_REQUEST_BYTES:
+            return JSONResponse({"detail": "Request body too large"}, status_code=413)
+        try:
+            raw_body = await _read_request_body(request)
+        except _RequestTooLarge:
+            return JSONResponse({"detail": "Request body too large"}, status_code=413)
         payload = _responses_payload(raw_body, request.headers.get("content-type"))
         if payload is None:
             return JSONResponse(
@@ -77,7 +96,13 @@ def create_proxy_app(
         headers["authorization"] = f"Bearer {upstream_api_key}"
 
         owned_client = client is None
-        proxy_client = client or httpx.AsyncClient(transport=transport)
+        try:
+            proxy_client = client or httpx.AsyncClient(transport=transport)
+        except BaseException as exc:
+            permit.release()
+            if not isinstance(exc, Exception):
+                raise
+            return JSONResponse({"detail": "Upstream request failed"}, status_code=502)
         try:
             upstream_request = proxy_client.build_request(
                 "POST",
@@ -86,35 +111,42 @@ def create_proxy_app(
                 content=raw_body,
             )
             upstream_response = await proxy_client.send(upstream_request, stream=True)
-        except Exception:
-            permit.release()
-            if owned_client:
-                await proxy_client.aclose()
+        except BaseException as exc:
+            await _cleanup(permit, client=proxy_client if owned_client else None)
+            if not isinstance(exc, Exception):
+                raise
             return JSONResponse({"detail": "Upstream request failed"}, status_code=502)
 
         if upstream_response.is_error:
             status_code = upstream_response.status_code
-            await upstream_response.aclose()
-            permit.release()
-            if owned_client:
-                await proxy_client.aclose()
+            await _cleanup(
+                permit,
+                response=upstream_response,
+                client=proxy_client if owned_client else None,
+            )
             return JSONResponse({"detail": "Upstream request failed"}, status_code=status_code)
 
         response_headers = _forward_headers(upstream_response.headers)
         content_type = upstream_response.headers.get("content-type", "")
         if not content_type.lower().startswith("text/event-stream"):
             try:
-                content = await upstream_response.aread()
-            except Exception:
-                await upstream_response.aclose()
-                permit.release()
-                if owned_client:
-                    await proxy_client.aclose()
+                content = await _read_upstream_body(upstream_response, permit)
+            except BaseException as exc:
+                await _cleanup(
+                    permit,
+                    response=upstream_response,
+                    client=proxy_client if owned_client else None,
+                )
+                if isinstance(exc, LeaseRejected):
+                    return JSONResponse({"detail": str(exc)}, status_code=exc.status_code)
+                if not isinstance(exc, Exception):
+                    raise
                 return JSONResponse({"detail": "Upstream request failed"}, status_code=502)
-            await upstream_response.aclose()
-            permit.release()
-            if owned_client:
-                await proxy_client.aclose()
+            await _cleanup(
+                permit,
+                response=upstream_response,
+                client=proxy_client if owned_client else None,
+            )
             return Response(
                 content=content,
                 status_code=upstream_response.status_code,
@@ -124,14 +156,16 @@ def create_proxy_app(
         async def body() -> AsyncIterator[bytes]:
             try:
                 async for chunk in upstream_response.aiter_raw():
+                    permit.record_output(len(chunk))
                     yield chunk
-            except Exception:
-                return
+            except LeaseRejected:
+                yield _output_limit_sse_error()
             finally:
-                await upstream_response.aclose()
-                permit.release()
-                if owned_client:
-                    await proxy_client.aclose()
+                await _cleanup(
+                    permit,
+                    response=upstream_response,
+                    client=proxy_client if owned_client else None,
+                )
 
         return StreamingResponse(
             body(),
@@ -189,4 +223,90 @@ def _responses_payload(
         return None
     if "stream" in payload and not isinstance(payload["stream"], bool):
         return None
+    max_output_tokens = payload.get("max_output_tokens")
+    if max_output_tokens is not None and (
+        not isinstance(max_output_tokens, int)
+        or isinstance(max_output_tokens, bool)
+        or not 1 <= max_output_tokens <= _MAX_OUTPUT_TOKENS
+    ):
+        return None
+    if payload.get("background", False) is not False:
+        return None
+    tools = payload.get("tools", [])
+    if not isinstance(tools, list) or len(tools) > _MAX_TOOLS:
+        return None
+    for tool in tools:
+        if not isinstance(tool, dict) or tool.get("type") not in _TOOL_FIELDS:
+            return None
+        tool_type = tool["type"]
+        if not set(tool).issubset(_TOOL_FIELDS[tool_type]):
+            return None
+        if tool_type != "local_shell" and (
+            not isinstance(tool.get("name"), str) or not tool["name"]
+        ):
+            return None
     return payload
+
+
+def _content_length(value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    return parsed if parsed >= 0 else None
+
+
+async def _read_request_body(request: Request) -> bytes:
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > _MAX_REQUEST_BYTES:
+            raise _RequestTooLarge
+        body.extend(chunk)
+    return bytes(body)
+
+
+async def _read_upstream_body(response: httpx.Response, permit) -> bytes:
+    if response.is_stream_consumed:
+        content = response.content
+        permit.record_output(len(content))
+        return content
+    body = bytearray()
+    if isinstance(response.stream, httpx.AsyncByteStream):
+        async for chunk in response.aiter_raw():
+            permit.record_output(len(chunk))
+            body.extend(chunk)
+    else:
+        for chunk in response.iter_raw():
+            permit.record_output(len(chunk))
+            body.extend(chunk)
+    return bytes(body)
+
+
+def _output_limit_sse_error() -> bytes:
+    payload = json.dumps(
+        {
+            "type": "error",
+            "code": "output_limit_exceeded",
+            "message": "Model proxy output limit exceeded",
+            "param": None,
+        },
+        separators=(",", ":"),
+    )
+    return f"event: error\ndata: {payload}\n\ndata: [DONE]\n\n".encode()
+
+
+async def _cleanup(
+    permit,
+    *,
+    response: httpx.Response | None = None,
+    client: httpx.AsyncClient | None = None,
+) -> None:
+    permit.release()
+    try:
+        if response is not None:
+            await response.aclose()
+    finally:
+        if client is not None:
+            await client.aclose()

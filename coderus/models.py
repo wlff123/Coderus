@@ -28,6 +28,16 @@ class Base(DeclarativeBase):
     pass
 
 
+class CoderusSchema(Base):
+    __tablename__ = "coderus_schema"
+    __table_args__ = (
+        CheckConstraint("singleton = 1", name="ck_coderus_schema_singleton"),
+    )
+
+    singleton: Mapped[int] = mapped_column(primary_key=True, default=1)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -145,8 +155,15 @@ class Task(Base):
     pr_url: Mapped[str | None] = mapped_column(String(1000))
     pr_number: Mapped[int | None] = mapped_column(Integer)
     pr_state: Mapped[str | None] = mapped_column(String(30))
+    pr_status_error: Mapped[str | None] = mapped_column(Text)
+    pr_status_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     failure_code: Mapped[str | None] = mapped_column(String(100))
     failure_summary: Mapped[str | None] = mapped_column(Text)
+    claim_token: Mapped[str | None] = mapped_column(String(100))
+    claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    publication_key: Mapped[str | None] = mapped_column(String(100))
+    publication_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    contract_version: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -156,6 +173,21 @@ class Task(Base):
     agent_runs: Mapped[list[AgentRun]] = relationship(back_populates="task")
     reviews: Mapped[list[Review]] = relationship(back_populates="task")
     pr_feedback: Mapped[list[PRFeedback]] = relationship(back_populates="task")
+    transitions: Mapped[list[TaskTransition]] = relationship(back_populates="task")
+
+
+class TaskTransition(Base):
+    __tablename__ = "task_transitions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id"), index=True)
+    from_status: Mapped[str] = mapped_column(String(50))
+    to_status: Mapped[str] = mapped_column(String(50))
+    actor: Mapped[str] = mapped_column(String(50), default="system")
+    contract_version: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    task: Mapped[Task] = relationship(back_populates="transitions")
 
 
 class FeishuEvent(Base):
@@ -170,6 +202,12 @@ class FeishuEvent(Base):
     command: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(30), default="queued", index=True)
     error_summary: Mapped[str | None] = mapped_column(Text)
+    reply_text: Mapped[str | None] = mapped_column(Text)
+    reply_status: Mapped[str | None] = mapped_column(String(30), index=True)
+    reply_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    reply_error: Mapped[str | None] = mapped_column(Text)
+    reply_next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reply_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     task_id: Mapped[int | None] = mapped_column(ForeignKey("tasks.id"), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -237,6 +275,7 @@ class Review(Base):
     decision: Mapped[str] = mapped_column(String(30))
     findings: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     blocking_count: Mapped[int] = mapped_column(Integer, default=0)
+    contract_version: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     task: Mapped[Task] = relationship(back_populates="reviews")

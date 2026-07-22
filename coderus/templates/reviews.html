@@ -16,12 +16,13 @@
     <button class="button secondary" type="submit">筛选</button>
   </form>
 </div>
+{% if not codex_auth.ready %}<div class="credential-notice warning"><span class="status warning">Agent 执行已阻止</span><span>{{ codex_auth.detail }}</span></div>{% endif %}
 <section class="workspace-section">
   <form method="post" action="/reviews" class="inline-form">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <label for="pr-url">PR URL</label>
     <input id="pr-url" name="pr_url" type="url" required placeholder="https://github.com/owner/repository/pull/123 或 https://gitcode.com/owner/repository/pulls/123">
-    <button class="button primary" type="submit">创建检视</button>
+    <button class="button primary" type="submit"{% if not codex_auth.ready %} disabled{% endif %}>创建检视</button>
   </form>
 </section>
 <section class="workspace-section">

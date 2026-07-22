@@ -43,6 +43,12 @@ touch "$DRAIN_GATE"
   rm -f "$DRAIN_GATE"
   exit 1
 }
+"$PYTHON" -m coderus.release_ops check-schema "$DATABASE" \
+  "$PREVIOUS/release.json" || {
+  rm -f "$DRAIN_GATE"
+  echo "Previous release does not support the current database schema" >&2
+  exit 1
+}
 CODERUS_STOP_TIMEOUT=5 bash "$ROOT/scripts/container-stop.sh" \
   || fail_closed "current release did not stop"
 atomic_link current "$PREVIOUS_ID" || fail_closed "cannot switch current link"

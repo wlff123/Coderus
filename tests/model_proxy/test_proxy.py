@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 
+import coderus.model_proxy.proxy as proxy_module
 from coderus.model_proxy import CredentialBroker, create_proxy_app
 
 
@@ -30,6 +33,17 @@ class SSEStream(httpx.AsyncByteStream):
         yield b"event: response.output_text.delta\n"
         yield b'data: {"delta":"hello"}\n\n'
         yield b"data: [DONE]\n\n"
+
+
+class TrackedChunks(httpx.AsyncByteStream):
+    def __init__(self, chunks: list[bytes]) -> None:
+        self.chunks = chunks
+        self.read_count = 0
+
+    async def __aiter__(self):
+        for chunk in self.chunks:
+            self.read_count += 1
+            yield chunk
 
 
 @pytest.mark.asyncio
@@ -171,6 +185,84 @@ async def test_sse_response_bytes_are_forwarded_unchanged() -> None:
 
 
 @pytest.mark.asyncio
+async def test_non_streaming_response_stops_reading_when_output_limit_is_reached() -> None:
+    broker = CredentialBroker(configured_model="test-model")
+    token = broker.issue(
+        task_id="task-1", stage="develop", max_output_bytes=8
+    )
+    stream = TrackedChunks([b"12345", b"67890", b"must-not-be-read"])
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            stream=stream,
+        )
+
+    app = create_proxy_app(
+        broker,
+        "https://models.example",
+        "real-secret-key",
+        transport=httpx.MockTransport(upstream),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+    ) as client:
+        response = await client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {token}"},
+            json=responses_payload(),
+        )
+
+    assert response.status_code == 429
+    assert response.json() == {"detail": "Lease output limit reached"}
+    assert stream.read_count == 2
+
+
+@pytest.mark.asyncio
+async def test_sse_output_limit_emits_error_event_and_terminal_marker() -> None:
+    broker = CredentialBroker(configured_model="test-model")
+    token = broker.issue(
+        task_id="task-1", stage="develop", max_output_bytes=42
+    )
+    stream = TrackedChunks(
+        [
+            b"event: response.output_text.delta\n",
+            b'data: {"delta":"hello"}\n\n',
+            b"data: must-not-be-forwarded\n\n",
+        ]
+    )
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=stream,
+        )
+
+    app = create_proxy_app(
+        broker,
+        "https://models.example",
+        "real-secret-key",
+        transport=httpx.MockTransport(upstream),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+    ) as client:
+        response = await client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {token}"},
+            json=responses_payload(stream=True),
+        )
+
+    assert response.status_code == 200
+    assert b"event: error\n" in response.content
+    assert b'"code":"output_limit_exceeded"' in response.content
+    assert response.content.endswith(b"data: [DONE]\n\n")
+    assert b"must-not-be-forwarded" not in response.content
+
+
+@pytest.mark.asyncio
 async def test_upstream_failures_return_only_generic_details(caplog) -> None:
     broker = CredentialBroker(configured_model="test-model")
     token = broker.issue(task_id="task-1", stage="develop")
@@ -280,3 +372,259 @@ async def test_proxy_enforces_request_limit() -> None:
     assert first.status_code == 200
     assert exhausted.status_code == 429
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_proxy_rejects_content_length_before_reading_body() -> None:
+    broker = CredentialBroker(configured_model="test-model")
+    token = broker.issue(task_id="task-1", stage="develop")
+    calls = 0
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"ok": True})
+
+    app = create_proxy_app(
+        broker,
+        "https://models.example",
+        "real-secret-key",
+        transport=httpx.MockTransport(upstream),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+    ) as client:
+        response = await client.post(
+            "/v1/responses",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Content-Length": str(10 * 1024 * 1024 + 1),
+            },
+            content=b"{}",
+        )
+
+    assert response.status_code == 413
+    assert calls == 0
+
+
+class RequestChunks(httpx.AsyncByteStream):
+    async def __aiter__(self):
+        yield b'{"model":"test-model",'
+        yield b'"input":"payload-too-large"}'
+
+
+@pytest.mark.asyncio
+async def test_proxy_stops_incremental_body_read_at_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(proxy_module, "_MAX_REQUEST_BYTES", 24)
+    broker = CredentialBroker(configured_model="test-model")
+    token = broker.issue(task_id="task-1", stage="develop")
+    app = create_proxy_app(broker, "https://models.example", "real-secret-key")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+    ) as client:
+        response = await client.post(
+            "/v1/responses",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            content=RequestChunks(),
+        )
+
+    assert response.status_code == 413
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"max_output_tokens": 32_769},
+        {"background": True},
+        {"tools": [{"type": "web_search_preview"}]},
+        {"tools": [{"type": "function", "name": "safe", "url": "https://example.com"}]},
+        {"tools": "not-a-list"},
+    ],
+)
+async def test_proxy_rejects_unsafe_response_options(change: dict[str, object]) -> None:
+    broker = CredentialBroker(configured_model="test-model")
+    token = broker.issue(task_id="task-1", stage="develop")
+    payload = responses_payload()
+    payload.update(change)
+    calls = 0
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"ok": True})
+
+    app = create_proxy_app(
+        broker,
+        "https://models.example",
+        "real-secret-key",
+        transport=httpx.MockTransport(upstream),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+    ) as client:
+        response = await client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {token}"},
+            json=payload,
+        )
+
+    assert response.status_code == 400
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelled_upstream_releases_broker_permit() -> None:
+    broker = CredentialBroker(configured_model="test-model")
+    token = broker.issue(
+        task_id="task-1", stage="develop", max_requests=2, max_concurrency=1
+    )
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        raise asyncio.CancelledError
+
+    app = create_proxy_app(
+        broker,
+        "https://models.example",
+        "real-secret-key",
+        transport=httpx.MockTransport(upstream),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+    ) as client:
+        with pytest.raises(asyncio.CancelledError):
+            await client.post(
+                "/v1/responses",
+                headers={"Authorization": f"Bearer {token}"},
+                json=responses_payload(),
+            )
+
+    permit = broker.acquire(
+        token, endpoint="/v1/responses", requested_model="test-model"
+    )
+    permit.release()
+
+
+class CancellingTransport(httpx.AsyncBaseTransport):
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        raise asyncio.CancelledError
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_cancelled_upstream_closes_owned_client() -> None:
+    broker = CredentialBroker(configured_model="test-model")
+    token = broker.issue(task_id="task-1", stage="develop")
+    transport = CancellingTransport()
+    app = create_proxy_app(
+        broker,
+        "https://models.example",
+        "real-secret-key",
+        transport=transport,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+    ) as client:
+        with pytest.raises(asyncio.CancelledError):
+            await client.post(
+                "/v1/responses",
+                headers={"Authorization": f"Bearer {token}"},
+                json=responses_payload(),
+            )
+
+    assert transport.closed is True
+
+
+@pytest.mark.asyncio
+async def test_client_construction_cancellation_releases_broker_permit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broker = CredentialBroker(configured_model="test-model")
+    token = broker.issue(
+        task_id="task-1", stage="develop", max_requests=2, max_concurrency=1
+    )
+    app = create_proxy_app(broker, "https://models.example", "real-secret-key")
+
+    def cancelled_client(*args, **kwargs):
+        raise asyncio.CancelledError
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+    ) as client:
+        monkeypatch.setattr(proxy_module.httpx, "AsyncClient", cancelled_client)
+        with pytest.raises(asyncio.CancelledError):
+            await client.post(
+                "/v1/responses",
+                headers={"Authorization": f"Bearer {token}"},
+                json=responses_payload(),
+            )
+
+    permit = broker.acquire(
+        token, endpoint="/v1/responses", requested_model="test-model"
+    )
+    permit.release()
+
+
+@pytest.mark.asyncio
+async def test_proxy_allows_codex_local_shell_tool_and_token_boundary() -> None:
+    broker = CredentialBroker(configured_model="test-model")
+    token = broker.issue(task_id="task-1", stage="develop")
+    payload = responses_payload()
+    payload.update(
+        max_output_tokens=32_768,
+        tools=[{"type": "local_shell"}],
+    )
+    app = create_proxy_app(
+        broker,
+        "https://models.example",
+        "real-secret-key",
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"ok": True})),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+    ) as client:
+        response = await client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {token}"},
+            json=payload,
+        )
+
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_proxy_returns_429_when_response_exceeds_output_budget() -> None:
+    broker = CredentialBroker(configured_model="test-model")
+    token = broker.issue(
+        task_id="task-1", stage="develop", max_requests=2, max_output_bytes=4
+    )
+    app = create_proxy_app(
+        broker,
+        "https://models.example",
+        "real-secret-key",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=b"12345")
+        ),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+    ) as client:
+        response = await client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {token}"},
+            json=responses_payload(),
+        )
+
+    assert response.status_code == 429

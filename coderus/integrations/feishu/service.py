@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -56,17 +56,34 @@ class FeishuCommandService:
         providers: Mapping[str, IssueProvider],
         forges: ForgeRegistry,
         can_mutate: Callable[[], bool] | None = None,
+        mutation_block_reason: Callable[[], str] | None = None,
     ) -> None:
         self.sessions = session_factory
         self.providers = providers
         self.forges = forges
         self.can_mutate = can_mutate or (lambda: True)
+        self.mutation_block_reason = mutation_block_reason or (
+            lambda: "系统正在发布新版本，暂不接收新任务，请稍后重试"
+        )
 
     def handle(self, message: IncomingFeishuMessage) -> str | None:
         if message.chat_type == "group" and not message.mentioned_bot:
             return None
 
         with self.sessions() as session:
+            if not message.sender_open_id:
+                event = self._event(message, status="failed")
+                event.error_summary = "missing sender_open_id"
+                event.processed_at = datetime.now(UTC)
+                reply = "无法确认发送者身份，已拒绝处理"
+                self._queue_reply(event, reply)
+                session.add(event)
+                try:
+                    session.commit()
+                except IntegrityError:
+                    session.rollback()
+                    return None
+                return reply
             event = self._event(message, status="processing")
             session.add(event)
             try:
@@ -78,7 +95,7 @@ class FeishuCommandService:
             command = parse_command(message.text)
             try:
                 if command.kind in {"dispatch", "review"} and not self.can_mutate():
-                    reply = "系统正在发布新版本，暂不接收新任务，请稍后重试"
+                    reply = self.mutation_block_reason()
                 elif command.kind == "help":
                     reply = HELP_TEXT
                 elif command.kind == "status":
@@ -134,9 +151,11 @@ class FeishuCommandService:
                 event.status = "failed"
                 event.error_summary = error_summary
                 event.processed_at = datetime.now(UTC)
-                session.commit()
                 operation = "检视" if command.kind == "review" else "派发"
-                return f"{operation}失败：{reason}"
+                reply = f"{operation}失败：{reason}"
+                self._queue_reply(event, reply)
+                session.commit()
+                return reply
             except Exception as exc:
                 session.rollback()
                 event = session.get(FeishuEvent, event.id)
@@ -144,9 +163,11 @@ class FeishuCommandService:
                 event.status = "failed"
                 event.error_summary = type(exc).__name__
                 event.processed_at = datetime.now(UTC)
-                session.commit()
                 operation = "检视" if command.kind == "review" else "派发"
-                return f"{operation}失败：内部错误，请稍后重试"
+                reply = f"{operation}失败：内部错误，请稍后重试"
+                self._queue_reply(event, reply)
+                session.commit()
+                return reply
             except BaseException:
                 session.rollback()
                 event = session.get(FeishuEvent, event.id)
@@ -157,8 +178,54 @@ class FeishuCommandService:
 
             event.status = "processed"
             event.processed_at = datetime.now(UTC)
+            self._queue_reply(event, reply)
             session.commit()
             return reply
+
+    def pending_replies(self, *, limit: int = 100) -> list[tuple[str, str, str]]:
+        now = datetime.now(UTC)
+        with self.sessions() as session:
+            rows = session.execute(
+                select(FeishuEvent.message_id, FeishuEvent.chat_id, FeishuEvent.reply_text)
+                .where(
+                    FeishuEvent.reply_status == "pending",
+                    FeishuEvent.reply_text.is_not(None),
+                    or_(
+                        FeishuEvent.reply_next_attempt_at.is_(None),
+                        FeishuEvent.reply_next_attempt_at <= now,
+                    ),
+                )
+                .order_by(FeishuEvent.id)
+                .limit(limit)
+            ).all()
+            return [(message_id, chat_id, text) for message_id, chat_id, text in rows]
+
+    def mark_reply_result(self, message_id: str, error: str | None = None) -> None:
+        with self.sessions() as session:
+            event = session.scalar(
+                select(FeishuEvent).where(FeishuEvent.message_id == message_id)
+            )
+            if event is None or event.reply_status != "pending":
+                return
+            event.reply_attempts += 1
+            event.reply_error = error[:1000] if error else None
+            if error is None:
+                event.reply_status = "sent"
+                event.reply_sent_at = datetime.now(UTC)
+                event.reply_next_attempt_at = None
+            else:
+                delay_seconds = min(300, 5 * (2 ** min(event.reply_attempts - 1, 6)))
+                event.reply_next_attempt_at = datetime.now(UTC) + timedelta(
+                    seconds=delay_seconds
+                )
+            session.commit()
+
+    @staticmethod
+    def _queue_reply(event: FeishuEvent, reply: str) -> None:
+        event.reply_text = reply
+        event.reply_status = "pending"
+        event.reply_error = None
+        event.reply_next_attempt_at = None
 
     @staticmethod
     def _event(message: IncomingFeishuMessage, *, status: str) -> FeishuEvent:
@@ -167,7 +234,7 @@ class FeishuCommandService:
             event_id=message.event_id or "",
             chat_id=message.chat_id,
             chat_type=message.chat_type,
-            sender_open_id=message.sender_open_id or "",
+            sender_open_id=message.sender_open_id or "<missing>",
             command=message.text,
             status=status,
         )

@@ -1,4 +1,5 @@
 from collections import deque
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -8,6 +9,7 @@ from coderus.providers import (
     ProviderRemoteError,
     Repository,
 )
+from coderus.providers.http import RetryPolicy
 
 
 class FakeResponse:
@@ -194,6 +196,26 @@ def test_list_issues_caps_page_count(monkeypatch) -> None:
     assert len(client.calls) == 2
 
 
+def test_list_issues_rejects_repeated_cursor() -> None:
+    first = (
+        '<https://api.github.com/repositories/1/issues?state=open&per_page=100'
+        '&page=2&after=same>; rel="next"'
+    )
+    second = (
+        '<https://api.github.com/repositories/1/issues?state=open&per_page=100'
+        '&page=3&after=same>; rel="next"'
+    )
+    client = FakeClient(
+        FakeResponse(200, [issue_payload(1)], headers={"Link": first}),
+        FakeResponse(200, [issue_payload(2)], headers={"Link": second}),
+    )
+
+    with pytest.raises(ProviderRemoteError, match="pagination"):
+        GitHubProvider(client=client).list_open_issues(github_repository())
+
+    assert len(client.calls) == 2
+
+
 def test_list_all_issues_requests_all_states() -> None:
     client = FakeClient(FakeResponse(200, [issue_payload(1)]))
 
@@ -201,6 +223,17 @@ def test_list_all_issues_requests_all_states() -> None:
 
     assert [issue.number for issue in issues] == [1]
     assert client.calls[0]["params"]["state"] == "all"
+
+
+def test_list_issues_can_request_updates_since_cursor() -> None:
+    client = FakeClient(FakeResponse(200, [issue_payload(1)]))
+    cursor = datetime(2026, 7, 20, 8, 30, tzinfo=UTC)
+
+    GitHubProvider(client=client).list_issues(
+        github_repository(), state="all", updated_since=cursor
+    )
+
+    assert client.calls[0]["params"]["since"] == "2026-07-20T08:30:00Z"
 
 
 def test_get_issue_uses_optional_token_and_maps_response() -> None:
@@ -264,7 +297,9 @@ def test_remote_status_exposes_retry_metadata_without_response_body() -> None:
     )
 
     with pytest.raises(ProviderRemoteError) as error:
-        GitHubProvider(client=client).get_issue(github_repository(), 1)
+        GitHubProvider(client=client, retry_policy=RetryPolicy(max_attempts=1)).get_issue(
+            github_repository(), 1
+        )
 
     assert error.value.provider == "github"
     assert error.value.status_code == 403

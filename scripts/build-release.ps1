@@ -1,5 +1,7 @@
 param(
-    [string]$OutputDirectory = "dist/releases"
+    [string]$OutputDirectory = "dist/releases",
+    [Parameter(Mandatory = $true)]
+    [string]$SigningKey
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,5 +23,6 @@ Invoke-Checked @("uv", "run", "ruff", "check", "coderus", "tests", "scripts/chec
 Invoke-Checked @("uv", "run", "pytest", "-q")
 Invoke-Checked @(
     "uv", "run", "python", "-m", "coderus.release_manifest",
-    "--root", $root, "--output", $OutputDirectory
+    "--root", $root, "--output", $OutputDirectory,
+    "--signing-key", $SigningKey
 )

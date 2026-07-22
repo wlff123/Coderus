@@ -10,6 +10,7 @@ ISSUE_URL_PATTERN = re.compile(r"^https://[^\s]+/issues/\d+$")
 PULL_REQUEST_URL_PATTERN = re.compile(
     r"^https://[^\s]+/(?:pulls?|merge_requests)/\d+$"
 )
+MARKDOWN_LINK_PATTERN = re.compile(r"^\[(https://[^\]\s]+)\]\((https://[^\s)]+)\)$")
 INTRO_QUESTIONS = frozenset(
     {
         "你会干什么",
@@ -57,13 +58,26 @@ def parse_command(text: str) -> BotCommand:
     if value == "任务":
         return BotCommand("tasks")
 
-    name, separator, argument = value.partition(" ")
-    if name == "任务" and separator:
+    argument = _command_argument(value, "任务")
+    if argument is not None:
         match = TASK_PATTERN.fullmatch(argument)
         if match:
             return BotCommand("task", f"RE-{int(match.group(1))}")
-    if name == "派发" and separator and ISSUE_URL_PATTERN.fullmatch(argument):
+    argument = _command_argument(value, "派发")
+    if argument is not None and ISSUE_URL_PATTERN.fullmatch(argument):
         return BotCommand("dispatch", argument)
-    if name == "检视" and separator and PULL_REQUEST_URL_PATTERN.fullmatch(argument):
+    argument = _command_argument(value, "检视")
+    if argument is not None and PULL_REQUEST_URL_PATTERN.fullmatch(argument):
         return BotCommand("review", argument)
     return BotCommand("unknown")
+
+
+def _command_argument(value: str, command: str) -> str | None:
+    if not value.startswith(command):
+        return None
+    argument = value[len(command) :].strip()
+    markdown_link = MARKDOWN_LINK_PATTERN.fullmatch(argument)
+    if markdown_link is None:
+        return argument
+    label, target = markdown_link.groups()
+    return target if label == target else argument

@@ -143,6 +143,8 @@ async def test_pr_status_poller_isolates_mixed_forge_failures_and_skips_dismisse
             ("awaiting_human_review", "open"),
             ("dismissed", "open"),
         ]
+        assert tasks[3].pr_status_error == "RuntimeError: temporary"
+        assert tasks[3].pr_status_checked_at is not None
     assert github_forge.calls == [7, 10]
     assert gitcode_forge.calls == [8]
 

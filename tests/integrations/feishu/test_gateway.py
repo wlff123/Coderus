@@ -10,6 +10,7 @@ from coderus.integrations.feishu.commands import IncomingFeishuMessage
 from coderus.integrations.feishu.gateway import (
     FeishuGateway,
     GatewayFailure,
+    _put_gateway_item,
     normalize_message_event,
 )
 
@@ -98,6 +99,26 @@ def test_normalize_ignores_events_without_required_message_identifiers() -> None
 
     assert normalize_message_event(missing_message_id) is None
     assert normalize_message_event(missing_chat_id) is None
+
+
+def test_normalize_preserves_event_without_sender_for_service_audit() -> None:
+    missing_sender = event(text="状态")
+    missing_sender.event.sender.sender_id.open_id = None
+
+    normalized = normalize_message_event(missing_sender)
+    assert normalized is not None
+    assert normalized.sender_open_id is None
+
+
+def test_queue_full_is_reported_with_structured_warning(caplog) -> None:
+    output: queue.Queue[object] = queue.Queue(maxsize=1)
+    output.put(object())
+
+    with caplog.at_level("WARNING"):
+        accepted = _put_gateway_item(output, incoming())
+
+    assert accepted is False
+    assert "feishu_gateway_queue_full" in caplog.text
 
 
 class FakeProcess:

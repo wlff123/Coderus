@@ -17,7 +17,7 @@ from coderus.pr_review import orchestrator as orchestrator_module
 from coderus.pr_review.models import ChangedRanges
 from coderus.pr_review.orchestrator import PRReviewOrchestrator, _ClaimLost
 from coderus.publisher import PRCommentResult, PublisherRemoteError, PullRequestDetails
-from coderus.runner import AgentRole, JobResult, JobStatus, Stage
+from coderus.runner import AgentRole, JobResult, JobStatus, RetryableAgentError, Stage
 
 BASE_SHA = "a" * 40
 HEAD_SHA = "b" * 40
@@ -190,6 +190,27 @@ class FakeRunner:
         )
 
 
+class RetryableRunner(FakeRunner):
+    def __init__(self, engine, failures: int) -> None:
+        super().__init__(engine)
+        self.failures = failures
+
+    async def run(self, spec, *, cancel_event=None) -> JobResult:
+        self.specs.append(spec)
+        self.cancel_events.append(cancel_event)
+        if len(self.specs) <= self.failures:
+            raise RetryableAgentError("temporary process exhaustion")
+        return JobResult(
+            job_id=spec.job_id,
+            status=JobStatus.SUCCEEDED,
+            exit_code=0,
+            stdout=self.stdout,
+            stderr="",
+            output_truncated=False,
+            duration_seconds=0.1,
+        )
+
+
 class FakeNotifier:
     def __init__(self, engine, *, error: Exception | None = None) -> None:
         self.engine = engine
@@ -222,6 +243,27 @@ def build_orchestrator(engine, tmp_path: Path, **overrides):
         stage_timeout_seconds=30,
     )
     return orchestrator, publisher, workspace, runner, notifier, broker
+
+
+@pytest.mark.asyncio
+async def test_pr_review_retries_retryable_agent_start_twice(
+    engine, session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = add_review_task(session)
+    runner = RetryableRunner(engine, failures=2)
+    orchestrator, *_ = build_orchestrator(engine, tmp_path, runner=runner)
+
+    async def no_delay(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", no_delay)
+
+    await orchestrator.run(task.id)
+
+    session.expire_all()
+    persisted = session.get(PRReviewTask, task.id)
+    assert persisted.status == "completed"
+    assert len(runner.specs) == 3
 
 
 @pytest.mark.asyncio

@@ -56,6 +56,7 @@ class CodexSettings(BaseModel):
     base_url: str | None = None
     proxy_port: int = Field(default=18083, ge=1, le=65535)
     sandbox_mode: Literal["workspace-write", "danger-full-access"] = "workspace-write"
+    auth_mode: Literal["api_proxy"] = "api_proxy"
 
 
 class GitSettings(BaseModel):

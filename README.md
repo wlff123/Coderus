@@ -36,7 +36,7 @@ Coderus 采用“人工分派、AI 执行”的协作模式：用户可通过控
 - Python 3.12 或 3.13；
 - Git；
 - [uv](https://docs.astral.sh/uv/)；
-- 已登录的 Codex CLI，或兼容 OpenAI Responses API 的模型服务；
+- 兼容 OpenAI Responses API 的模型服务，或使用专用系统账号登录的 Codex CLI；
 - 可选：GitHub、GitCode 和飞书应用凭据。
 
 ## 快速开始
@@ -51,11 +51,8 @@ uv run coderus serve --config config.yaml --secrets secrets.env
 
 `coderus init` 生成被 Git 忽略的 `config.yaml` 和 `secrets.env`，并输出初始管理员密码。启动后访问 [http://127.0.0.1:18082](http://127.0.0.1:18082)，使用用户名 `admin` 登录。
 
-使用 Codex 登录态前先确认：
-
-```bash
-codex login status
-```
+默认使用模型 API 代理。配置 `CODERUS_MODEL_API_KEY`、`CODERUS_MODEL_BASE_URL` 和 `codex.model` 后，每个 Agent 只获得任务级短期 Token。
+Coderus 不会把个人或服务账号的 Codex 长期登录凭据复制给 Agent。
 
 Windows 也可以在初始化后运行：
 

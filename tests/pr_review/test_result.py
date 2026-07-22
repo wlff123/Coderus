@@ -245,13 +245,42 @@ def test_render_comment_uses_provider_file_links(
     assert marker == f"<!-- coderus-pr-review:{REVIEW_KEY}:{BASE}:{HEAD} -->"
 
 
-def test_render_comment_uses_base_sha_for_left_locations() -> None:
+def test_render_comment_uses_comparison_sha_for_left_locations() -> None:
     output = output_at_line(3, file_path="src/removed.py", line_side="LEFT", line_end=5)
+    comparison = "c" * 40
 
-    body, _ = render_pr_comment("github", output, "acme", "widgets", BASE, HEAD, REVIEW_KEY)
+    body, _ = render_pr_comment(
+        "github",
+        output,
+        "acme",
+        "widgets",
+        BASE,
+        HEAD,
+        REVIEW_KEY,
+        comparison_sha=comparison,
+    )
 
-    assert f"/blob/{BASE}/src/removed.py#L3-L5" in body
+    assert f"/blob/{comparison}/src/removed.py#L3-L5" in body
+    assert f"/blob/{BASE}/src/removed.py#L3-L5" not in body
     assert f"/blob/{HEAD}/src/removed.py#L3-L5" not in body
+
+
+def test_validated_findings_carry_comparison_sha_to_left_links() -> None:
+    comparison = "c" * 40
+    output = output_at_line(
+        3, file_path="src/removed.py", line_side="LEFT", line_end=5
+    )
+    ranges = ChangedRanges(
+        {("src/removed.py", "LEFT"): ((3, 5),)}, comparison_sha=comparison
+    )
+
+    validated = validate_findings(output, ranges)
+    body, _ = render_pr_comment(
+        "github", validated, "acme", "widgets", BASE, HEAD, REVIEW_KEY
+    )
+
+    assert f"/blob/{comparison}/src/removed.py#L3-L5" in body
+    assert "comparison_sha" not in validated.model_dump()
 
 
 def test_render_comment_allows_no_findings() -> None:
@@ -310,13 +339,22 @@ def test_render_comment_keeps_malicious_path_inside_a_safe_code_span() -> None:
     assert body.endswith(marker)
 
 
-def test_render_comment_deduplicates_findings_with_the_same_location() -> None:
+def test_render_comment_keeps_distinct_findings_at_the_same_location() -> None:
     first = finding_data(title="第一个问题")
     duplicate = finding_data(title="第二个问题", impact="不同影响")
     output = ReviewOutput.model_validate(review_data([first, duplicate]))
 
     body, _ = render_pr_comment("github", output, "acme", "widgets", BASE, HEAD, REVIEW_KEY)
 
-    assert body.count("### ") == 1
+    assert body.count("### ") == 2
     assert "第一个问题" in body
-    assert "第二个问题" not in body
+    assert "第二个问题" in body
+
+
+def test_render_comment_deduplicates_identical_findings() -> None:
+    finding = finding_data()
+    output = ReviewOutput.model_validate(review_data([finding, finding.copy()]))
+
+    body, _ = render_pr_comment("github", output, "acme", "widgets", BASE, HEAD, REVIEW_KEY)
+
+    assert body.count("### ") == 1

@@ -19,7 +19,9 @@ mkdir -p "$ROOT/data"
 exec 9>"$LOCK_FILE"
 flock -n 9 || { echo "Another release operation is running" >&2; exit 1; }
 
-mkdir -p "$ROOT/releases" "$ROOT/incoming" "$ROOT/validation" "$ROOT/backups"
+mkdir -p "$ROOT/releases" "$ROOT/incoming" "$ROOT/validation" "$ROOT/backups" "$ROOT/bootstrap"
+install -m 0444 "$ROOT/coderus/release_bootstrap.py" \
+  "$ROOT/bootstrap/release-bootstrap.py"
 digest="$({ find "$ROOT/coderus" -type f -print0; printf '%s\0' "$ROOT/pyproject.toml" "$ROOT/uv.lock"; } \
   | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-8)"
 RELEASE_ID="$(date -u +%Y%m%d-%H%M%S)-$digest"

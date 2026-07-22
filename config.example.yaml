@@ -27,6 +27,8 @@ scheduler:
 
 codex:
   binary: codex
+  # Agent 只使用任务级短期 Token，不读取 Codex 长期登录凭据。
+  auth_mode: api_proxy
   model: null
   base_url: null
   proxy_port: 18083

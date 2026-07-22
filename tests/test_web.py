@@ -4,6 +4,7 @@ import os
 import re
 import sqlite3
 from base64 import urlsafe_b64encode
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -152,6 +153,14 @@ def login(client: TestClient) -> None:
     login_as(client, "admin", "initial-password")
 
 
+def enable_agent_execution(app) -> None:
+    app.state.codex_auth = replace(
+        app.state.codex_auth,
+        ready=True,
+        detail="test authentication ready",
+    )
+
+
 def test_healthz_is_public(client: TestClient) -> None:
     response = client.get("/healthz")
     assert response.status_code == 200
@@ -220,10 +229,56 @@ def test_preview_runtime_disables_background_components(
         app_settings,
         providers={"github": FakeGitHubProvider()},
         runtime="preview",
+        preview_isolated=True,
     )
 
     assert app.state.runtime_mode == "preview"
     assert app.state.background_enabled is False
+
+
+def test_explicit_preview_requires_isolated_runtime_confirmation(
+    app_settings: Settings,
+) -> None:
+    with pytest.raises(ValueError, match="isolated preview"):
+        create_app(app_settings, runtime="preview")
+
+
+def test_explicit_preview_does_not_run_active_recovery(
+    app_settings: Settings,
+) -> None:
+    engine = app_module.create_engine_from_settings(app_settings.database)
+    Base.metadata.create_all(engine)
+    with app_module.Session(engine) as session:
+        owner = create_user(session, "preview-owner", "password-123", role="admin")
+        session.add(
+            DbRepository(
+                provider="github",
+                owner="octo",
+                name="preview-state",
+                canonical_url="https://github.com/octo/preview-state",
+                default_branch="main",
+                created_by=owner.id,
+                sync_status="running",
+            )
+        )
+        session.commit()
+    engine.dispose()
+
+    app = create_app(
+        app_settings,
+        providers={"github": FakeGitHubProvider()},
+        runtime="preview",
+        preview_isolated=True,
+    )
+    with TestClient(app):
+        pass
+
+    with app.state.sessions() as session:
+        repository = session.scalar(
+            select(DbRepository).where(DbRepository.name == "preview-state")
+        )
+        assert repository is not None
+        assert repository.sync_status == "running"
 
 
 def test_create_app_rejects_unknown_runtime(app_settings: Settings) -> None:
@@ -253,6 +308,29 @@ def test_active_readyz_checks_background_components(app_settings: Settings) -> N
     assert unavailable.json()["error_codes"] == ["components_unavailable"]
 
 
+def test_second_active_manager_is_rejected(app_settings: Settings) -> None:
+    first = create_app(
+        app_settings,
+        providers={"github": FakeGitHubProvider()},
+        runtime="active",
+    )
+    with TestClient(first):
+        with pytest.raises(RuntimeError, match="already active"):
+            create_app(
+                app_settings,
+                providers={"github": FakeGitHubProvider()},
+                runtime="active",
+            )
+
+    replacement = create_app(
+        app_settings,
+        providers={"github": FakeGitHubProvider()},
+        runtime="active",
+    )
+    with TestClient(replacement):
+        assert replacement.state.manager_lock.acquired is True
+
+
 def test_release_drain_gate_rejects_new_post_requests(
     app_settings: Settings, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -262,6 +340,7 @@ def test_release_drain_gate_rejects_new_post_requests(
         app_settings,
         providers={"github": FakeGitHubProvider()},
         runtime="preview",
+        preview_isolated=True,
     )
     with TestClient(app) as drain_client:
         assert drain_client.get("/healthz").status_code == 200
@@ -970,6 +1049,7 @@ def test_account_password_change_shows_feedback(client: TestClient) -> None:
 
 
 def test_repository_sync_and_issue_dispatch_flow(client: TestClient) -> None:
+    enable_agent_execution(client.app)
     login(client)
     repositories = client.get("/repositories")
     added = client.post(
@@ -1031,6 +1111,32 @@ def test_repository_sync_and_issue_dispatch_flow(client: TestClient) -> None:
     detail = client.get("/tasks/1")
     assert detail.status_code == 200
     assert "执行进度" in detail.text
+
+
+def test_unavailable_codex_auth_blocks_issue_dispatch(client: TestClient) -> None:
+    login(client)
+    repositories = client.get("/repositories")
+    client.post(
+        "/repositories",
+        data={
+            "url": "https://github.com/octo/demo",
+            "csrf_token": csrf_from(repositories),
+        },
+    )
+    client.post(
+        "/repositories/1/sync",
+        data={"csrf_token": csrf_from(client.get("/repositories"))},
+    )
+    issues = client.get("/issues?repository=1")
+
+    response = client.post(
+        "/issues/1/dispatch",
+        data={"csrf_token": csrf_from(issues), "repository": "1"},
+    )
+
+    assert "Agent 执行已阻止" in response.text
+    with client.app.state.sessions() as session:
+        assert session.scalar(select(func.count()).select_from(Task)) == 0
 
 
 def test_pr_task_page_shows_human_review_handoff(client: TestClient) -> None:
@@ -2542,6 +2648,17 @@ def test_system_page_disables_github_form_without_encryption_key(client: TestCli
     assert "disabled" in page.text
 
 
+def test_system_page_shows_unavailable_codex_authentication(client: TestClient) -> None:
+    login(client)
+
+    page = client.get("/system")
+
+    assert "模型 API 代理" in page.text
+    assert "Agent 执行已阻止" in page.text
+    assert "CODERUS_MODEL_API_KEY" in page.text
+    assert client.app.state.codex_auth.ready is False
+
+
 def test_system_page_shows_safe_feishu_configuration_status(client: TestClient) -> None:
     login(client)
 
@@ -3621,6 +3738,7 @@ def test_regular_user_can_create_review_for_admin_registered_repository(
     )
     if provider == "gitcode":
         app.state.forges.install("gitcode", FakeReviewPublisher())
+    enable_agent_execution(app)
     with TestClient(app) as test_client:
         login(test_client)
         with app.state.sessions() as session:
@@ -3657,6 +3775,45 @@ def test_regular_user_can_create_review_for_admin_registered_repository(
             assert task.source_chat_id == ""
             assert task.source_message_id.startswith("web-review:")
             assert task.source_sender_open_id == f"web-user:{developer_id}"
+
+
+def test_unavailable_codex_auth_blocks_pr_review(
+    app_settings: Settings,
+) -> None:
+    app = create_app(
+        app_settings,
+        providers={"github": FakeGitHubProvider()},
+        publisher=FakeReviewPublisher(),
+        start_scheduler=False,
+    )
+    with TestClient(app) as test_client:
+        login(test_client)
+        with app.state.sessions() as session:
+            admin = session.scalar(select(User).where(User.username == "admin"))
+            session.add(
+                DbRepository(
+                    provider="github",
+                    owner="octo",
+                    name="web-review",
+                    canonical_url="https://github.com/octo/web-review",
+                    default_branch="main",
+                    created_by_user=admin,
+                )
+            )
+            session.commit()
+        page = test_client.get("/reviews")
+
+        response = test_client.post(
+            "/reviews",
+            data={
+                "pr_url": "https://github.com/octo/web-review/pull/7",
+                "csrf_token": csrf_from(page),
+            },
+        )
+
+        assert "Agent 执行已阻止" in response.text
+        with app.state.sessions() as session:
+            assert session.scalar(select(func.count()).select_from(PRReviewTask)) == 0
 
 
 @pytest.mark.parametrize(

@@ -26,9 +26,20 @@ sudo useradd --system --create-home --shell /bin/bash coderus
 sudo install -d -o coderus -g coderus /opt/coderus
 sudo -u coderus -H git clone <your-coderus-repository-url> /opt/coderus
 sudo -u coderus -H bash -lc 'cd /opt/coderus && uv sync --locked --extra dev'
-sudo -u coderus -H bash -lc 'cd /opt/coderus && codex login'
 sudo -u coderus -H bash -lc 'cd /opt/coderus && uv run coderus init'
 ```
+
+签名归档由稳定目录中的独立 bootstrap 验证。系统 Python 必须预装 `cryptography`；bootstrap 不导入当前版本或候选版本的 Coderus 代码。首次建立版本布局会自动安装它。已经运行旧版布局的机器，在第一次签名升级前执行一次：
+
+```bash
+sudo install -d -o coderus -g coderus -m 0755 /opt/coderus/bootstrap
+sudo install -o coderus -g coderus -m 0444 \
+  coderus/release_bootstrap.py \
+  /opt/coderus/bootstrap/release-bootstrap.py
+sudo -u coderus /usr/bin/python3 -c 'import cryptography'
+```
+
+如系统 Python 不是 `/usr/bin/python3`，通过 `CODERUS_BOOTSTRAP_PYTHON` 指定已审核且安装了 `cryptography` 的解释器。bootstrap 文件只在人工审核升级安装链路时更新，普通候选包不能覆盖它。
 
 如果 `uv` 不在服务用户的 `PATH`，请使用系统绝对路径执行上述命令，并将同一路径设置到 `CODERUS_UV`。初始化命令会输出管理员初始密码；应立即保存到密码管理器，并保护 `/opt/coderus/secrets.env`。
 
@@ -73,9 +84,14 @@ bash scripts/container-start.sh
 
 在开发工作区执行：
 
+首次构建前生成一对 Ed25519 发布密钥。私钥只保存在受控开发机或 CI Secret 中，部署机只保存公钥：
+
 ```powershell
-.\scripts\build-release.ps1
+uv run python -c "from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey as K; from cryptography.hazmat.primitives.serialization import Encoding as E, PrivateFormat as PF, PublicFormat as UF, NoEncryption as N; k=K.generate(); open('release-signing-key.pem','wb').write(k.private_bytes(E.PEM,PF.PKCS8,N())); open('release-public-key.pem','wb').write(k.public_key().public_bytes(E.PEM,UF.SubjectPublicKeyInfo))"
+.\scripts\build-release.ps1 -SigningKey .\release-signing-key.pem
 ```
+
+`release-signing-key.pem` 和 `release-public-key.pem` 都不能提交到代码仓。通过独立安全通道将公钥安装为 `/opt/coderus/release-public-key.pem`；可用 `CODERUS_RELEASE_PUBLIC_KEY` 覆盖该路径。
 
 构建过程依次执行公开发布扫描、Ruff、完整 pytest，并生成：
 
@@ -83,7 +99,7 @@ bash scripts/container-start.sh
 dist/releases/coderus-<release-id>.tar.gz
 ```
 
-发布包只包含源码、测试、通用脚本、README、示例配置和锁文件，不包含配置、密钥、数据库或工作区。
+发布包只包含源码、测试、通用脚本、README、示例配置和锁文件，不包含配置、密钥、数据库或工作区。`release.json` 使用 Ed25519 签名，安装、预览和切换时均由部署机固定公钥验证来源。
 
 ## 安装和隔离预览
 
@@ -120,7 +136,9 @@ bash scripts/promote-release.sh <release-id>
 bash scripts/rollback-release.sh
 ```
 
-手工回滚只切换到 `previous` 代码版本，不自动恢复历史数据库，因此数据库 Schema 必须保持向后兼容。
+手工回滚只切换到 `previous` 代码版本，不自动恢复历史数据库。回滚脚本会先读取目标版本的 Schema 兼容范围；不兼容时保持当前服务和数据库不变并拒绝回滚。需要破坏性迁移的版本必须同时提供经过验证的数据库恢复方案。
+
+发布成功记录通过临时文件、`fsync` 和原子替换写入 `data/release-history/`，默认保留最近 20 条；默认另外保留最近 5 个版本目录和 20 个数据库备份，`current`、`previous` 永不被清理。可分别使用 `CODERUS_RELEASE_HISTORY_RETAIN`、`CODERUS_RELEASE_RETAIN` 和 `CODERUS_BACKUP_RETAIN` 调整。历史写入完成前排空闸门不会解除；非关键的过期文件清理失败只记录警告，不回滚已经健康运行的新版本。
 
 ## SSH 隧道
 

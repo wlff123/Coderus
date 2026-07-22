@@ -75,6 +75,24 @@ def test_sync_repository_is_idempotent(session) -> None:
     assert repository.sync_status == "succeeded"
 
 
+def test_incremental_sync_uses_existing_cursor_and_advances_it(session) -> None:
+    _, repository = repository_fixture(session)
+    cursor = datetime(2026, 7, 20, 8, 30, tzinfo=UTC)
+    repository.sync_cursor_updated_at = cursor
+    session.commit()
+
+    class Provider:
+        def list_issues(self, _repository, *, state, updated_since):
+            assert state == "all"
+            assert updated_since == cursor
+            return [provider_issue("Incremental title")]
+
+    assert sync_repository(session, repository, Provider(), full=False) == 1
+    assert repository.sync_cursor_updated_at > cursor
+    assert repository.last_synced_at is not None
+    assert session.query(Issue).one().title == "Incremental title"
+
+
 def test_dispatch_issue_creates_one_active_task(session) -> None:
     user, repository = repository_fixture(session)
     issue = upsert_provider_issue(session, repository, provider_issue())

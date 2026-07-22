@@ -9,7 +9,9 @@
   <dl class="facts system-facts">
     <div><dt>访问模式</dt><dd><span class="status {{ status_tone(checks.server_mode) }}">{{ status_label(checks.server_mode) }}</span></dd></div>
     <div><dt>Codex 命令</dt><dd class="mono">{{ checks.codex_binary }}</dd></div>
-    <div><dt>模型认证</dt><dd><span class="status {{ 'ok' if checks.model_proxy else 'neutral' }}">{{ 'API 代理已配置' if checks.model_proxy else '使用本机 Codex 登录' }}</span></dd></div>
+    <div><dt>模型认证</dt><dd><span class="status {{ 'ok' if checks.codex_auth.ready else 'warning' }}">{{ checks.codex_auth.label }} · {{ '已就绪' if checks.codex_auth.ready else 'Agent 执行已阻止' }}</span></dd></div>
+    <div><dt>认证检查</dt><dd>{{ checks.codex_auth.detail }}</dd></div>
+    {% if checks.codex_auth.account_name %}<div><dt>专用系统用户</dt><dd class="mono">{{ checks.codex_auth.account_name }}</dd></div>{% endif %}
     <div><dt>GitHub 发布</dt><dd><span class="status {{ 'ok' if github.publish else 'warning' }}">{{ '已就绪' if github.publish else '未配置 Token' }}</span></dd></div>
     <div><dt>GitCode 发布</dt><dd><span class="status {{ 'ok' if gitcode.publish else ('warning' if gitcode.configured else 'neutral') }}">{{ '已就绪' if gitcode.publish else ('仅可同步 Issue' if gitcode.configured else '未配置 Token') }}</span></dd></div>
     <div><dt>飞书通知</dt><dd><span class="status {{ 'ok' if checks.feishu else 'neutral' }}">{{ '已启用' if checks.feishu else '未启用' }}</span></dd></div>

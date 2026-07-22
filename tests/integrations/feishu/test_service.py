@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import select
@@ -32,16 +32,33 @@ def message(
     message_id: str = "om_1",
     chat_type: str = "group",
     mentioned_bot: bool = True,
+    sender_open_id: str | None = "ou_1",
 ) -> IncomingFeishuMessage:
     return IncomingFeishuMessage(
         message_id=message_id,
         event_id="evt_1",
         chat_id="oc_1",
         chat_type=chat_type,
-        sender_open_id="ou_1",
+        sender_open_id=sender_open_id,
         text=text,
         mentioned_bot=mentioned_bot,
     )
+
+
+def test_missing_sender_is_rejected_and_audited(engine) -> None:
+    reply = service(engine).handle(
+        message("状态", message_id="missing-sender", sender_open_id=None)
+    )
+
+    assert reply == "无法确认发送者身份，已拒绝处理"
+    with create_session_factory(engine)() as session:
+        event = session.query(FeishuEvent).one()
+        assert event.chat_id == "oc_1"
+        assert event.sender_open_id == "<missing>"
+        assert event.status == "failed"
+        assert event.error_summary == "missing sender_open_id"
+        assert event.reply_text == reply
+        assert event.reply_status == "pending"
 
 
 def service(engine, providers=None, *, forges: ForgeRegistry | None = None) -> FeishuCommandService:
@@ -166,6 +183,26 @@ def test_help_lists_only_supported_commands(engine) -> None:
     assert "任务 RE-N" in reply
     assert "派发 <Issue URL>" in reply
     assert "取消" not in reply
+    with create_session_factory(engine)() as session:
+        event = session.query(FeishuEvent).one()
+        assert event.reply_text == reply
+        assert event.reply_status == "pending"
+
+
+def test_failed_reply_uses_persisted_backoff_before_retry(engine) -> None:
+    command_service = service(engine)
+    command_service.handle(message("帮助", message_id="retry-me"))
+
+    command_service.mark_reply_result("retry-me", "temporary")
+
+    assert command_service.pending_replies() == []
+    with create_session_factory(engine)() as session:
+        event = session.query(FeishuEvent).filter_by(message_id="retry-me").one()
+        assert event.reply_attempts == 1
+        assert event.reply_next_attempt_at is not None
+        event.reply_next_attempt_at = datetime.now(UTC) - timedelta(seconds=1)
+        session.commit()
+    assert command_service.pending_replies()[0][0] == "retry-me"
 
 
 def test_unknown_command_returns_strict_usage_help(engine) -> None:
@@ -510,6 +547,27 @@ def test_missing_review_publisher_does_not_affect_status_or_dispatch(engine) -> 
     with create_session_factory(engine)() as session:
         assert session.query(Task).count() == 1
         assert session.query(PRReviewTask).count() == 0
+
+
+def test_agent_authentication_gate_returns_configured_reason(engine) -> None:
+    command_service = FeishuCommandService(
+        session_factory=create_session_factory(engine),
+        providers={},
+        forges=ForgeRegistry(),
+        can_mutate=lambda: False,
+        mutation_block_reason=lambda: "Codex 认证未就绪，Agent 执行已阻止",
+    )
+
+    reply = command_service.handle(
+        message(
+            "派发 https://github.com/octo/demo/issues/7",
+            message_id="auth-unavailable",
+        )
+    )
+
+    assert reply == "Codex 认证未就绪，Agent 执行已阻止"
+    with create_session_factory(engine)() as session:
+        assert session.query(Task).count() == 0
 
 
 def test_duplicate_review_message_does_not_enqueue_a_second_task(engine) -> None:

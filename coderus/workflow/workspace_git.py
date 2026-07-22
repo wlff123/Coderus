@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import stat
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from coderus.processes import CommandTimedOut, run_process
+from coderus.processes import (
+    CommandOutputLimitExceeded,
+    CommandResourceLimitExceeded,
+    CommandTimedOut,
+    path_size_exceeds,
+    run_process,
+)
 
 _CODEX_PROBE_NAME = re.compile(r"^[a-z0-9_]{8}$")
 _SYSTEM_ENVIRONMENT_KEYS = {
@@ -54,12 +61,28 @@ class SealedPatch:
 
 class WorkspaceGit:
     def __init__(
-        self, workspace_root: Path, *, command_timeout_seconds: float = 120.0
+        self,
+        workspace_root: Path,
+        *,
+        command_timeout_seconds: float = 120.0,
+        max_workspace_bytes: int = 2 * 1024 * 1024 * 1024,
+        max_changed_files: int = 500,
+        max_patch_bytes: int = 8 * 1024 * 1024,
     ) -> None:
         if command_timeout_seconds <= 0:
             raise ValueError("command_timeout_seconds must be positive")
+        for name, value in (
+            ("max_workspace_bytes", max_workspace_bytes),
+            ("max_changed_files", max_changed_files),
+            ("max_patch_bytes", max_patch_bytes),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
         self.workspace_root = workspace_root.expanduser().resolve()
         self.command_timeout_seconds = command_timeout_seconds
+        self.max_workspace_bytes = max_workspace_bytes
+        self.max_changed_files = max_changed_files
+        self.max_patch_bytes = max_patch_bytes
 
     async def prepare(
         self,
@@ -74,18 +97,25 @@ class WorkspaceGit:
             raise ValueError("task workspace escapes workspace root")
         if workspace.exists():
             raise FileExistsError(f"task workspace already exists: {workspace}")
-        await self._run(
-            "git",
-            "clone",
-            "--no-tags",
-            "--origin",
-            "upstream",
-            "--branch",
-            default_branch,
-            repository_url,
-            str(workspace),
-            cwd=self.workspace_root,
-        )
+        try:
+            await self._run(
+                "git",
+                "clone",
+                "--no-tags",
+                "--origin",
+                "upstream",
+                "--branch",
+                default_branch,
+                repository_url,
+                str(workspace),
+                cwd=self.workspace_root,
+            )
+        except BaseException:
+            if workspace.is_symlink():
+                workspace.unlink(missing_ok=True)
+            elif workspace.exists() and workspace.parent == self.workspace_root:
+                shutil.rmtree(workspace, onexc=self._remove_readonly)
+            raise
         await self._run("git", "checkout", "-b", branch, cwd=workspace)
         self._ignore_runtime_artifacts(workspace)
         base_commit_sha = (await self._run("git", "rev-parse", "HEAD", cwd=workspace)).strip()
@@ -93,12 +123,21 @@ class WorkspaceGit:
 
     async def seal(self, workspace: Path, patch_path: Path) -> SealedPatch:
         self._ignore_runtime_artifacts(workspace)
+        if self._workspace_size(workspace) > self.max_workspace_bytes:
+            raise ValueError("workspace size limit exceeded")
         await self._run("git", "add", "-A", cwd=workspace)
+        changed = await self._run(
+            "git", "diff", "--cached", "--name-only", "-z", "HEAD", cwd=workspace
+        )
+        if len([name for name in changed.split("\0") if name]) > self.max_changed_files:
+            raise ValueError("changed file limit exceeded")
         patch = await self._run(
             "git", "diff", "--no-ext-diff", "--cached", "--binary", "HEAD", cwd=workspace
         )
         if not patch.strip():
             raise ValueError("Codex did not produce any code changes")
+        if len(patch.encode("utf-8")) > self.max_patch_bytes:
+            raise ValueError("patch size limit exceeded")
         patch_path.parent.mkdir(parents=True, exist_ok=True)
         patch_path.write_text(patch, encoding="utf-8")
         tree_sha = (await self._run("git", "write-tree", cwd=workspace)).strip()
@@ -274,14 +313,48 @@ class WorkspaceGit:
             *command[1:],
         )
         try:
-            return await run_process(
+            watch_path = (
+                Path(command[-1]).resolve(strict=False)
+                if len(command) > 2 and command[1] == "clone"
+                else cwd
+            )
+            result = await run_process(
                 hardened,
                 cwd=cwd,
                 env=environment,
                 timeout_seconds=self.command_timeout_seconds,
+                watch_path=watch_path,
+                max_path_bytes=self.max_workspace_bytes,
             )
+            if path_size_exceeds(watch_path, self.max_workspace_bytes):
+                raise CommandResourceLimitExceeded("command path size limit exceeded")
+            return result
         except CommandTimedOut:
             raise RuntimeError("Git command timed out") from None
+        except CommandOutputLimitExceeded:
+            raise RuntimeError("Git command output limit exceeded") from None
+        except CommandResourceLimitExceeded:
+            raise RuntimeError("workspace size limit exceeded") from None
+
+    def _workspace_size(self, workspace: Path) -> int:
+        total = 0
+        pending = [workspace]
+        while pending:
+            directory = pending.pop()
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_symlink():
+                            total += entry.stat(follow_symlinks=False).st_size
+                        elif entry.is_dir(follow_symlinks=False):
+                            pending.append(Path(entry.path))
+                        elif entry.is_file(follow_symlinks=False):
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError as exc:
+                        raise RuntimeError("unable to measure task workspace") from exc
+                    if total > self.max_workspace_bytes:
+                        return total
+        return total
 
     @staticmethod
     def _is_executable_config_key(key: str) -> bool:
@@ -325,6 +398,11 @@ class WorkspaceGit:
         self._require_real_directory(git_dir, "Git metadata directory")
         self._require_real_file(git_dir / "config", "Git config file")
         return resolved, git_dir
+
+    @staticmethod
+    def _remove_readonly(function, path: str, _error: BaseException) -> None:
+        os.chmod(path, stat.S_IWRITE)
+        function(path)
 
     @staticmethod
     def _require_real_directory(path: Path, label: str) -> None:

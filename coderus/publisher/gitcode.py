@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import math
+import json
 import re
 import time
 from collections.abc import Callable, Iterator, Mapping
@@ -9,6 +9,8 @@ from typing import Any, Protocol, cast
 from urllib.parse import urlsplit
 
 from coderus.providers.errors import InvalidProviderUrl
+from coderus.providers.errors import ProviderRemoteError as ProviderRequestError
+from coderus.providers.http import RetryPolicy, request_with_backoff
 from coderus.providers.urls import parse_pull_request_url
 
 from .errors import (
@@ -76,6 +78,8 @@ def default_http_client() -> HttpClient:
 
 
 class GitCodePublisher:
+    _MAX_PAGES = 1000
+
     def __init__(
         self,
         token: str,
@@ -450,7 +454,10 @@ class GitCodePublisher:
         self, url: str, *, params: Mapping[str, object]
     ) -> Iterator[dict[str, Any]]:
         page = 1
+        seen_pages: set[str] = set()
         while True:
+            if page > self._MAX_PAGES:
+                raise PublisherRemoteError("gitcode returned invalid pagination")
             page_params = {**params, "per_page": 100, "page": page}
             response = self._request("GET", url, params=page_params)
             payload = self._response_json(response)
@@ -458,6 +465,10 @@ class GitCodePublisher:
                 isinstance(item, dict) for item in payload
             ):
                 raise PublisherRemoteError("gitcode returned an invalid response")
+            signature = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            if signature in seen_pages:
+                raise PublisherRemoteError("gitcode returned invalid pagination")
+            seen_pages.add(signature)
             yield from payload
             if len(payload) < 100:
                 return
@@ -473,84 +484,45 @@ class GitCodePublisher:
         allowed_statuses: set[int] | None = None,
     ) -> HttpResponse:
         allowed_statuses = allowed_statuses or set()
-        is_post = method == "POST"
-        deadline = self._clock() + self._max_retry_elapsed_seconds
-        for attempt in range(self._request_attempts):
-            if attempt > 0 and self._clock() >= deadline:
-                raise _GitCodeRequestError(
-                    "gitcode retry deadline exceeded", uncertain=True
-                )
+        if method == "GET":
             try:
-                if method == "GET":
-                    response = self._http_client.get(
+                response = request_with_backoff(
+                    "gitcode",
+                    lambda: self._http_client.get(
                         url, headers=self._headers(), params=params
-                    )
-                else:
-                    response = self._http_client.post(
-                        url, headers=self._headers(), json=payload or {}
-                    )
+                    ),
+                    policy=RetryPolicy(
+                        max_attempts=self._request_attempts,
+                        base_delay=self._retry_interval,
+                        max_delay=self._max_retry_delay,
+                        max_elapsed=self._max_retry_elapsed_seconds,
+                    ),
+                    sleep=self._sleep,
+                    clock=self._clock,
+                )
+            except ProviderRequestError as exc:
+                raise _GitCodeRequestError(str(exc), uncertain=True) from None
+        elif method == "POST":
+            try:
+                response = self._http_client.post(
+                    url, headers=self._headers(), json=payload or {}
+                )
             except Exception:
-                if is_post or attempt + 1 == self._request_attempts:
-                    raise _GitCodeRequestError(
-                        "gitcode request failed", uncertain=True
-                    ) from None
-                self._sleep_for_retry(self._retry_interval, deadline)
-                continue
+                raise _GitCodeRequestError(
+                    "gitcode request failed", uncertain=True
+                ) from None
+        else:
+            raise ValueError("unsupported HTTP method")
 
-            if 200 <= response.status_code < 300 or response.status_code in allowed_statuses:
-                return response
-            if is_post and response.status_code == 409:
-                raise _GitCodeRequestError(
-                    "gitcode request failed with status 409", uncertain=True
-                )
-            rate_limited = response.status_code == 429
-            server_error = response.status_code >= 500
-            retryable = rate_limited or server_error
-            if not retryable:
-                raise _GitCodeRequestError(
-                    f"gitcode request failed with status {response.status_code}",
-                    uncertain=False,
-                )
-            if server_error and is_post:
-                raise _GitCodeRequestError(
-                    f"gitcode request failed with status {response.status_code}",
-                    uncertain=True,
-                )
-            if attempt + 1 == self._request_attempts:
-                raise _GitCodeRequestError(
-                    f"gitcode request failed with status {response.status_code}",
-                    uncertain=True,
-                )
-            self._sleep_for_retry(self._retry_delay(response), deadline)
-        raise AssertionError("unreachable")
-
-    def _sleep_for_retry(self, requested_delay: float, deadline: float) -> None:
-        remaining = deadline - self._clock()
-        if remaining <= 0:
-            raise _GitCodeRequestError(
-                "gitcode retry deadline exceeded", uncertain=True
-            )
-        self._sleep(min(requested_delay, self._max_retry_delay, remaining))
-
-    def _retry_delay(self, response: HttpResponse) -> float:
-        if response.status_code == 429:
-            value = next(
-                (
-                    value
-                    for key, value in response.headers.items()
-                    if key.casefold() == "retry-after"
-                ),
-                None,
-            )
-            if value is not None:
-                try:
-                    delay = float(value)
-                except (TypeError, ValueError):
-                    pass
-                else:
-                    if math.isfinite(delay) and delay >= 0:
-                        return delay
-        return self._retry_interval
+        if 200 <= response.status_code < 300 or response.status_code in allowed_statuses:
+            return response
+        uncertain = method == "POST" and (
+            response.status_code in {409, 429} or response.status_code >= 500
+        )
+        raise _GitCodeRequestError(
+            f"gitcode request failed with status {response.status_code}",
+            uncertain=uncertain,
+        )
 
     @staticmethod
     def _response_json(response: HttpResponse) -> Any:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import io
 import json
@@ -9,10 +10,16 @@ import tarfile
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import load_pem_private_key
+
 from coderus.public_release import require_public_files
+from coderus.release_bootstrap import signed_manifest_payload
 
 INCLUDED_DIRECTORIES = ("coderus", "tests", "scripts")
 INCLUDED_FILES = (
+    ".github/workflows/ci.yml",
+    "docs/deployment.md",
     "pyproject.toml",
     "uv.lock",
     "README.md",
@@ -21,6 +28,7 @@ INCLUDED_FILES = (
 )
 EXCLUDED_PARTS = frozenset({"__pycache__", ".pytest_cache", ".ruff_cache"})
 EXCLUDED_SUFFIXES = frozenset({".pyc", ".pyo"})
+SCHEMA_VERSION = 1
 
 
 def _sha256(path: Path) -> str:
@@ -74,12 +82,25 @@ def _parse_created_at(value: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
+def _load_signing_key(path: Path | None) -> Ed25519PrivateKey:
+    if path is None:
+        raise ValueError("release signing key is required")
+    try:
+        key = load_pem_private_key(path.expanduser().read_bytes(), password=None)
+    except (OSError, ValueError, TypeError) as exc:
+        raise ValueError("invalid release signing key") from exc
+    if not isinstance(key, Ed25519PrivateKey):
+        raise ValueError("release signing key must be Ed25519")
+    return key
+
+
 def create_release_archive(
     root: Path,
     output_directory: Path,
     *,
     created_at: str | None = None,
     python_version: str | None = None,
+    signing_key_path: Path | None = None,
 ) -> Path:
     root = root.resolve()
     source = build_source_manifest(root)
@@ -91,8 +112,16 @@ def create_release_archive(
         "source_sha256": source["source_sha256"],
         "uv_lock_sha256": _sha256(root / "uv.lock"),
         "python_version": python_version or platform.python_version(),
+        "schema_version": SCHEMA_VERSION,
+        "min_schema_version": SCHEMA_VERSION,
+        "max_schema_version": SCHEMA_VERSION,
+        "signature_algorithm": "ed25519",
         "files": source["files"],
     }
+    signing_key = _load_signing_key(signing_key_path)
+    manifest["signature"] = base64.b64encode(
+        signing_key.sign(signed_manifest_payload(manifest))
+    ).decode("ascii")
     output_directory.mkdir(parents=True, exist_ok=True)
     destination = output_directory / f"coderus-{release_id}.tar.gz"
     temporary = destination.with_suffix(destination.suffix + ".tmp")
@@ -127,8 +156,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Build a verified Coderus release archive")
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--output", type=Path, default=Path("dist/releases"))
+    parser.add_argument("--signing-key", type=Path, required=True)
     args = parser.parse_args()
-    archive = create_release_archive(args.root, args.output)
+    archive = create_release_archive(
+        args.root,
+        args.output,
+        signing_key_path=args.signing_key,
+    )
     print(archive)
 
 

@@ -4,7 +4,7 @@ from .local import (
     RunnerConfig,
     resolve_codex_command,
 )
-from .protocol import AgentRole, JobResult, JobSpec, JobStatus, Stage
+from .protocol import AgentRole, JobResult, JobSpec, JobStatus, RetryableAgentError, Stage
 from .workspace import WorkspaceError, validate_workspace
 
 __all__ = [
@@ -15,6 +15,7 @@ __all__ = [
     "JobStatus",
     "LocalCodexRunner",
     "RunnerConfig",
+    "RetryableAgentError",
     "resolve_codex_command",
     "Stage",
     "WorkspaceError",

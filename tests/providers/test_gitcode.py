@@ -1,4 +1,5 @@
 from collections import deque
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -8,6 +9,7 @@ from coderus.providers import (
     ProviderRemoteError,
     Repository,
 )
+from coderus.providers.http import RetryPolicy
 
 
 class FakeResponse:
@@ -160,6 +162,16 @@ def test_list_open_issues_uses_documented_endpoint_and_paginates() -> None:
     assert all("access_token" not in call["params"] for call in client.calls)
 
 
+def test_list_issues_rejects_repeated_full_page() -> None:
+    page = [issue_payload(number) for number in range(1, 101)]
+    client = FakeClient(FakeResponse(200, page), FakeResponse(200, page))
+
+    with pytest.raises(ProviderRemoteError, match="pagination"):
+        GitCodeProvider(client=client).list_open_issues(gitcode_repository())
+
+    assert len(client.calls) == 2
+
+
 def test_get_issue_maps_documented_response() -> None:
     client = FakeClient(FakeResponse(200, issue_payload(7)))
 
@@ -172,11 +184,42 @@ def test_get_issue_maps_documented_response() -> None:
     )
 
 
+def test_list_issues_can_request_updates_since_cursor() -> None:
+    client = FakeClient(FakeResponse(200, [issue_payload(1)]))
+    cursor = datetime(2026, 7, 20, 8, 30, tzinfo=UTC)
+
+    GitCodeProvider(client=client).list_issues(
+        gitcode_repository(), state="all", updated_since=cursor
+    )
+
+    assert client.calls[0]["params"]["sort"] == "updated"
+    assert client.calls[0]["params"]["direction"] == "desc"
+    assert "since" not in client.calls[0]["params"]
+
+
+def test_incremental_issue_listing_stops_at_updated_at_boundary() -> None:
+    cursor = datetime(2026, 7, 2, 0, 0, tzinfo=UTC)
+    recent = issue_payload(2)
+    recent["updated_at"] = "2026-07-03T02:03:04.000+00:00"
+    old = issue_payload(1)
+    old["updated_at"] = "2026-07-01T02:03:04.000+00:00"
+    client = FakeClient(FakeResponse(200, [recent, old]))
+
+    issues = GitCodeProvider(client=client).list_issues(
+        gitcode_repository(), state="all", updated_since=cursor
+    )
+
+    assert [issue.number for issue in issues] == [2]
+    assert len(client.calls) == 1
+
+
 def test_remote_error_is_clear_and_preserves_retry_metadata() -> None:
     client = FakeClient(FakeResponse(429, {"message": "limited"}, headers={"Retry-After": "30"}))
 
     with pytest.raises(ProviderRemoteError) as error:
-        GitCodeProvider(client=client, token="token").get_issue(gitcode_repository(), 1)
+        GitCodeProvider(
+            client=client, token="token", retry_policy=RetryPolicy(max_attempts=1)
+        ).get_issue(gitcode_repository(), 1)
 
     assert error.value.provider == "gitcode"
     assert error.value.status_code == 429

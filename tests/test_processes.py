@@ -5,7 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from coderus.processes import CommandTimedOut, run_process, run_process_sync
+from coderus.processes import (
+    CommandOutputLimitExceeded,
+    CommandResourceLimitExceeded,
+    CommandTimedOut,
+    run_process,
+    run_process_sync,
+)
 
 _SPAWN_CHILD = """
 import subprocess
@@ -84,3 +90,87 @@ def test_run_process_sync_timeout_terminates_the_process_group(tmp_path: Path) -
     time.sleep(3.1)
     assert ready.exists()
     assert not orphan_marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_run_process_stops_when_combined_output_exceeds_limit(tmp_path: Path) -> None:
+    command = (
+        sys.executable,
+        "-c",
+        "import sys,time; sys.stdout.write('x' * 4096); sys.stdout.flush(); time.sleep(30)",
+    )
+
+    with pytest.raises(CommandOutputLimitExceeded):
+        await run_process(
+            command,
+            cwd=tmp_path,
+            env={},
+            timeout_seconds=10,
+            max_output_bytes=1024,
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_process_stops_when_watched_path_exceeds_limit(tmp_path: Path) -> None:
+    watched = tmp_path / "checkout"
+    command = (
+        sys.executable,
+        "-c",
+        "import sys,time; from pathlib import Path; "
+        "p=Path(sys.argv[1]); p.mkdir(); (p/'data').write_bytes(b'x'*4096); time.sleep(30)",
+        str(watched),
+    )
+
+    with pytest.raises(CommandResourceLimitExceeded):
+        await run_process(
+            command,
+            cwd=tmp_path,
+            env={},
+            timeout_seconds=10,
+            watch_path=watched,
+            max_path_bytes=1024,
+        )
+
+
+def test_run_process_sync_stops_when_combined_output_exceeds_limit(tmp_path: Path) -> None:
+    command = (
+        sys.executable,
+        "-c",
+        "import sys,time; sys.stderr.write('x' * 4096); sys.stderr.flush(); time.sleep(30)",
+    )
+
+    with pytest.raises(CommandOutputLimitExceeded):
+        run_process_sync(
+            command,
+            cwd=tmp_path,
+            env={},
+            timeout_seconds=10,
+            max_output_bytes=1024,
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_process_detects_output_limit_when_process_exits_immediately(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(CommandOutputLimitExceeded):
+        await run_process(
+            (sys.executable, "-c", "print('x' * 4096)"),
+            cwd=tmp_path,
+            env={},
+            timeout_seconds=10,
+            max_output_bytes=1024,
+        )
+
+
+def test_run_process_sync_detects_output_limit_when_process_exits_immediately(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(CommandOutputLimitExceeded):
+        run_process_sync(
+            (sys.executable, "-c", "print('x' * 4096)"),
+            cwd=tmp_path,
+            env={},
+            timeout_seconds=10,
+            max_output_bytes=1024,
+        )

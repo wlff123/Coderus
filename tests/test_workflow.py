@@ -1,3 +1,4 @@
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,9 +9,10 @@ from sqlalchemy import select
 from coderus.db import create_session_factory
 from coderus.forge import ForgeRegistry
 from coderus.models import AgentRun, Issue, PRFeedback, Repository, Review, Task, User
-from coderus.runner import JobResult, JobStatus
+from coderus.runner import JobResult, JobStatus, RetryableAgentError
 from coderus.workflow.developer_report import developer_report_schema_path
 from coderus.workflow.orchestrator import TaskOrchestrator
+from coderus.workflow.reviewer_result import reviewer_result_schema_path
 
 DEVELOPER_REPORT = {
     "problem_description": "Issue 描述的边界输入会触发错误行为。",
@@ -113,6 +115,60 @@ class FakeRunner:
             output_truncated=False,
             duration_seconds=0.01,
         )
+
+
+class BlockingDeveloperRunner(FakeRunner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def run(self, spec, *, cancel_event=None):
+        self.started.set()
+        await self.release.wait()
+        return await super().run(spec, cancel_event=cancel_event)
+
+
+class ExplodingRunner:
+    async def run(self, spec, *, cancel_event=None):
+        raise RuntimeError("runner exploded")
+
+
+class RetryThenRun(FakeRunner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.start_attempts = 0
+
+    async def run(self, spec, *, cancel_event=None):
+        self.start_attempts += 1
+        if self.start_attempts < 3:
+            raise RetryableAgentError("temporary process exhaustion")
+        return await super().run(spec, cancel_event=cancel_event)
+
+
+class CancellingRunner:
+    async def run(self, spec, *, cancel_event=None):
+        raise asyncio.CancelledError
+
+
+class ReviewerFailureRunner(FakeRunner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reviewer_b_started = asyncio.Event()
+        self.reviewer_b_cancelled = False
+
+    async def run(self, spec, *, cancel_event=None):
+        if spec.role.value == "reviewer_b":
+            self.reviewer_b_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.reviewer_b_cancelled = True
+                raise
+        if spec.role.value == "reviewer_a":
+            await self.reviewer_b_started.wait()
+            raise RuntimeError("reviewer failed")
+        return await super().run(spec, cancel_event=cancel_event)
 
 
 class FakePublisher:
@@ -247,8 +303,8 @@ async def test_orchestrator_runs_developer_and_two_reviewers_once(engine, tmp_pa
     ]
     assert "先探索代码并复现" in runner.specs[0].prompt
     assert runner.specs[0].output_schema == developer_report_schema_path()
-    assert runner.specs[1].output_schema is None
-    assert runner.specs[2].output_schema is None
+    assert runner.specs[1].output_schema == reviewer_result_schema_path()
+    assert runner.specs[2].output_schema == reviewer_result_schema_path()
     for heading in (
         "问题描述",
         "问题复现",
@@ -417,6 +473,7 @@ async def test_review_findings_get_one_revision_then_publish_pr(
     assert "初次修改方案" not in body
     assert "targeted tests are missing" not in body
     assert "首轮检视意见" not in body
+    assert "<!-- coderus-publication:" in body
     with sessions() as session:
         task = session.get(Task, task_id)
         assert task is not None
@@ -537,6 +594,8 @@ async def test_publish_completion_does_not_overwrite_concurrent_cancellation(
         async def publish(self, **kwargs):
             with sessions() as session:
                 task = session.get(Task, task_id)
+                assert task.publication_key
+                assert task.publication_started_at is not None
                 task.status = "cancelling"
                 session.commit()
             return await super().publish(**kwargs)
@@ -550,7 +609,105 @@ async def test_publish_completion_does_not_overwrite_concurrent_cancellation(
     with sessions() as session:
         task = session.get(Task, task_id)
         assert task.status == "cancelled"
-        assert task.pr_url is None
+        assert task.pr_url == "https://github.com/octo/demo/pull/9"
+        assert task.pr_number == 9
+
+
+@pytest.mark.asyncio
+async def test_duplicate_orchestrator_worker_returns_when_claim_fails(
+    engine, tmp_path: Path
+) -> None:
+    sessions = create_session_factory(engine)
+    with sessions() as session:
+        task_id = create_task(session).id
+    runner = BlockingDeveloperRunner()
+    orchestrator = make_orchestrator(sessions, tmp_path, runner)
+
+    first = asyncio.create_task(orchestrator.run(task_id))
+    await runner.started.wait()
+    await orchestrator.run(task_id)
+    assert len(runner.specs) == 0
+
+    runner.release.set()
+    await first
+    assert [spec.role.value for spec in runner.specs] == [
+        "developer",
+        "reviewer_a",
+        "reviewer_b",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runner_exception_finishes_agent_run(engine, tmp_path: Path) -> None:
+    sessions = create_session_factory(engine)
+    with sessions() as session:
+        task_id = create_task(session).id
+    orchestrator = make_orchestrator(sessions, tmp_path, ExplodingRunner())
+
+    await orchestrator.run(task_id)
+
+    with sessions() as session:
+        run = session.scalar(select(AgentRun).where(AgentRun.task_id == task_id))
+        assert run.status == "failed"
+        assert run.finished_at is not None
+        assert run.error_summary == "runner exploded"
+
+
+@pytest.mark.asyncio
+async def test_transient_start_failure_is_retried_before_agent_runs(
+    engine, tmp_path: Path
+) -> None:
+    sessions = create_session_factory(engine)
+    with sessions() as session:
+        task_id = create_task(session).id
+    runner = RetryThenRun()
+    orchestrator = make_orchestrator(sessions, tmp_path, runner)
+
+    await orchestrator.run(task_id)
+
+    assert runner.start_attempts == 5
+    with sessions() as session:
+        runs = session.scalars(select(AgentRun).where(AgentRun.task_id == task_id)).all()
+        assert all(run.status == "succeeded" for run in runs)
+
+
+@pytest.mark.asyncio
+async def test_coroutine_cancellation_interrupts_agent_run(engine, tmp_path: Path) -> None:
+    sessions = create_session_factory(engine)
+    with sessions() as session:
+        task_id = create_task(session).id
+    orchestrator = make_orchestrator(sessions, tmp_path, CancellingRunner())
+
+    with pytest.raises(asyncio.CancelledError):
+        await orchestrator.run(task_id)
+
+    with sessions() as session:
+        run = session.scalar(select(AgentRun).where(AgentRun.task_id == task_id))
+        task = session.get(Task, task_id)
+        assert run.status == "interrupted"
+        assert run.finished_at is not None
+        assert task.status == "manual_intervention"
+
+
+@pytest.mark.asyncio
+async def test_reviewer_failure_cancels_and_drains_sibling(engine, tmp_path: Path) -> None:
+    sessions = create_session_factory(engine)
+    with sessions() as session:
+        task_id = create_task(session).id
+    runner = ReviewerFailureRunner()
+    orchestrator = make_orchestrator(sessions, tmp_path, runner)
+
+    await orchestrator.run(task_id)
+
+    assert runner.reviewer_b_cancelled is True
+    with sessions() as session:
+        runs = session.scalars(
+            select(AgentRun)
+            .where(AgentRun.task_id == task_id)
+            .order_by(AgentRun.id)
+        ).all()
+        assert [run.status for run in runs] == ["succeeded", "failed", "interrupted"]
+        assert all(run.finished_at is not None for run in runs)
 
 
 def test_feedback_processing_marks_only_the_original_snapshot(engine, tmp_path: Path) -> None:

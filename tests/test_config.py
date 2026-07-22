@@ -30,6 +30,7 @@ def test_local_mode_uses_safe_defaults(tmp_path: Path) -> None:
     assert settings.scheduler.per_user_task_limit == 2
     assert settings.scheduler.max_agent_processes == 16
     assert settings.codex.sandbox_mode == "workspace-write"
+    assert settings.codex.auth_mode == "api_proxy"
 
 
 def test_codex_sandbox_mode_can_be_configured_for_container() -> None:
@@ -109,3 +110,15 @@ def test_model_api_key_requires_base_url_and_model() -> None:
         }
     )
     assert settings.codex.model == "test-model"
+
+
+def test_long_lived_codex_login_mode_is_rejected() -> None:
+    with pytest.raises(ValidationError, match="auth_mode"):
+        Settings.model_validate(
+            {
+                **SECRETS,
+                "codex": {
+                    "auth_mode": "dedicated_login",
+                },
+            }
+        )

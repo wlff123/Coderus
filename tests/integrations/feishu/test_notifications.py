@@ -1,30 +1,11 @@
 from datetime import UTC, datetime
 
 import pytest
+from sqlalchemy import select
 
 from coderus.db import create_session_factory
 from coderus.models import FeishuEvent, Issue, Repository, Task, User
 from coderus.workflow.notifications import FeishuTaskNotifier
-
-
-class RecordingClient:
-    def __init__(self) -> None:
-        self.calls: list[dict[str, object]] = []
-
-    def send_task_completed(
-        self,
-        message,
-        *,
-        receive_id: str,
-        receive_id_type: str,
-    ) -> None:
-        self.calls.append(
-            {
-                "message": message,
-                "receive_id": receive_id,
-                "receive_id_type": receive_id_type,
-            }
-        )
 
 
 def create_task(session) -> Task:
@@ -70,8 +51,7 @@ async def test_feishu_task_completion_returns_to_originating_chat(engine) -> Non
         )
         session.commit()
         task_id = task.id
-    client = RecordingClient()
-    notifier = FeishuTaskNotifier(client, session_factory=sessions, default_chat_id="oc-default")
+    notifier = FeishuTaskNotifier(session_factory=sessions, default_chat_id="oc-default")
 
     await notifier.notify(
         database_task_id=task_id,
@@ -82,8 +62,13 @@ async def test_feishu_task_completion_returns_to_originating_chat(engine) -> Non
         pr_url="https://github.com/octo/demo/pull/2",
     )
 
-    assert client.calls[0]["receive_id"] == "oc-origin"
-    assert client.calls[0]["receive_id_type"] == "chat_id"
+    with sessions() as session:
+        queued = session.scalar(
+            select(FeishuEvent).where(FeishuEvent.message_id == f"task-completed:{task_id}")
+        )
+        assert queued.chat_id == "oc-origin"
+        assert queued.reply_status == "pending"
+        assert "https://github.com/octo/demo/pull/2" in queued.reply_text
 
 
 @pytest.mark.asyncio
@@ -93,8 +78,7 @@ async def test_web_task_completion_uses_default_chat(engine) -> None:
         task = create_task(session)
         session.commit()
         task_id = task.id
-    client = RecordingClient()
-    notifier = FeishuTaskNotifier(client, session_factory=sessions, default_chat_id="oc-default")
+    notifier = FeishuTaskNotifier(session_factory=sessions, default_chat_id="oc-default")
 
     await notifier.notify(
         database_task_id=task_id,
@@ -105,7 +89,11 @@ async def test_web_task_completion_uses_default_chat(engine) -> None:
         pr_url="https://github.com/octo/demo/pull/2",
     )
 
-    assert client.calls[0]["receive_id"] == "oc-default"
+    with sessions() as session:
+        queued = session.scalar(
+            select(FeishuEvent).where(FeishuEvent.message_id == f"task-completed:{task_id}")
+        )
+        assert queued.chat_id == "oc-default"
 
 
 @pytest.mark.asyncio
@@ -115,8 +103,7 @@ async def test_web_task_without_default_chat_skips_notification(engine) -> None:
         task = create_task(session)
         session.commit()
         task_id = task.id
-    client = RecordingClient()
-    notifier = FeishuTaskNotifier(client, session_factory=sessions, default_chat_id=None)
+    notifier = FeishuTaskNotifier(session_factory=sessions, default_chat_id=None)
 
     await notifier.notify(
         database_task_id=task_id,
@@ -127,4 +114,7 @@ async def test_web_task_without_default_chat_skips_notification(engine) -> None:
         pr_url="https://github.com/octo/demo/pull/2",
     )
 
-    assert client.calls == []
+    with sessions() as session:
+        assert session.scalar(
+            select(FeishuEvent).where(FeishuEvent.message_id == f"task-completed:{task_id}")
+        ) is None

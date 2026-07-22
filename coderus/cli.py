@@ -165,7 +165,11 @@ def main() -> None:
     environment = {**load_env_file(args.secrets), **os.environ}
     settings = load_settings(args.config, environment)
     settings = prepare_runtime_settings(settings, args, args.config.parent)
-    app = create_app(settings, runtime=args.runtime)
+    app = create_app(
+        settings,
+        runtime=args.runtime,
+        preview_isolated=args.runtime == "preview",
+    )
     uvicorn.run(
         app,
         host=settings.server.bind,

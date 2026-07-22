@@ -382,6 +382,40 @@ def test_list_pr_feedback_combines_comments_reviews_and_inline_comments() -> Non
     ]
 
 
+def test_list_pr_feedback_reads_every_github_page() -> None:
+    first_page = [
+        {
+            "id": identifier,
+            "body": f"comment {identifier}",
+            "html_url": f"https://github.com/acme/widgets/pull/7#issuecomment-{identifier}",
+            "user": {"login": "maintainer"},
+            "author_association": "MEMBER",
+        }
+        for identifier in range(1, 101)
+    ]
+    first = FakeResponse(200, first_page)
+    first.headers = {
+        "Link": (
+            '<https://api.github.com/repos/acme/widgets/issues/7/comments?per_page=100&page=2>'
+            '; rel="next"'
+        )
+    }
+    client = FakeHttpClient(
+        first,
+        FakeResponse(200, [{**first_page[0], "id": 101}]),
+        FakeResponse(200, []),
+        FakeResponse(200, []),
+    )
+    publisher = GitHubPublisher(
+        "github-secret", registered_forks={}, http_client=client, git_runner=FakeGitRunner()
+    )
+
+    feedback = publisher.list_pr_feedback("acme", "widgets", 7)
+
+    assert len(feedback) == 101
+    assert [call["params"].get("page") for call in client.calls] == [1, 2, 1, 1]
+
+
 @pytest.mark.parametrize(
     ("payload", "expected"),
     [

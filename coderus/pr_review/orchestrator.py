@@ -23,6 +23,7 @@ from coderus.pr_review.result import (
 )
 from coderus.providers import ProviderName
 from coderus.runner import AgentRole, JobSpec, JobStatus, Stage
+from coderus.workflow.limited_runner import retry_agent_operation
 
 logger = logging.getLogger(__name__)
 ACTIVE_STATUSES = ("preparing", "reviewing", "commenting")
@@ -278,19 +279,28 @@ class PRReviewOrchestrator:
                 ttl_seconds=self.stage_timeout_seconds + 300
             )
         try:
-            result = await self.runner.run(
-                JobSpec(
-                    job_id=f"pr-review-{task_id}",
-                    stage=Stage.PR_REVIEW,
-                    role=AgentRole.PR_REVIEWER,
-                    workspace=workspace,
-                    prompt=self._review_prompt(base_sha, head_sha),
-                    review_base=base_sha,
-                    timeout_seconds=self.stage_timeout_seconds,
-                    max_output_bytes=PR_REVIEW_MAX_OUTPUT_BYTES,
-                    proxy_token=token,
-                ),
-                cancel_event=claim_lost,
+            spec = JobSpec(
+                job_id=f"pr-review-{task_id}",
+                stage=Stage.PR_REVIEW,
+                role=AgentRole.PR_REVIEWER,
+                workspace=workspace,
+                prompt=self._review_prompt(base_sha, head_sha),
+                review_base=base_sha,
+                timeout_seconds=self.stage_timeout_seconds,
+                max_output_bytes=PR_REVIEW_MAX_OUTPUT_BYTES,
+                proxy_token=token,
+            )
+
+            async def run_agent():
+                return await self.runner.run(spec, cancel_event=claim_lost)
+
+            async def restore_checkpoint() -> None:
+                return None
+
+            result = await retry_agent_operation(
+                run_agent,
+                restore_checkpoint,
+                max_retries=2,
             )
             return result, token
         finally:

@@ -4,6 +4,7 @@ set -euo pipefail
 umask 077
 ROOT="${CODERUS_ROOT:-/opt/coderus}"
 DATABASE="${CODERUS_DATABASE:-$ROOT/data/coderus.db}"
+PUBLIC_KEY="${CODERUS_RELEASE_PUBLIC_KEY:-$ROOT/release-public-key.pem}"
 PREVIEW_PORT="${CODERUS_PREVIEW_PORT:-18084}"
 [[ $# -eq 1 ]] || { echo "Usage: $0 <release-id>" >&2; exit 2; }
 RELEASE_ID="$1"
@@ -60,7 +61,8 @@ for _ in {1..30}; do
     && curl -fsS "http://127.0.0.1:${PREVIEW_PORT}/login" >/dev/null; then
     cleanup
     trap - EXIT
-    "$PYTHON" -m coderus.release_install --write-verification "$RELEASE"
+    "$PYTHON" -m coderus.release_install --write-verification "$RELEASE" \
+      --public-key "$PUBLIC_KEY"
     chmod -R a-w "$RELEASE"
     echo "Release verified: $RELEASE_ID"
     exit 0

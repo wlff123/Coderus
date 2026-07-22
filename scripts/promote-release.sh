@@ -5,11 +5,15 @@ umask 077
 ROOT="${CODERUS_ROOT:-/opt/coderus}"
 DATABASE="${CODERUS_DATABASE:-$ROOT/data/coderus.db}"
 DRAIN_TIMEOUT="${CODERUS_DRAIN_TIMEOUT:-3600}"
-CUTOVER_TIMEOUT="${CODERUS_CUTOVER_TIMEOUT:-15}"
+CUTOVER_TIMEOUT="${CODERUS_CUTOVER_TIMEOUT:-30}"
 PORT="${CODERUS_PORT:-18082}"
 DRAIN_GATE="$ROOT/data/release-draining"
 LOCK_FILE="$ROOT/data/release.lock"
 ROLLBACK_FAILED="$ROOT/data/ROLLBACK_FAILED"
+PUBLIC_KEY="${CODERUS_RELEASE_PUBLIC_KEY:-$ROOT/release-public-key.pem}"
+HISTORY_RETAIN="${CODERUS_RELEASE_HISTORY_RETAIN:-20}"
+RELEASE_RETAIN="${CODERUS_RELEASE_RETAIN:-5}"
+BACKUP_RETAIN="${CODERUS_BACKUP_RETAIN:-20}"
 [[ $# -eq 1 ]] || { echo "Usage: $0 <release-id>" >&2; exit 2; }
 RELEASE_ID="$1"
 [[ "$RELEASE_ID" =~ ^[0-9]{8}-[0-9]{6}-[0-9a-f]{8}$ ]] || {
@@ -25,7 +29,9 @@ PYTHON="$TARGET/.venv/bin/python"
 
 # Verification can be expensive, so complete it before draining or taking the release lock.
 cd "$TARGET"
-"$PYTHON" -m coderus.release_install --verify-release "$TARGET"
+"$PYTHON" -m coderus.release_install --verify-release "$TARGET" \
+  --public-key "$PUBLIC_KEY"
+"$PYTHON" -m coderus.release_ops check-schema "$DATABASE" "$TARGET/release.json"
 exec 9>"$LOCK_FILE"
 flock -n 9 || { echo "Another release operation is running" >&2; exit 1; }
 [[ -L "$ROOT/current" ]] || { echo "Current release is missing" >&2; exit 1; }
@@ -158,6 +164,8 @@ backup_candidate="$ROOT/backups/$(date -u +%Y%m%d-%H%M%S)-before-$RELEASE_ID.db"
 run_with_budget "$PYTHON" -m coderus.release_ops backup "$DATABASE" "$backup_candidate" \
   || rollback_failed_promotion "database backup failed"
 BACKUP="$backup_candidate"
+run_with_budget "$PYTHON" -m coderus.release_ops migrate "$DATABASE" \
+  || rollback_failed_promotion "database migration failed"
 atomic_link previous "$OLD_ID" || rollback_failed_promotion "cannot update previous link"
 atomic_link current "$RELEASE_ID" || rollback_failed_promotion "cannot update current link"
 
@@ -166,7 +174,7 @@ nohup "$PYTHON" -m coderus serve \
   --config "$ROOT/config.yaml" \
   --secrets "$ROOT/secrets.env" \
   --port "$PORT" \
-  >"$ROOT/data/logs/maintenance.log" 2>&1 </dev/null &
+  >"$ROOT/data/logs/maintenance.log" 2>&1 </dev/null 9>&- &
 MAINTENANCE_PID=$!
 maintenance_ready=0
 while (( SECONDS - CUTOVER_STARTED < CUTOVER_TIMEOUT )); do
@@ -210,10 +218,15 @@ curl --connect-timeout "$remaining" --max-time "$remaining" \
 (( SECONDS - CUTOVER_STARTED <= CUTOVER_TIMEOUT )) \
   || rollback_failed_promotion "cutover exceeded ${CUTOVER_TIMEOUT} seconds"
 
-rm -f "$DRAIN_GATE" "$ROLLBACK_FAILED"
 trap - ERR
-mkdir -p "$ROOT/data/release-history"
-printf '{"release_id":"%s","previous_id":"%s","backup":"%s","cutover_seconds":%d}\n' \
-  "$RELEASE_ID" "$OLD_ID" "$BACKUP" "$((SECONDS - CUTOVER_STARTED))" \
-  >"$ROOT/data/release-history/$RELEASE_ID.json"
+history_payload="$(printf \
+  '{"release_id":"%s","previous_id":"%s","backup":"%s","cutover_seconds":%d}' \
+  "$RELEASE_ID" "$OLD_ID" "$BACKUP" "$((SECONDS - CUTOVER_STARTED))")"
+"$PYTHON" -m coderus.release_ops write-history "$ROOT/data/release-history" \
+  "$history_payload" --retain "$HISTORY_RETAIN" \
+  || rollback_failed_promotion "cannot write release history"
+rm -f "$DRAIN_GATE" "$ROLLBACK_FAILED"
+"$PYTHON" -m coderus.release_ops prune-artifacts "$ROOT" \
+  --retain-releases "$RELEASE_RETAIN" --retain-backups "$BACKUP_RETAIN" \
+  || echo "Warning: release artifact retention failed" >&2
 echo "Promoted Coderus to $RELEASE_ID in $((SECONDS - CUTOVER_STARTED)) seconds"

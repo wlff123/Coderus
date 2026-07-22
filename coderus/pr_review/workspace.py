@@ -10,7 +10,12 @@ from collections.abc import Mapping
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from coderus.processes import CommandTimedOut, run_process
+from coderus.processes import (
+    CommandResourceLimitExceeded,
+    CommandTimedOut,
+    path_size_exceeds,
+    run_process,
+)
 from coderus.providers import InvalidProviderUrl, parse_repository_url
 
 from .models import ChangedRanges, normalize_repository_path
@@ -39,9 +44,12 @@ class PRWorkspace:
         *,
         staging_root: Path | None = None,
         command_timeout_seconds: float = 120.0,
+        max_workspace_bytes: int = 2 * 1024 * 1024 * 1024,
     ) -> None:
         if command_timeout_seconds <= 0:
             raise ValueError("command_timeout_seconds must be positive")
+        if max_workspace_bytes <= 0:
+            raise ValueError("max_workspace_bytes must be positive")
         self.workspace_root = workspace_root.expanduser().resolve()
         suffix = f"-{os.getuid()}" if hasattr(os, "getuid") else ""
         self.staging_root = (
@@ -50,6 +58,7 @@ class PRWorkspace:
             else Path(tempfile.gettempdir()) / f"coderus-pr-review-staging{suffix}"
         )
         self.command_timeout_seconds = command_timeout_seconds
+        self.max_workspace_bytes = max_workspace_bytes
 
     async def prepare(
         self,
@@ -131,6 +140,11 @@ class PRWorkspace:
             await self._run("git", "cat-file", "-e", f"{base_sha}^{{commit}}", cwd=workspace)
         except RuntimeError:
             raise RuntimeError("PR review base revision is unavailable") from None
+        comparison_sha = (
+            await self._run("git", "merge-base", base_sha, head_sha, cwd=workspace)
+        ).strip()
+        if _SHA.fullmatch(comparison_sha) is None:
+            raise RuntimeError("PR review merge base is unavailable")
         diff = await self._run(
             "git",
             "diff",
@@ -140,12 +154,15 @@ class PRWorkspace:
             "--find-renames",
             "--unified=0",
             "--end-of-options",
-            base_sha,
+            comparison_sha,
             head_sha,
             "--",
             cwd=workspace,
         )
-        return self._parse_changed_ranges(diff)
+        return ChangedRanges(
+            self._parse_changed_ranges(diff).ranges,
+            comparison_sha=comparison_sha,
+        )
 
     def _validated_staging_root(self) -> Path:
         configured = Path(os.path.abspath(self.staging_root))
@@ -183,7 +200,12 @@ class PRWorkspace:
             raise RuntimeError("refusing to delete a path outside the workspace root")
         if not resolved.is_dir():
             raise RuntimeError("stale PR workspace is not a directory")
-        shutil.rmtree(resolved)
+        shutil.rmtree(resolved, onexc=self._remove_readonly)
+
+    @staticmethod
+    def _remove_readonly(function, path: str, _error: BaseException) -> None:
+        os.chmod(path, stat.S_IWRITE)
+        function(path)
 
     @staticmethod
     def _validate_prepare_inputs(
@@ -391,14 +413,25 @@ class PRWorkspace:
                 *command[1:],
             )
             try:
+                watch_path = (
+                    Path(command[-1]).resolve(strict=False)
+                    if len(command) > 2 and command[1] == "clone"
+                    else cwd
+                )
                 result = await run_process(
                     hardened,
                     cwd=cwd,
                     env=self._git_environment(isolated_home),
                     timeout_seconds=self.command_timeout_seconds,
+                    watch_path=watch_path,
+                    max_path_bytes=self.max_workspace_bytes,
                 )
+                if path_size_exceeds(watch_path, self.max_workspace_bytes):
+                    raise CommandResourceLimitExceeded("command path size limit exceeded")
             except CommandTimedOut:
                 raise RuntimeError("Git command timed out") from None
+            except CommandResourceLimitExceeded:
+                raise RuntimeError("PR workspace size limit exceeded") from None
         if result.returncode != 0:
             raise RuntimeError("git command failed")
         return result.stdout.decode("utf-8", errors="replace")

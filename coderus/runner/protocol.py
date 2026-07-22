@@ -8,6 +8,10 @@ from pathlib import Path
 _SHA_PATTERN = re.compile(r"[0-9A-Fa-f]{40}\Z")
 
 
+class RetryableAgentError(RuntimeError):
+    """An Agent startup failure known to be transient and free of side effects."""
+
+
 class Stage(StrEnum):
     DEVELOP = "develop"
     REVIEW_CORRECTNESS = "review_correctness"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import multiprocessing
 import queue
 import threading
@@ -11,11 +12,24 @@ from typing import Any
 from .commands import IncomingFeishuMessage
 
 QUEUE_CAPACITY = 256
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class GatewayFailure:
     error_type: str
+
+
+def _put_gateway_item(output: Any, item: object) -> bool:
+    try:
+        output.put_nowait(item)
+    except queue.Full:
+        logger.warning(
+            "feishu_gateway_queue_full",
+            extra={"event": "feishu_gateway_queue_full", "item_type": type(item).__name__},
+        )
+        return False
+    return True
 
 
 def _run_websocket(app_id: str, app_secret: str, output: Any) -> None:
@@ -25,10 +39,7 @@ def _run_websocket(app_id: str, app_secret: str, output: Any) -> None:
         def receive(data: Any) -> None:
             message = normalize_message_event(data)
             if message is not None:
-                try:
-                    output.put_nowait(message)
-                except queue.Full:
-                    pass
+                _put_gateway_item(output, message)
 
         handler = (
             lark.EventDispatcherHandler.builder("", "")
@@ -42,12 +53,9 @@ def _run_websocket(app_id: str, app_secret: str, output: Any) -> None:
             log_level=lark.LogLevel.INFO,
         )
         client.start()
-        output.put_nowait(GatewayFailure("ConnectionClosed"))
+        _put_gateway_item(output, GatewayFailure("ConnectionClosed"))
     except Exception as exc:
-        try:
-            output.put_nowait(GatewayFailure(type(exc).__name__))
-        except queue.Full:
-            pass
+        _put_gateway_item(output, GatewayFailure(type(exc).__name__))
 
 
 class FeishuGateway:
@@ -158,13 +166,16 @@ def normalize_message_event(data: Any) -> IncomingFeishuMessage | None:
 
     sender = getattr(event, "sender", None)
     sender_id = getattr(sender, "sender_id", None)
+    sender_open_id = getattr(sender_id, "open_id", None)
+    if not isinstance(sender_open_id, str) or not sender_open_id:
+        sender_open_id = None
     header = getattr(data, "header", None)
     return IncomingFeishuMessage(
         message_id=message_id,
         event_id=getattr(header, "event_id", None),
         chat_id=chat_id,
         chat_type=chat_type,
-        sender_open_id=getattr(sender_id, "open_id", None),
+        sender_open_id=sender_open_id,
         text=" ".join(text.split()),
         mentioned_bot=bool(mentions),
     )

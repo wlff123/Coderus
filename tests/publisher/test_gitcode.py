@@ -1058,13 +1058,16 @@ def test_publish_pr_comment_reconciles_malformed_success_without_reposting(
     assert methods.count("POST") == 1
 
 
-def test_publish_pr_comment_retries_429_only() -> None:
+def test_publish_pr_comment_reconciles_429_without_reposting() -> None:
     marker = "<!-- coderus-pr-review:RV-7:abc -->"
     body = f"review complete\n{marker}"
     client = FakeHttpClient(
         FakeResponse(200, []),
         FakeResponse(429, {}, {"Retry-After": "0"}),
-        FakeResponse(201, {"id": "hash-9", "body": body}),
+        FakeResponse(
+            200,
+            [{"id": "hash-9", "body": body, "user": {"login": "coderus-bot"}}],
+        ),
     )
 
     result = publisher(client, sleep=lambda _: None).publish_pr_comment(
@@ -1072,7 +1075,8 @@ def test_publish_pr_comment_retries_429_only() -> None:
     )
 
     assert result.created is True
-    assert [call["method"] for call in client.calls] == ["GET", "POST", "POST"]
+    assert [call["method"] for call in client.calls] == ["GET", "POST", "GET"]
+    assert [call["method"] for call in client.calls].count("POST") == 1
 
 
 @pytest.mark.parametrize(

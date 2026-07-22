@@ -5,7 +5,10 @@ import time
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Any, Protocol, cast
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
+
+from coderus.providers.errors import ProviderRemoteError as ProviderRequestError
+from coderus.providers.http import DEFAULT_RETRY_POLICY, RetryPolicy, request_with_backoff
 
 from .errors import (
     ForkNotReady,
@@ -60,6 +63,8 @@ def default_http_client() -> HttpClient:
 
 
 class GitHubPublisher:
+    _MAX_PAGES = 1000
+
     def __init__(
         self,
         token: str,
@@ -71,6 +76,8 @@ class GitHubPublisher:
         sleep: Callable[[float], None] = time.sleep,
         fork_poll_attempts: int = 10,
         fork_poll_interval: float = 1.0,
+        retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._token = token
         self._registered_forks = {
@@ -86,6 +93,8 @@ class GitHubPublisher:
         self._sleep = sleep
         self._fork_poll_attempts = fork_poll_attempts
         self._fork_poll_interval = fork_poll_interval
+        self._retry_policy = retry_policy
+        self._clock = clock
 
     def ensure_fork(self, upstream_owner: str, repository_name: str) -> ForkResult:
         self._validate_name(upstream_owner, "upstream owner")
@@ -206,10 +215,11 @@ class GitHubPublisher:
         )
         feedback: list[PRFeedbackItem] = []
         for kind, url in endpoints:
-            for payload in self._get_list(url, params={"per_page": 100}):
-                item = self._feedback_item(kind, payload)
-                if item is not None:
-                    feedback.append(item)
+            for page in self._get_list_pages(url, params={}):
+                for payload in page:
+                    item = self._feedback_item(kind, payload)
+                    if item is not None:
+                        feedback.append(item)
         return feedback
 
     def get_pr_status(
@@ -319,13 +329,72 @@ class GitHubPublisher:
         return payload
 
     def _get_comment_pages(self, url: str) -> Iterator[list[dict[str, Any]]]:
+        yield from self._get_list_pages(url, params={})
+
+    def _get_list_pages(
+        self, url: str, *, params: Mapping[str, object]
+    ) -> Iterator[list[dict[str, Any]]]:
         page = 1
+        visited: set[int] = set()
         while True:
-            comments = self._get_list(url, params={"per_page": 100, "page": page})
-            yield comments
-            if len(comments) < 100:
+            if page in visited or len(visited) >= self._MAX_PAGES:
+                raise PublisherRemoteError("github returned invalid pagination")
+            visited.add(page)
+            response = self._get_response(
+                url, params={**params, "per_page": 100, "page": page}
+            )
+            if response.status_code != 200:
+                raise PublisherRemoteError(
+                    f"github request failed with status {response.status_code}"
+                )
+            payload = self._response_json(response)
+            if not isinstance(payload, list) or not all(
+                isinstance(item, dict) for item in payload
+            ):
+                raise PublisherRemoteError("github returned an invalid response")
+            yield payload
+            next_page = self._next_page(response.headers, url, page)
+            if next_page is None and len(payload) == 100:
+                next_page = page + 1
+            if next_page is None:
                 return
-            page += 1
+            page = next_page
+
+    @staticmethod
+    def _next_page(headers: Mapping[str, str], expected_url: str, current: int) -> int | None:
+        link_header = next(
+            (value for key, value in headers.items() if key.casefold() == "link"), ""
+        )
+        next_links = [part for part in link_header.split(",") if 'rel="next"' in part]
+        if not next_links:
+            return None
+        if len(next_links) != 1:
+            raise PublisherRemoteError("github returned invalid pagination")
+        start = next_links[0].find("<")
+        end = next_links[0].find(">", start + 1)
+        if start < 0 or end < 0:
+            raise PublisherRemoteError("github returned invalid pagination")
+        try:
+            parsed = urlsplit(next_links[0][start + 1 : end])
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            raw_page = query.get("page", [None])[0]
+        except (TypeError, ValueError):
+            raise PublisherRemoteError("github returned invalid pagination") from None
+        expected = urlsplit(expected_url)
+        if (
+            parsed.scheme != "https"
+            or parsed.netloc != "api.github.com"
+            or parsed.path != expected.path
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.port is not None
+            or parsed.fragment
+            or not isinstance(raw_page, str)
+            or not raw_page.isdigit()
+            or int(raw_page) <= current
+        ):
+            raise PublisherRemoteError("github returned invalid pagination")
+        return int(raw_page)
 
     @staticmethod
     def _feedback_item(kind: str, payload: Mapping[str, Any]) -> PRFeedbackItem | None:
@@ -371,9 +440,15 @@ class GitHubPublisher:
 
     def _get_response(self, url: str, *, params: Mapping[str, object] | None) -> HttpResponse:
         try:
-            return self._http_client.get(url, headers=self._headers(), params=params)
-        except Exception:
-            raise PublisherRemoteError("github request failed") from None
+            return request_with_backoff(
+                "github",
+                lambda: self._http_client.get(url, headers=self._headers(), params=params),
+                policy=self._retry_policy,
+                sleep=self._sleep,
+                clock=self._clock,
+            )
+        except ProviderRequestError as exc:
+            raise PublisherRemoteError(str(exc)) from None
 
     def _post_response(self, url: str, payload: Mapping[str, object]) -> HttpResponse:
         try:

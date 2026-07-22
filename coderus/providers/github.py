@@ -4,7 +4,14 @@ from typing import Any, cast
 from urllib.parse import parse_qs, urlsplit
 
 from .errors import ProviderRemoteError
-from .http import HttpClient, default_http_client, get_json, get_json_response
+from .http import (
+    DEFAULT_RETRY_POLICY,
+    HttpClient,
+    RetryPolicy,
+    default_http_client,
+    get_json,
+    get_json_response,
+)
 from .models import Issue, ProviderName, Repository
 from .urls import parse_issue_url, parse_repository_url
 
@@ -13,9 +20,16 @@ class GitHubProvider:
     name: ProviderName = "github"
     _MAX_ISSUE_PAGES = 1000
 
-    def __init__(self, *, client: HttpClient | None = None, token: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        client: HttpClient | None = None,
+        token: str | None = None,
+        retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
+    ) -> None:
         self.client = client if client is not None else default_http_client()
         self.token = token or None
+        self.retry_policy = retry_policy
 
     def parse_repository_url(self, url: str) -> Repository:
         return parse_repository_url(url, expected_provider=self.name)
@@ -30,6 +44,7 @@ class GitHubProvider:
             self.name,
             self._api_url(repository),
             headers=self._headers(),
+            retry_policy=self.retry_policy,
         )
         try:
             private = payload["private"]
@@ -56,7 +71,13 @@ class GitHubProvider:
     def list_open_issues(self, repository: Repository) -> list[Issue]:
         return self.list_issues(repository, state="open")
 
-    def list_issues(self, repository: Repository, *, state: str = "all") -> list[Issue]:
+    def list_issues(
+        self,
+        repository: Repository,
+        *,
+        state: str = "all",
+        updated_since: datetime | None = None,
+    ) -> list[Issue]:
         if state not in {"open", "closed", "all"}:
             raise ValueError("issue state must be open, closed, or all")
         repository = self._validated_repository(repository)
@@ -65,6 +86,7 @@ class GitHubProvider:
         page = 1
         after: str | None = None
         visited_pages: set[int] = set()
+        visited_cursors: set[str] = set()
         while True:
             if page in visited_pages or len(visited_pages) >= self._MAX_ISSUE_PAGES:
                 raise ProviderRemoteError(self.name, "github returned invalid pagination")
@@ -74,6 +96,10 @@ class GitHubProvider:
                 "per_page": 100,
                 "page": page,
             }
+            if updated_since is not None:
+                if updated_since.tzinfo is None:
+                    raise ValueError("updated_since must include a timezone")
+                params["since"] = updated_since.isoformat().replace("+00:00", "Z")
             if after is not None:
                 params["after"] = after
             payload, headers = get_json_response(
@@ -82,6 +108,7 @@ class GitHubProvider:
                 url,
                 headers=self._headers(),
                 params=params,
+                retry_policy=self.retry_policy,
             )
             if not isinstance(payload, list):
                 raise ProviderRemoteError(self.name, "github returned an invalid response")
@@ -94,12 +121,17 @@ class GitHubProvider:
                 expected_url=url,
                 expected_state=state,
                 current_page=page,
+                expected_since=params.get("since"),
             )
             if next_pagination is None:
                 return issues
             if len(visited_pages) >= self._MAX_ISSUE_PAGES:
                 raise ProviderRemoteError(self.name, "github returned invalid pagination")
             page, after = next_pagination
+            if after is not None:
+                if after in visited_cursors:
+                    raise ProviderRemoteError(self.name, "github returned invalid pagination")
+                visited_cursors.add(after)
 
     def get_issue(self, repository: Repository, number: int) -> Issue:
         repository = self._validated_repository(repository)
@@ -110,6 +142,7 @@ class GitHubProvider:
             self.name,
             f"{self._api_url(repository)}/issues/{number}",
             headers=self._headers(),
+            retry_policy=self.retry_policy,
         )
         if isinstance(payload, dict) and "pull_request" in payload:
             raise ProviderRemoteError(self.name, "github item is a pull request, not an issue")
@@ -131,6 +164,7 @@ class GitHubProvider:
         expected_url: str,
         expected_state: str,
         current_page: int,
+        expected_since: object = None,
     ) -> tuple[int, str | None] | None:
         link_header = next(
             (value for key, value in headers.items() if key.lower() == "link"),
@@ -167,10 +201,11 @@ class GitHubProvider:
             or port is not None
             or parsed.fragment
             or (parsed.path != expected_path and canonical_path is None)
-            or set(query) - {"state", "per_page", "page", "after"}
+            or set(query) - {"state", "per_page", "page", "after", "since"}
             or any(len(values) != 1 for values in query.values())
             or query.get("state", [expected_state])[0] != expected_state
             or query.get("per_page", ["100"])[0] != "100"
+            or query.get("since", [expected_since])[0] != expected_since
         ):
             raise ProviderRemoteError("github", "github returned invalid pagination")
         raw_page = query.get("page", [None])[0]

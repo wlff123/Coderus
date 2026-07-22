@@ -5,6 +5,8 @@ import tarfile
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat
 
 from coderus.release_manifest import (
     build_source_manifest,
@@ -23,6 +25,8 @@ def make_source_tree(root: Path) -> None:
         "README.md": "# Coderus\n",
         "LICENSE": "Apache License 2.0\n",
         "config.example.yaml": "server: {}\n",
+        ".github/workflows/ci.yml": "steps:\n  - run: uv run pytest -q\n",
+        "docs/deployment.md": "# Deployment\n",
         "config.yaml": "secret: production\n",
         "secrets.env": "CODERUS_MODEL_API_KEY=secret\n",
         "data/coderus.db": "database",
@@ -34,6 +38,19 @@ def make_source_tree(root: Path) -> None:
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
+
+
+def signing_key(tmp_path: Path) -> Path:
+    path = tmp_path / "release-signing-key.pem"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(
+        Ed25519PrivateKey.generate().private_bytes(
+            Encoding.PEM,
+            PrivateFormat.PKCS8,
+            NoEncryption(),
+        )
+    )
+    return path
 
 
 def test_source_manifest_uses_runtime_whitelist_and_stable_digest(tmp_path: Path) -> None:
@@ -48,6 +65,9 @@ def test_source_manifest_uses_runtime_whitelist_and_stable_digest(tmp_path: Path
     assert "coderus/app.py" in paths
     assert "tests/test_app.py" in paths
     assert "LICENSE" in paths
+    assert ".github/workflows/ci.yml" in paths
+    assert "docs/deployment.md" in paths
+    assert "docs/internal.md" not in paths
     assert "config.yaml" not in paths
     assert "secrets.env" not in paths
     assert "data/coderus.db" not in paths
@@ -67,6 +87,7 @@ def test_create_release_archive_contains_manifest_and_no_runtime_data(
         output,
         created_at="2026-07-21T12:00:00Z",
         python_version="3.12.11",
+        signing_key_path=signing_key(tmp_path),
     )
 
     assert archive_path.name.startswith("coderus-20260721-120000-")
@@ -78,11 +99,19 @@ def test_create_release_archive_contains_manifest_and_no_runtime_data(
     assert "release.json" in names
     assert "coderus/app.py" in names
     assert "LICENSE" in names
+    assert ".github/workflows/ci.yml" in names
+    assert "docs/deployment.md" in names
+    assert "docs/internal.md" not in names
     assert "config.yaml" not in names
     assert "secrets.env" not in names
     assert "data/coderus.db" not in names
     assert release["release_id"] in archive_path.name
     assert release["python_version"] == "3.12.11"
+    assert release["signature_algorithm"] == "ed25519"
+    assert isinstance(release["signature"], str)
+    assert release["schema_version"] == 1
+    assert release["min_schema_version"] == 1
+    assert release["max_schema_version"] == 1
     assert script_mode == 0o755
     assert "tests" not in release
 
@@ -104,3 +133,10 @@ def test_source_manifest_rejects_sensitive_files_inside_release_directories(
 
     with pytest.raises(ValueError, match="public release rejected"):
         build_source_manifest(tmp_path)
+
+
+def test_release_archive_requires_a_signing_key(tmp_path: Path) -> None:
+    make_source_tree(tmp_path)
+
+    with pytest.raises(ValueError, match="signing key"):
+        create_release_archive(tmp_path, tmp_path / "dist")
