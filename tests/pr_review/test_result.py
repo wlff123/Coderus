@@ -176,9 +176,10 @@ def test_parse_review_output_rejects_overlong_stdout() -> None:
         parse_review_output(" " * 65_537)
 
 
-def test_validate_rejects_location_outside_diff(changed_ranges: ChangedRanges) -> None:
-    with pytest.raises(ReviewOutputError, match="不在 PR 变更范围"):
-        validate_findings(output_at_line(99), changed_ranges)
+def test_validate_drops_location_outside_diff(changed_ranges: ChangedRanges) -> None:
+    validated = validate_findings(output_at_line(99), changed_ranges)
+
+    assert validated.findings == []
 
 
 def test_validate_clips_location_to_single_overlapping_diff(
@@ -198,23 +199,38 @@ def test_validate_accepts_location_contained_in_one_hunk(
     assert validate_findings(valid_output, changed_ranges) is valid_output
 
 
-def test_validate_rejects_location_crossing_changed_hunks() -> None:
+def test_validate_drops_location_crossing_changed_hunks() -> None:
     ranges = ChangedRanges(
         {("src/app.py", "RIGHT"): ((10, 12), (20, 22))}
     )
     output = output_at_line(12, line_end=20)
 
-    with pytest.raises(ReviewOutputError, match="不在 PR 变更范围"):
-        validate_findings(output, ranges)
+    assert validate_findings(output, ranges).findings == []
 
 
-def test_validate_rejects_oversized_location_covering_changed_lines(
+def test_validate_drops_oversized_location_covering_changed_lines(
     changed_ranges: ChangedRanges,
 ) -> None:
     output = output_at_line(1, line_end=100_000)
 
-    with pytest.raises(ReviewOutputError, match="不在 PR 变更范围"):
-        validate_findings(output, changed_ranges)
+    assert validate_findings(output, changed_ranges).findings == []
+
+
+def test_validate_keeps_valid_findings_when_dropping_invalid_ones(
+    changed_ranges: ChangedRanges,
+) -> None:
+    output = ReviewOutput.model_validate(
+        review_data(
+            [
+                finding_data(line_start=12, line_end=14),
+                finding_data(line_start=99, line_end=99, title="越界意见"),
+            ]
+        )
+    )
+
+    validated = validate_findings(output, changed_ranges)
+
+    assert [finding.line_start for finding in validated.findings] == [12]
 
 
 def test_render_comment_contains_clickable_range(valid_output: ReviewOutput) -> None:

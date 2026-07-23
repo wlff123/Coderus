@@ -457,7 +457,7 @@ async def test_run_rejects_non_open_pr_before_workspace(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure_kind", ["workspace", "runner", "output", "location", "comment"])
+@pytest.mark.parametrize("failure_kind", ["workspace", "runner", "output", "comment"])
 async def test_run_failure_is_sanitized_and_never_retries_codex(
     engine, session: Session, tmp_path: Path, failure_kind: str
 ) -> None:
@@ -478,8 +478,6 @@ async def test_run_failure_is_sanitized_and_never_retries_codex(
         runner.stderr = f"failed with {secret} in {absolute_path}"
     elif failure_kind == "output":
         runner.stdout = f"invalid {secret} {absolute_path} {raw_stdout}"
-    elif failure_kind == "location":
-        workspace.ranges = ChangedRanges({})
     else:
         publisher.comment_error = PublisherRemoteError(
             f"comment failed {secret} {absolute_path} {raw_stdout}"
@@ -512,6 +510,27 @@ async def test_run_failure_is_sanitized_and_never_retries_codex(
     assert notifier.messages[-1][2] == (
         f"RV-{task.id} 检视失败：{persisted.failure_summary}"
     )
+
+
+@pytest.mark.asyncio
+async def test_run_drops_unpublishable_locations_and_completes(
+    engine, session: Session, tmp_path: Path
+) -> None:
+    task = add_review_task(session)
+    workspace = FakeWorkspace(engine, tmp_path / "workspace")
+    workspace.ranges = ChangedRanges({})
+    orchestrator, publisher, _, _, _, _ = build_orchestrator(
+        engine, tmp_path, workspace=workspace
+    )
+
+    await orchestrator.run(task.id)
+
+    session.expire_all()
+    persisted = session.get(PRReviewTask, task.id)
+    assert persisted.status == "completed"
+    assert persisted.structured_result["findings"] == []
+    assert len(publisher.comment_calls) == 1
+    assert "未发现需要反馈的具体问题" in publisher.comment_calls[0]["body"]
 
 
 @pytest.mark.asyncio

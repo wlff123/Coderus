@@ -74,7 +74,8 @@ def validate_findings(output: ReviewOutput, ranges: ChangedRanges) -> ReviewOutp
             finding.line_end,
         )
         if clipped is None:
-            raise ReviewOutputError("意见位置不在 PR 变更范围")
+            changed = True
+            continue
         if clipped != (finding.line_start, finding.line_end):
             finding = finding.model_copy(
                 update={"line_start": clipped[0], "line_end": clipped[1]}
