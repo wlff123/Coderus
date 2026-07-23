@@ -466,7 +466,12 @@ class LocalCodexRunner:
         assert process.stdout is not None
         assert process.stderr is not None
 
-        stdout_limit = max(1, spec.max_output_bytes * 4 // 5)
+        stdout_limit = max(
+            1,
+            spec.max_output_bytes // 2
+            if spec.stage is Stage.PR_REVIEW
+            else spec.max_output_bytes * 4 // 5,
+        )
         stderr_limit = spec.max_output_bytes - stdout_limit
         output_budget = _OutputBudget(spec.max_output_bytes)
         stdout_task = asyncio.create_task(

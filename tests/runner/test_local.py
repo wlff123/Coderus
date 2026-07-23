@@ -118,7 +118,7 @@ elif prompt == "large-workspace":
         output.flush()
     time.sleep(30)
 elif prompt == "large-native-review":
-    sys.stderr.write("native-review-" + "n" * 300_000)
+    sys.stderr.write("native-review-" + "n" * 500_000)
 else:
     print(json.dumps({"argv": sys.argv[1:], "prompt": prompt}))
     print("diagnostic", file=sys.stderr)
@@ -311,7 +311,7 @@ async def test_pr_review_sends_large_formatter_prompt_over_stdin(
     assert result.status is JobStatus.SUCCEEDED
     assert payload["argv"][-1] == "-"
     assert "native-review-" in payload["prompt"]
-    assert len(payload["prompt"]) > 300_000
+    assert len(payload["prompt"]) > 500_000
 
 
 @pytest.mark.asyncio
