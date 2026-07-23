@@ -557,7 +557,10 @@ async def test_client_construction_cancellation_releases_broker_permit(
     )
     app = create_proxy_app(broker, "https://models.example", "real-secret-key")
 
+    client_options: dict[str, object] = {}
+
     def cancelled_client(*args, **kwargs):
+        client_options.update(kwargs)
         raise asyncio.CancelledError
 
     async with httpx.AsyncClient(
@@ -575,6 +578,12 @@ async def test_client_construction_cancellation_releases_broker_permit(
         token, endpoint="/v1/responses", requested_model="test-model"
     )
     permit.release()
+    timeout = client_options["timeout"]
+    assert isinstance(timeout, httpx.Timeout)
+    assert timeout.connect == 30
+    assert timeout.read is None
+    assert timeout.write == 30
+    assert timeout.pool == 30
 
 
 @pytest.mark.asyncio

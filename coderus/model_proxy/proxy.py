@@ -24,6 +24,7 @@ _HOP_BY_HOP_HEADERS = {
 _MAX_REQUEST_BYTES = 10 * 1024 * 1024
 _MAX_OUTPUT_TOKENS = 32_768
 _MAX_TOOLS = 64
+_UPSTREAM_TIMEOUT = httpx.Timeout(connect=30, read=None, write=30, pool=30)
 _TOOL_FIELDS = {
     "function": frozenset({"type", "name", "description", "parameters", "strict"}),
     "custom": frozenset({"type", "name", "description", "format"}),
@@ -97,7 +98,10 @@ def create_proxy_app(
 
         owned_client = client is None
         try:
-            proxy_client = client or httpx.AsyncClient(transport=transport)
+            proxy_client = client or httpx.AsyncClient(
+                transport=transport,
+                timeout=_UPSTREAM_TIMEOUT,
+            )
         except BaseException as exc:
             permit.release()
             if not isinstance(exc, Exception):
