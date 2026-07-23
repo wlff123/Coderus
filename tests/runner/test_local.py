@@ -227,7 +227,11 @@ def test_build_command_uses_builtin_codex_review_for_pr_review(
     assert command[command.index("--base") + 1] == "a" * 40
     assert review_spec.prompt not in command
     assert "project_doc_max_bytes=0" in command
-    assert 'openai_base_url="http://127.0.0.1:9999/v1"' in command
+    assert 'model_provider="coderus_proxy"' in command
+    assert 'model_providers.coderus_proxy.base_url="http://127.0.0.1:9999/v1"' in command
+    assert 'model_providers.coderus_proxy.env_key="OPENAI_API_KEY"' in command
+    assert 'model_providers.coderus_proxy.wire_api="responses"' in command
+    assert "model_providers.coderus_proxy.supports_websockets=false" in command
     assert command[command.index("--model") + 1] == "test-model"
     assert "--output-schema" not in command
     assert "--search" not in command
@@ -274,6 +278,7 @@ async def test_pr_review_runs_builtin_review_then_structured_formatter(
     payload = json.loads(result.stdout)
     assert result.status is JobStatus.SUCCEEDED
     assert "exec" in payload["argv"]
+    assert 'model_provider="coderus_proxy"' in payload["argv"]
     assert payload["argv"][-1] == "-"
     assert "review" in payload["prompt"]
     assert "Codex 内置 Review" in payload["prompt"]
@@ -404,7 +409,11 @@ def test_build_command_applies_model_and_network_policy(
     )
 
     assert "sandbox_workspace_write.network_access=true" in command
-    assert 'openai_base_url="http://127.0.0.1:9999/v1"' in command
+    assert 'model_provider="coderus_proxy"' in command
+    assert 'model_providers.coderus_proxy.base_url="http://127.0.0.1:9999/v1"' in command
+    assert 'model_providers.coderus_proxy.env_key="OPENAI_API_KEY"' in command
+    assert 'model_providers.coderus_proxy.wire_api="responses"' in command
+    assert "model_providers.coderus_proxy.supports_websockets=false" in command
     assert command[command.index("--model") + 1] == "test-model"
 
 
@@ -418,7 +427,8 @@ def test_build_command_preserves_codex_login_when_no_proxy_token(
 
     command = runner.build_command(make_spec(workspace, "work"))
 
-    assert not any(argument.startswith("openai_base_url=") for argument in command)
+    assert not any(argument.startswith("model_provider=") for argument in command)
+    assert not any(argument.startswith("model_providers.") for argument in command)
 
 
 def test_build_command_uses_read_only_for_reviewers(

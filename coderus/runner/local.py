@@ -46,6 +46,8 @@ BLOCKED_INHERITED_ENVIRONMENT = frozenset(
     }
 )
 
+PROXY_PROVIDER = "coderus_proxy"
+
 
 def resolve_codex_command(binary: str) -> tuple[str, ...]:
     if not binary:
@@ -225,6 +227,23 @@ class LocalCodexRunner:
             return self._build_review_command(spec)
         return self._build_exec_command(spec, output_schema=output_schema)
 
+    def _proxy_provider_options(self) -> tuple[str, ...]:
+        provider = f"model_providers.{PROXY_PROVIDER}"
+        return (
+            "-c",
+            f"model_provider={json.dumps(PROXY_PROVIDER)}",
+            "-c",
+            f'{provider}.name="Coderus model proxy"',
+            "-c",
+            f"{provider}.base_url={json.dumps(self._config.api_base_url)}",
+            "-c",
+            f'{provider}.env_key="OPENAI_API_KEY"',
+            "-c",
+            f'{provider}.wire_api="responses"',
+            "-c",
+            f"{provider}.supports_websockets=false",
+        )
+
     def _build_exec_command(
         self,
         spec: JobSpec,
@@ -257,9 +276,7 @@ class LocalCodexRunner:
         if self._config.network_access:
             command.extend(("-c", "sandbox_workspace_write.network_access=true"))
         if spec.proxy_token is not None:
-            command.extend(
-                ("-c", f"openai_base_url={json.dumps(self._config.api_base_url)}")
-            )
+            command.extend(self._proxy_provider_options())
         if self._config.model:
             command.extend(("--model", self._config.model))
         if output_schema is not None and not review_formatter:
@@ -278,7 +295,7 @@ class LocalCodexRunner:
             command.extend(("--sandbox", "read-only", "--ask-for-approval", "never"))
         command.extend(("-c", "project_doc_max_bytes=0"))
         if spec.proxy_token is not None:
-            command.extend(("-c", f"openai_base_url={json.dumps(self._config.api_base_url)}"))
+            command.extend(self._proxy_provider_options())
         if self._config.model:
             command.extend(("--model", self._config.model))
         command.extend(("review", "--base", spec.review_base))
