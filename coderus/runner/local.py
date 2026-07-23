@@ -385,9 +385,7 @@ class LocalCodexRunner:
                     stderr="PR review formatting timed out before start",
                     duration_seconds=time.monotonic() - started,
                 )
-            native_review = "\n".join(
-                part.strip() for part in (result.stdout, result.stderr) if part.strip()
-            )
+            native_review = result.stdout.strip() or result.stderr.strip()
             formatter_prompt = self._format_review_prompt(spec.prompt, native_review)
             formatter_command = self._build_exec_command(
                 spec,
