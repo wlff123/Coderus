@@ -64,14 +64,25 @@ def _final_agent_message(stdout: str) -> str | None:
 
 
 def validate_findings(output: ReviewOutput, ranges: ChangedRanges) -> ReviewOutput:
+    validated_findings = []
+    changed = False
     for finding in output.findings:
-        if not ranges.contains(
+        clipped = ranges.clip(
             finding.file_path,
             finding.line_side,
             finding.line_start,
             finding.line_end,
-        ):
+        )
+        if clipped is None:
             raise ReviewOutputError("意见位置不在 PR 变更范围")
+        if clipped != (finding.line_start, finding.line_end):
+            finding = finding.model_copy(
+                update={"line_start": clipped[0], "line_end": clipped[1]}
+            )
+            changed = True
+        validated_findings.append(finding)
+    if changed:
+        output = output.model_copy(update={"findings": validated_findings})
     output._comparison_sha = ranges.comparison_sha
     return output
 

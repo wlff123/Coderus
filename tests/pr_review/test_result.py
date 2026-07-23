@@ -181,6 +181,17 @@ def test_validate_rejects_location_outside_diff(changed_ranges: ChangedRanges) -
         validate_findings(output_at_line(99), changed_ranges)
 
 
+def test_validate_clips_location_to_single_overlapping_diff(
+    changed_ranges: ChangedRanges,
+) -> None:
+    output = output_at_line(9, line_end=12)
+
+    validated = validate_findings(output, changed_ranges)
+
+    assert validated.findings[0].line_start == 10
+    assert validated.findings[0].line_end == 12
+
+
 def test_validate_accepts_location_contained_in_one_hunk(
     changed_ranges: ChangedRanges, valid_output: ReviewOutput
 ) -> None:

@@ -32,13 +32,26 @@ class ChangedRanges:
     comparison_sha: str | None = None
 
     def contains(self, file_path: str, side: str, start: int, end: int) -> bool:
+        return self.clip(file_path, side, start, end) == (start, end)
+
+    def clip(
+        self, file_path: str, side: str, start: int, end: int
+    ) -> tuple[int, int] | None:
         path = normalize_repository_path(file_path)
         if path is None or side not in {"LEFT", "RIGHT"} or start < 1 or end < start:
-            return False
-        return any(
-            range_start <= start and end <= range_end
-            for range_start, range_end in self.ranges.get((path, side), ())
+            return None
+        overlaps = tuple(
+            dict.fromkeys(
+                (max(start, range_start), min(end, range_end))
+                for range_start, range_end in self.ranges.get((path, side), ())
+                if max(start, range_start) <= min(end, range_end)
+            )
         )
+        if len(overlaps) != 1:
+            return None
+        clipped_start, clipped_end = overlaps[0]
+        context_lines = clipped_start - start + end - clipped_end
+        return overlaps[0] if context_lines <= 1 else None
 
 
 class ReviewFinding(BaseModel):
