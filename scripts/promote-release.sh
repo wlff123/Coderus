@@ -52,12 +52,12 @@ if [[ -L "$ROOT/previous" ]]; then
   }
 fi
 
-atomic_link() {
+switch_link() {
   local pointer="$1"
   local release_id="$2"
-  rm -f "$ROOT/$pointer.new"
-  ln -s "releases/$release_id" "$ROOT/$pointer.new"
-  mv -Tf "$ROOT/$pointer.new" "$ROOT/$pointer"
+  rm -f "$ROOT/$pointer"
+  ln -s "releases/$release_id" "$ROOT/$pointer"
+  [[ "$(readlink "$ROOT/$pointer")" == "releases/$release_id" ]]
 }
 
 wait_until_idle() {
@@ -121,9 +121,9 @@ rollback_failed_promotion() {
     bash "$ROOT/scripts/container-stop.sh"; then
     mark_rollback_failed "production process did not stop"
   fi
-  atomic_link current "$OLD_ID" || mark_rollback_failed "cannot restore current link"
+  switch_link current "$OLD_ID" || mark_rollback_failed "cannot restore current link"
   if [[ -n "$ORIGINAL_PREVIOUS_ID" ]]; then
-    atomic_link previous "$ORIGINAL_PREVIOUS_ID" \
+    switch_link previous "$ORIGINAL_PREVIOUS_ID" \
       || mark_rollback_failed "cannot restore previous link"
   else
     rm -f "$ROOT/previous" || mark_rollback_failed "cannot clear previous link"
@@ -166,8 +166,8 @@ run_with_budget "$PYTHON" -m coderus.release_ops backup "$DATABASE" "$backup_can
 BACKUP="$backup_candidate"
 run_with_budget "$PYTHON" -m coderus.release_ops migrate "$DATABASE" \
   || rollback_failed_promotion "database migration failed"
-atomic_link previous "$OLD_ID" || rollback_failed_promotion "cannot update previous link"
-atomic_link current "$RELEASE_ID" || rollback_failed_promotion "cannot update current link"
+switch_link previous "$OLD_ID" || rollback_failed_promotion "cannot update previous link"
+switch_link current "$RELEASE_ID" || rollback_failed_promotion "cannot update current link"
 
 nohup "$PYTHON" -m coderus serve \
   --runtime maintenance \

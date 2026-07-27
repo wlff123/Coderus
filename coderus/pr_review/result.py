@@ -98,6 +98,9 @@ def render_pr_comment(
     review_key: str,
     *,
     changed_file_count: int | None = None,
+    additions: int | None = None,
+    deletions: int | None = None,
+    filtered_finding_count: int = 0,
     comparison_sha: str | None = None,
 ) -> tuple[str, str]:
     hosts = {"github": "github.com", "gitcode": "gitcode.com"}
@@ -105,17 +108,23 @@ def render_pr_comment(
         raise ValueError("unsupported PR review provider")
     marker = f"<!-- coderus-pr-review:{review_key}:{base_sha}:{head_sha} -->"
     findings = _unique_findings(output)
-    summary = (
-        f"发现 {len(findings)} 项需要处理的问题"
-        if findings
-        else "未发现需要反馈的具体问题"
-    )
+    if findings:
+        summary = f"发现 {len(findings)} 项需要处理的问题"
+        if filtered_finding_count:
+            summary += f"；另有 {filtered_finding_count} 条意见因无法安全定位未发布"
+    elif filtered_finding_count:
+        summary = f"{filtered_finding_count} 条意见因无法安全定位未发布，需人工复核"
+    else:
+        summary = "未发现需要反馈的具体问题"
     sections = [
         "## Coderus 代码检视",
         f"- 检视版本：{_code_span(head_sha)}",
     ]
     if changed_file_count is not None:
-        sections.append(f"- 检视输入：{changed_file_count} 个变更文件")
+        input_summary = f"{changed_file_count} 个变更文件"
+        if additions is not None and deletions is not None:
+            input_summary += f"，+{additions} / -{deletions}"
+        sections.append(f"- 检视输入：{input_summary}")
     sections.append("- PR 修改摘要：")
     sections.extend(
         f"  {index}. {_escape_markdown(sentence)}"

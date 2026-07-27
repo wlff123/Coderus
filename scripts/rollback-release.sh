@@ -24,12 +24,12 @@ PREVIOUS_ID="$(basename "$PREVIOUS")"
 PYTHON="$CURRENT/.venv/bin/python"
 cd "$CURRENT"
 
-atomic_link() {
+switch_link() {
   local pointer="$1"
   local release_id="$2"
-  rm -f "$ROOT/$pointer.new"
-  ln -s "releases/$release_id" "$ROOT/$pointer.new"
-  mv -Tf "$ROOT/$pointer.new" "$ROOT/$pointer"
+  rm -f "$ROOT/$pointer"
+  ln -s "releases/$release_id" "$ROOT/$pointer"
+  [[ "$(readlink "$ROOT/$pointer")" == "releases/$release_id" ]]
 }
 
 fail_closed() {
@@ -51,14 +51,14 @@ touch "$DRAIN_GATE"
 }
 CODERUS_STOP_TIMEOUT=5 bash "$ROOT/scripts/container-stop.sh" \
   || fail_closed "current release did not stop"
-atomic_link current "$PREVIOUS_ID" || fail_closed "cannot switch current link"
-atomic_link previous "$CURRENT_ID" || fail_closed "cannot switch previous link"
+switch_link current "$PREVIOUS_ID" || fail_closed "cannot switch current link"
+switch_link previous "$CURRENT_ID" || fail_closed "cannot switch previous link"
 
 if ! CODERUS_START_TIMEOUT=10 bash "$ROOT/scripts/container-start.sh"; then
   CODERUS_STOP_TIMEOUT=3 bash "$ROOT/scripts/container-stop.sh" \
     || fail_closed "failed target process did not stop"
-  atomic_link current "$CURRENT_ID" || fail_closed "cannot restore current link"
-  atomic_link previous "$PREVIOUS_ID" || fail_closed "cannot restore previous link"
+  switch_link current "$CURRENT_ID" || fail_closed "cannot restore current link"
+  switch_link previous "$PREVIOUS_ID" || fail_closed "cannot restore previous link"
   CODERUS_START_TIMEOUT=10 bash "$ROOT/scripts/container-start.sh" \
     || fail_closed "original release failed to restart"
   rm -f "$DRAIN_GATE"

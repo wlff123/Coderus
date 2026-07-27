@@ -60,6 +60,14 @@ class HttpClient(Protocol):
         json: Mapping[str, object],
     ) -> HttpResponse: ...
 
+    def patch(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        json: Mapping[str, object],
+    ) -> HttpResponse: ...
+
 
 class GitPusher(Protocol):
     def push(self, workspace: Path, remote_url: str, branch: str) -> None: ...
@@ -311,6 +319,16 @@ class GitCodePublisher:
         )
         existing = self._find_comment(comments_url, marker)
         if existing is not None:
+            if existing["body"] != body:
+                identifier = self._comment_identifier(existing.get("id"), "comment response")
+                self._request(
+                    "PATCH",
+                    (
+                        f"{_API_ROOT}/repos/{upstream_owner}/{repository_name}"
+                        f"/pulls/comments/{identifier}"
+                    ),
+                    payload={"body": body},
+                )
             return PRCommentResult(
                 url=self._comment_url(
                     existing.get("html_url"),
@@ -502,9 +520,10 @@ class GitCodePublisher:
                 )
             except ProviderRequestError as exc:
                 raise _GitCodeRequestError(str(exc), uncertain=True) from None
-        elif method == "POST":
+        elif method in {"POST", "PATCH"}:
             try:
-                response = self._http_client.post(
+                request = self._http_client.post if method == "POST" else self._http_client.patch
+                response = request(
                     url, headers=self._headers(), json=payload or {}
                 )
             except Exception:

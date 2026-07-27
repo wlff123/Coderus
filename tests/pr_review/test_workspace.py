@@ -427,6 +427,9 @@ async def test_changed_ranges_reads_verified_git_diff(
     assert ranges.contains("src/app.py", "LEFT", 1, 1)
     assert ranges.contains("src/app.py", "RIGHT", 1, 1)
     assert ranges.comparison_sha == "c" * 40
+    assert ranges.changed_file_count == 1
+    assert ranges.additions == 1
+    assert ranges.deletions == 1
     assert ("git", "cat-file", "-e", f"{'a' * 40}^{{commit}}") in calls
     assert ("git", "merge-base", "a" * 40, "b" * 40) in calls
     diff_call = next(call for call in calls if call[:2] == ("git", "diff"))
@@ -522,6 +525,9 @@ async def test_changed_ranges_tracks_modified_added_and_deleted_lines(
         ("src/new.py", "RIGHT"): ((1, 2),),
         ("src/deleted.py", "LEFT"): ((1, 2),),
     }
+    assert ranges.changed_file_count == 3
+    assert ranges.additions == 6
+    assert ranges.deletions == 4
 
 
 def test_changed_ranges_ignores_header_like_hunk_content() -> None:

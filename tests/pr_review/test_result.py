@@ -330,6 +330,26 @@ def test_render_comment_allows_no_findings() -> None:
     assert body.endswith(marker)
 
 
+def test_render_comment_reports_filtered_findings_instead_of_clean_result() -> None:
+    body, _ = render_pr_comment(
+        "gitcode",
+        ReviewOutput.model_validate(review_data([])),
+        "acme",
+        "widgets",
+        BASE,
+        HEAD,
+        REVIEW_KEY,
+        changed_file_count=13,
+        additions=779,
+        deletions=29,
+        filtered_finding_count=2,
+    )
+
+    assert "检视输入：13 个变更文件，+779 / -29" in body
+    assert "2 条意见因无法安全定位未发布" in body
+    assert "未发现需要反馈的具体问题" not in body
+
+
 def test_render_comment_escapes_markdown_and_quotes_file_paths() -> None:
     output = output_at_line(
         12,

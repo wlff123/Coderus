@@ -63,6 +63,16 @@ class FakeHttpClient:
         self.calls.append({"method": "POST", "url": url, "headers": headers, "json": json})
         return self._next()
 
+    def patch(
+        self,
+        url: str,
+        *,
+        headers: dict[str, str],
+        json: dict[str, object],
+    ) -> FakeResponse:
+        self.calls.append({"method": "PATCH", "url": url, "headers": headers, "json": json})
+        return self._next()
+
     def _next(self) -> FakeResponse:
         response = self.responses.popleft()
         if isinstance(response, Exception):
@@ -893,6 +903,37 @@ def test_publish_pr_comment_reuses_marker_only_for_authenticated_author() -> Non
         url="https://gitcode.com/acme/widgets/merge_requests/7#note_8", created=False
     )
     assert [call["method"] for call in client.calls] == ["GET"]
+
+
+def test_publish_pr_comment_updates_stale_body_with_same_marker() -> None:
+    marker = "<!-- coderus-pr-review:RV-7:abc -->"
+    old_body = f"old review\n{marker}"
+    new_body = f"correct review\n{marker}"
+    client = FakeHttpClient(
+        FakeResponse(
+            200,
+            [
+                {
+                    "id": 8,
+                    "body": old_body,
+                    "html_url": "https://gitcode.com/acme/widgets/pulls/7#note_8",
+                    "user": {"login": "coderus-bot"},
+                }
+            ],
+        ),
+        FakeResponse(200, {}),
+    )
+
+    result = publisher(client).publish_pr_comment("acme", "widgets", 7, new_body, marker)
+
+    assert result == PRCommentResult(
+        url="https://gitcode.com/acme/widgets/merge_requests/7#note_8", created=False
+    )
+    assert client.calls[-1]["method"] == "PATCH"
+    assert client.calls[-1]["url"] == (
+        "https://api.gitcode.com/api/v5/repos/acme/widgets/pulls/comments/8"
+    )
+    assert client.calls[-1]["json"] == {"body": new_body}
 
 
 def test_publish_pr_comment_reuses_marker_without_html_url_using_canonical_url() -> None:

@@ -30,6 +30,9 @@ def normalize_repository_path(file_path: str) -> str | None:
 class ChangedRanges:
     ranges: Mapping[tuple[str, str], tuple[tuple[int, int], ...]]
     comparison_sha: str | None = None
+    changed_file_count: int = 0
+    additions: int = 0
+    deletions: int = 0
 
     def contains(self, file_path: str, side: str, start: int, end: int) -> bool:
         return self.clip(file_path, side, start, end) == (start, end)

@@ -131,7 +131,12 @@ def test_promotion_script_drains_then_switches_with_automatic_rollback() -> None
     assert 'bash "$ROOT/scripts/container-stop.sh"' in promote
     assert "coderus.release_ops backup" in promote
     assert "coderus.release_ops migrate" in promote
-    assert 'mv -Tf "$ROOT/$pointer.new" "$ROOT/$pointer"' in promote
+    assert 'rm -f "$ROOT/$pointer"' in promote
+    assert 'ln -s "releases/$release_id" "$ROOT/$pointer"' in promote
+    assert 'rm -f "$ROOT/$pointer"' in rollback
+    assert 'ln -s "releases/$release_id" "$ROOT/$pointer"' in rollback
+    assert "mv -Tf" not in promote
+    assert "mv -Tf" not in rollback
     assert "--runtime maintenance" in promote
     assert "9>&-" in promote
     assert 'bash "$ROOT/scripts/container-start.sh"' in promote
@@ -160,7 +165,7 @@ def test_legacy_promotion_stops_ingress_before_final_idle_check() -> None:
     )
     assert cutover.index("coderus.release_ops backup") < cutover.index(
         "coderus.release_ops migrate"
-    ) < cutover.index("atomic_link current")
+    ) < cutover.index("switch_link current")
     assert 'OLD_RELEASE/LEGACY_RUNTIME' not in cutover
 
 

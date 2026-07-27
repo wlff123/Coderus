@@ -125,7 +125,7 @@ bash scripts/promote-release.sh <release-id>
 3. 等待 Issue、PR 检视、仓库同步、Agent 和飞书命令全部空闲；
 4. 停止旧服务并再次确认数据库没有在途任务；
 5. 使用 SQLite backup API 创建发布前备份；
-6. 原子更新 `previous` 和 `current`；
+6. 在服务停止窗口内更新 `previous` 和 `current` 链接；
 7. 依次验证 `maintenance` 和 `active` 模式。
 
 实际切换阶段共享默认 15 秒硬截止。任一步失败会恢复旧版本；如果已经创建数据库备份，也会恢复发布前数据库。自动回滚失败时写入 `data/ROLLBACK_FAILED` 并保持排空状态，避免继续写入。

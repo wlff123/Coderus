@@ -21,6 +21,7 @@ from coderus.runner import AgentRole, JobResult, JobStatus, RetryableAgentError,
 
 BASE_SHA = "a" * 40
 HEAD_SHA = "b" * 40
+COMPARISON_SHA = "c" * 40
 REVIEW_JSON = json.dumps(
     {
         "change_summary": ["修复组件的空值处理。"],
@@ -150,7 +151,13 @@ class FakeWorkspace:
         self.path = path
         self.prepare_calls: list[dict[str, object]] = []
         self.prepare_error: Exception | None = None
-        self.ranges = ChangedRanges({("src/widget.py", "RIGHT"): ((12, 14),)})
+        self.ranges = ChangedRanges(
+            {("src/widget.py", "RIGHT"): ((12, 14),)},
+            comparison_sha=COMPARISON_SHA,
+            changed_file_count=1,
+            additions=3,
+            deletions=0,
+        )
 
     async def prepare(self, **kwargs) -> Path:
         self.prepare_calls.append(kwargs)
@@ -338,7 +345,18 @@ async def test_run_reviews_fixed_pr_revision_once_and_persists_safe_result(
     assert persisted.base_sha == BASE_SHA
     assert persisted.head_sha == HEAD_SHA
     assert persisted.comment_url.endswith("#issuecomment-9")
-    assert persisted.structured_result == json.loads(REVIEW_JSON)
+    expected_result = json.loads(REVIEW_JSON)
+    assert persisted.structured_result["change_summary"] == expected_result["change_summary"]
+    assert persisted.structured_result["findings"] == expected_result["findings"]
+    assert persisted.structured_result["review_audit"] == {
+        "comparison_sha": COMPARISON_SHA,
+        "changed_files": 1,
+        "additions": 3,
+        "deletions": 0,
+        "generated_findings": 1,
+        "validated_findings": 1,
+        "filtered_findings": 0,
+    }
     assert persisted.workspace_path is None
     assert persisted.failure_code is None
     assert persisted.failure_summary is None
@@ -378,9 +396,11 @@ async def test_run_reviews_fixed_pr_revision_once_and_persists_safe_result(
     assert spec.role is AgentRole.PR_REVIEWER
     assert spec.workspace == tmp_path / "workspace"
     assert spec.max_output_bytes == 5_000_000
+    assert spec.review_base == COMPARISON_SHA
     assert spec.proxy_token is not None
     assert not broker.validate(spec.proxy_token)
-    assert BASE_SHA in spec.prompt and HEAD_SHA in spec.prompt
+    assert COMPARISON_SHA in spec.prompt and HEAD_SHA in spec.prompt
+    assert BASE_SHA not in spec.prompt
     for required in (
         "仅分析 base SHA 到 head SHA 的 diff",
         "change_summary",
@@ -518,7 +538,13 @@ async def test_run_drops_unpublishable_locations_and_completes(
 ) -> None:
     task = add_review_task(session)
     workspace = FakeWorkspace(engine, tmp_path / "workspace")
-    workspace.ranges = ChangedRanges({})
+    workspace.ranges = ChangedRanges(
+        {},
+        comparison_sha=COMPARISON_SHA,
+        changed_file_count=1,
+        additions=1,
+        deletions=0,
+    )
     orchestrator, publisher, _, _, _, _ = build_orchestrator(
         engine, tmp_path, workspace=workspace
     )
@@ -529,8 +555,44 @@ async def test_run_drops_unpublishable_locations_and_completes(
     persisted = session.get(PRReviewTask, task.id)
     assert persisted.status == "completed"
     assert persisted.structured_result["findings"] == []
+    assert persisted.structured_result["review_audit"] == {
+        "comparison_sha": COMPARISON_SHA,
+        "changed_files": 1,
+        "additions": 1,
+        "deletions": 0,
+        "generated_findings": 1,
+        "validated_findings": 0,
+        "filtered_findings": 1,
+    }
     assert len(publisher.comment_calls) == 1
-    assert "未发现需要反馈的具体问题" in publisher.comment_calls[0]["body"]
+    assert "1 条意见因无法安全定位未发布" in publisher.comment_calls[0]["body"]
+    assert "未发现需要反馈的具体问题" not in publisher.comment_calls[0]["body"]
+
+
+@pytest.mark.asyncio
+async def test_run_rejects_review_when_merge_base_audit_is_missing(
+    engine, session: Session, tmp_path: Path
+) -> None:
+    task = add_review_task(session)
+    workspace = FakeWorkspace(engine, tmp_path / "workspace")
+    workspace.ranges = ChangedRanges(
+        {("src/widget.py", "RIGHT"): ((12, 14),)},
+        changed_file_count=1,
+        additions=3,
+        deletions=0,
+    )
+    orchestrator, publisher, _, runner, _, _ = build_orchestrator(
+        engine, tmp_path, workspace=workspace
+    )
+
+    await orchestrator.run(task.id)
+
+    session.expire_all()
+    persisted = session.get(PRReviewTask, task.id)
+    assert persisted.status == "failed"
+    assert persisted.failure_summary == "无法确认 PR 的实际比较基准"
+    assert runner.specs == []
+    assert publisher.comment_calls == []
 
 
 @pytest.mark.asyncio

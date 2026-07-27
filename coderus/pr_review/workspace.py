@@ -159,9 +159,13 @@ class PRWorkspace:
             "--",
             cwd=workspace,
         )
+        parsed = self._parse_changed_ranges(diff)
         return ChangedRanges(
-            self._parse_changed_ranges(diff).ranges,
+            parsed.ranges,
             comparison_sha=comparison_sha,
+            changed_file_count=parsed.changed_file_count,
+            additions=parsed.additions,
+            deletions=parsed.deletions,
         )
 
     def _validated_staging_root(self) -> Path:
@@ -290,12 +294,16 @@ class PRWorkspace:
     @staticmethod
     def _parse_changed_ranges(diff: str) -> ChangedRanges:
         ranges: dict[tuple[str, str], list[tuple[int, int]]] = defaultdict(list)
+        changed_file_count = 0
+        additions = 0
+        deletions = 0
         old_path: str | None = None
         new_path: str | None = None
         state = "outside"
 
         for line in diff.splitlines():
             if line.startswith("diff --git "):
+                changed_file_count += 1
                 old_path = None
                 new_path = None
                 state = "header"
@@ -319,9 +327,16 @@ class PRWorkspace:
                 ranges[(old_path, "LEFT")].append((old_start, old_start + old_count - 1))
             if new_path is not None and new_count > 0:
                 ranges[(new_path, "RIGHT")].append((new_start, new_start + new_count - 1))
+            deletions += old_count
+            additions += new_count
             state = "hunk"
 
-        return ChangedRanges({key: tuple(value) for key, value in ranges.items()})
+        return ChangedRanges(
+            {key: tuple(value) for key, value in ranges.items()},
+            changed_file_count=changed_file_count,
+            additions=additions,
+            deletions=deletions,
+        )
 
     @staticmethod
     def _parse_diff_path(value: str, prefix: str) -> str | None:

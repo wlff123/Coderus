@@ -124,11 +124,13 @@ class PRReviewOrchestrator:
                 ranges = await self.workspace.changed_ranges(
                     prepared, details.base_sha, details.head_sha
                 )
+                if ranges.comparison_sha is None:
+                    raise PRReviewError("无法确认 PR 的实际比较基准")
                 self._assert_claim(task_id, claim_token, claim_lost)
                 result, proxy_token = await self._run_review(
                     task_id,
                     prepared,
-                    details.base_sha,
+                    ranges.comparison_sha,
                     details.head_sha,
                     claim_lost,
                 )
@@ -137,9 +139,9 @@ class PRReviewOrchestrator:
                     raise PRReviewError(
                         f"Codex 检视失败（{result.status.value}）"
                     )
-                output = validate_findings(
-                    parse_review_output(result.stdout), ranges
-                )
+                generated_output = parse_review_output(result.stdout)
+                output = validate_findings(generated_output, ranges)
+                filtered_finding_count = len(generated_output.findings) - len(output.findings)
 
                 self._assert_claim(task_id, claim_token, claim_lost)
                 current = await self.forges.require(task.provider).get_pull_request(
@@ -154,11 +156,21 @@ class PRReviewOrchestrator:
                     expected_head_repository_url=details.head_repository_url,
                 )
                 output = self._redact_output(output, proxy_token, prepared)
+                structured_result = output.model_dump(mode="json")
+                structured_result["review_audit"] = {
+                    "comparison_sha": ranges.comparison_sha,
+                    "changed_files": ranges.changed_file_count,
+                    "additions": ranges.additions,
+                    "deletions": ranges.deletions,
+                    "generated_findings": len(generated_output.findings),
+                    "validated_findings": len(output.findings),
+                    "filtered_findings": filtered_finding_count,
+                }
                 self._set_commenting(
                     task_id,
                     state,
                     claim_token,
-                    output.model_dump(mode="json"),
+                    structured_result,
                 )
                 state = "commenting"
                 body, marker = render_pr_comment(
@@ -169,9 +181,11 @@ class PRReviewOrchestrator:
                     details.base_sha,
                     details.head_sha,
                     task.review_key,
-                    changed_file_count=len(
-                        {file_path for file_path, _ in ranges.ranges}
-                    ),
+                    changed_file_count=ranges.changed_file_count,
+                    additions=ranges.additions,
+                    deletions=ranges.deletions,
+                    filtered_finding_count=filtered_finding_count,
+                    comparison_sha=ranges.comparison_sha,
                 )
                 self._assert_claim(task_id, claim_token, claim_lost)
                 comment = await asyncio.wait_for(
