@@ -29,9 +29,7 @@ def create_upstream(tmp_path: Path) -> tuple[Path, str, str]:
 
     source_app = source / "src" / "app.py"
     source_app.parent.mkdir()
-    source_app.write_text(
-        "".join(f"line {number}\n" for number in range(1, 21)), encoding="utf-8"
-    )
+    source_app.write_text("".join(f"line {number}\n" for number in range(1, 21)), encoding="utf-8")
     (source / "src" / "deleted.py").write_text("old one\nold two\n", encoding="utf-8")
     git(source, "add", ".")
     git(source, "commit", "-m", "base")
@@ -101,9 +99,7 @@ async def test_prepare_rejects_a_fetched_pr_head_that_does_not_match_requested_s
     allow_local_head_repository: None,
 ) -> None:
     upstream, base_sha, _ = create_upstream(tmp_path)
-    manager = PRWorkspace(
-        tmp_path / "workspaces", staging_root=tmp_path / "manager-staging"
-    )
+    manager = PRWorkspace(tmp_path / "workspaces", staging_root=tmp_path / "manager-staging")
 
     with pytest.raises(RuntimeError, match="head SHA"):
         await manager.prepare(
@@ -117,9 +113,7 @@ async def test_prepare_fetches_base_then_cross_repository_head_without_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("GITHUB_TOKEN", "must-not-appear")
-    manager = PRWorkspace(
-        tmp_path / "workspaces", staging_root=tmp_path / "manager-staging"
-    )
+    manager = PRWorkspace(tmp_path / "workspaces", staging_root=tmp_path / "manager-staging")
     base_sha = "a" * 40
     head_sha = "b" * 40
     calls: list[tuple[str, ...]] = []
@@ -175,9 +169,7 @@ async def test_prepare_rejects_credential_bearing_head_repository_url_before_git
     monkeypatch: pytest.MonkeyPatch,
     head_repository_url: str,
 ) -> None:
-    manager = PRWorkspace(
-        tmp_path / "workspaces", staging_root=tmp_path / "manager-staging"
-    )
+    manager = PRWorkspace(tmp_path / "workspaces", staging_root=tmp_path / "manager-staging")
     calls: list[tuple[str, ...]] = []
 
     async def record_run(*command: str, cwd: Path) -> str:
@@ -206,9 +198,7 @@ async def test_prepare_rejects_an_unreachable_base_sha(
     tmp_path: Path, allow_local_head_repository: None
 ) -> None:
     upstream, _, head_sha = create_upstream(tmp_path)
-    manager = PRWorkspace(
-        tmp_path / "workspaces", staging_root=tmp_path / "manager-staging"
-    )
+    manager = PRWorkspace(tmp_path / "workspaces", staging_root=tmp_path / "manager-staging")
 
     with pytest.raises(RuntimeError, match="base SHA"):
         await manager.prepare(
@@ -242,9 +232,7 @@ async def test_prepare_rejects_a_base_sha_not_reachable_from_fetched_base_ref(
     git(unrelated, "push", "upstream", "unrelated")
     git(upstream, "symbolic-ref", "HEAD", "refs/heads/unrelated")
 
-    manager = PRWorkspace(
-        tmp_path / "workspaces", staging_root=tmp_path / "manager-staging"
-    )
+    manager = PRWorkspace(tmp_path / "workspaces", staging_root=tmp_path / "manager-staging")
 
     with pytest.raises(RuntimeError, match="base SHA"):
         await manager.prepare(
@@ -296,9 +284,7 @@ async def test_prepare_rejects_unsafe_inputs_before_running_git(
         "head_repository_url": "https://github.com/acme/source.git",
     }
     arguments[field] = value
-    manager = PRWorkspace(
-        tmp_path / "workspaces", staging_root=tmp_path / "manager-staging"
-    )
+    manager = PRWorkspace(tmp_path / "workspaces", staging_root=tmp_path / "manager-staging")
     calls: list[tuple[str, ...]] = []
 
     async def record_run(*command: str, cwd: Path) -> str:
@@ -371,7 +357,7 @@ async def test_prepare_rejects_unsafe_base_refs_before_running_git(
         ("head_sha", "b" * 39),
     ],
 )
-async def test_changed_ranges_rejects_invalid_revisions_before_reading_material(
+async def test_review_input_rejects_invalid_revisions_before_reading_material(
     tmp_path: Path,
     field: str,
     value: str,
@@ -389,13 +375,13 @@ async def test_changed_ranges_rejects_invalid_revisions_before_reading_material(
     monkeypatch.setattr(manager, "_run", record_run)
 
     with pytest.raises(ValueError, match=field):
-        await manager.changed_ranges(tmp_path, **arguments)
+        await manager.review_input(tmp_path, **arguments)
 
     assert calls == []
 
 
 @pytest.mark.asyncio
-async def test_changed_ranges_reads_verified_git_diff(
+async def test_review_input_reads_verified_git_material(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -408,7 +394,11 @@ async def test_changed_ranges_reads_verified_git_diff(
             return "b" * 40
         if command == ("git", "merge-base", "a" * 40, "b" * 40):
             return "c" * 40
-        if command[:4] == ("git", "diff", "--no-ext-diff", "--binary"):
+        if "--name-status" in command:
+            return "M\tsrc/app.py"
+        if "--stat=200" in command:
+            return "src/app.py | 2 +-"
+        if command[:4] == ("git", "diff", "--no-ext-diff", "--no-color"):
             return "\n".join(
                 (
                     "diff --git a/src/app.py b/src/app.py",
@@ -422,7 +412,8 @@ async def test_changed_ranges_reads_verified_git_diff(
         return ""
 
     monkeypatch.setattr(manager, "_run", record_run)
-    ranges = await manager.changed_ranges(tmp_path, "a" * 40, "b" * 40)
+    material = await manager.review_input(tmp_path, "a" * 40, "b" * 40)
+    ranges = material.ranges
 
     assert ranges.contains("src/app.py", "LEFT", 1, 1)
     assert ranges.contains("src/app.py", "RIGHT", 1, 1)
@@ -430,14 +421,18 @@ async def test_changed_ranges_reads_verified_git_diff(
     assert ranges.changed_file_count == 1
     assert ranges.additions == 1
     assert ranges.deletions == 1
+    assert material.changed_files == "M\tsrc/app.py"
+    assert material.diff_stat == "src/app.py | 2 +-"
+    assert "@@ -1 +1 @@" in material.unified_diff
     assert ("git", "cat-file", "-e", f"{'a' * 40}^{{commit}}") in calls
     assert ("git", "merge-base", "a" * 40, "b" * 40) in calls
-    diff_call = next(call for call in calls if call[:2] == ("git", "diff"))
+    diff_call = next(call for call in calls if "--unified=5" in call)
     assert diff_call[-3:-1] == ("c" * 40, "b" * 40)
+    assert "--unified=5" in diff_call
 
 
 @pytest.mark.asyncio
-async def test_changed_ranges_rejects_checkout_at_a_different_revision(
+async def test_review_input_rejects_checkout_at_a_different_revision(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manager = PRWorkspace(tmp_path / "workspaces")
@@ -448,7 +443,7 @@ async def test_changed_ranges_rejects_checkout_at_a_different_revision(
     monkeypatch.setattr(manager, "_run", wrong_head)
 
     with pytest.raises(RuntimeError, match="revision"):
-        await manager.changed_ranges(tmp_path, "a" * 40, "b" * 40)
+        await manager.review_input(tmp_path, "a" * 40, "b" * 40)
 
 
 def test_git_environment_excludes_github_tokens(
@@ -483,8 +478,7 @@ async def test_prepare_ignores_hostile_global_url_rewrite(
     hostile_home = tmp_path / "hostile-home"
     hostile_home.mkdir()
     (hostile_home / ".gitconfig").write_text(
-        "[url \"file:///definitely/missing\"]\n"
-        f"\tinsteadOf = {upstream.as_uri()}\n",
+        f'[url "file:///definitely/missing"]\n\tinsteadOf = {upstream.as_uri()}\n',
         encoding="utf-8",
     )
     monkeypatch.setenv("HOME", str(hostile_home))
@@ -508,7 +502,7 @@ async def test_prepare_ignores_hostile_global_url_rewrite(
 
 
 @pytest.mark.asyncio
-async def test_changed_ranges_tracks_modified_added_and_deleted_lines(
+async def test_review_input_tracks_modified_added_and_deleted_lines(
     tmp_path: Path, allow_local_head_repository: None
 ) -> None:
     upstream, base_sha, head_sha = create_upstream(tmp_path)
@@ -517,7 +511,7 @@ async def test_changed_ranges_tracks_modified_added_and_deleted_lines(
         3, upstream.as_uri(), 7, "main", base_sha, head_sha, "review-head", upstream.as_uri()
     )
 
-    ranges = await manager.changed_ranges(workspace, base_sha, head_sha)
+    ranges = (await manager.review_input(workspace, base_sha, head_sha)).ranges
 
     assert ranges.ranges == {
         ("src/app.py", "LEFT"): ((10, 11),),
@@ -558,6 +552,8 @@ def test_changed_ranges_decodes_c_style_quoted_paths() -> None:
                 r'--- "a/src/\346\265\213\350\257\225 space\t\"name.py"',
                 r'+++ "b/src/\346\265\213\350\257\225 space\t\"name.py"',
                 "@@ -1 +1 @@",
+                "-before",
+                "+after",
             ]
         )
     )

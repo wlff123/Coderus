@@ -18,7 +18,7 @@ from coderus.processes import (
 )
 from coderus.providers import InvalidProviderUrl, parse_repository_url
 
-from .models import ChangedRanges, normalize_repository_path
+from .models import ChangedRanges, ReviewInput, normalize_repository_path
 
 _HUNK_HEADER = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _SHA = re.compile(r"[0-9A-Fa-f]{40}\Z")
@@ -105,9 +105,7 @@ class PRWorkspace:
                 cwd=staging_root,
             )
             await self._run("git", "fetch", "--", "upstream", base_ref, cwd=checkout)
-            resolved_base = await self._run(
-                "git", "rev-parse", "FETCH_HEAD^{commit}", cwd=checkout
-            )
+            resolved_base = await self._run("git", "rev-parse", "FETCH_HEAD^{commit}", cwd=checkout)
             if resolved_base.strip().lower() != base_sha.lower():
                 raise RuntimeError("fetched base SHA does not match the requested base SHA")
             await self._run(
@@ -129,7 +127,7 @@ class PRWorkspace:
         workspace.chmod(0o700)
         return workspace
 
-    async def changed_ranges(self, workspace: Path, base_sha: str, head_sha: str) -> ChangedRanges:
+    async def review_input(self, workspace: Path, base_sha: str, head_sha: str) -> ReviewInput:
         self._validate_revisions(base_sha, head_sha)
         resolved_head = (
             await self._run("git", "rev-parse", "HEAD^{commit}", cwd=workspace)
@@ -145,27 +143,48 @@ class PRWorkspace:
         ).strip()
         if _SHA.fullmatch(comparison_sha) is None:
             raise RuntimeError("PR review merge base is unavailable")
-        diff = await self._run(
+        comparison = ("--end-of-options", comparison_sha, head_sha, "--")
+        changed_files = await self._run(
             "git",
             "diff",
             "--no-ext-diff",
-            "--binary",
-            "--full-index",
             "--find-renames",
-            "--unified=0",
-            "--end-of-options",
-            comparison_sha,
-            head_sha,
-            "--",
+            "--name-status",
+            *comparison,
             cwd=workspace,
         )
-        parsed = self._parse_changed_ranges(diff)
-        return ChangedRanges(
-            parsed.ranges,
-            comparison_sha=comparison_sha,
-            changed_file_count=parsed.changed_file_count,
-            additions=parsed.additions,
-            deletions=parsed.deletions,
+        diff_stat = await self._run(
+            "git",
+            "diff",
+            "--no-ext-diff",
+            "--find-renames",
+            "--stat=200",
+            *comparison,
+            cwd=workspace,
+        )
+        unified_diff = await self._run(
+            "git",
+            "diff",
+            "--no-ext-diff",
+            "--no-color",
+            "--full-index",
+            "--find-renames",
+            "--unified=5",
+            *comparison,
+            cwd=workspace,
+        )
+        parsed = self._parse_changed_ranges(unified_diff)
+        return ReviewInput(
+            ranges=ChangedRanges(
+                parsed.ranges,
+                comparison_sha=comparison_sha,
+                changed_file_count=parsed.changed_file_count,
+                additions=parsed.additions,
+                deletions=parsed.deletions,
+            ),
+            changed_files=changed_files,
+            diff_stat=diff_stat,
+            unified_diff=unified_diff,
         )
 
     def _validated_staging_root(self) -> Path:
@@ -299,7 +318,19 @@ class PRWorkspace:
         deletions = 0
         old_path: str | None = None
         new_path: str | None = None
+        old_line = 0
+        new_line = 0
         state = "outside"
+
+        def record(path: str | None, side: str, line_number: int) -> None:
+            if path is None or line_number < 1:
+                return
+            key = (path, side)
+            if ranges[key] and line_number <= ranges[key][-1][1] + 1:
+                start, end = ranges[key][-1]
+                ranges[key][-1] = (start, max(end, line_number))
+            else:
+                ranges[key].append((line_number, line_number))
 
         for line in diff.splitlines():
             if line.startswith("diff --git "):
@@ -317,19 +348,24 @@ class PRWorkspace:
                 state = "ready"
                 continue
             match = _HUNK_HEADER.match(line)
-            if match is None or state not in {"ready", "hunk"}:
+            if match is not None and state in {"ready", "hunk"}:
+                old_line = int(match.group(1))
+                new_line = int(match.group(3))
+                state = "hunk"
                 continue
-            old_start, old_count, new_start, new_count = (
-                int(value) if value is not None else default
-                for value, default in zip(match.groups(), (0, 1, 0, 1), strict=True)
-            )
-            if old_path is not None and old_count > 0:
-                ranges[(old_path, "LEFT")].append((old_start, old_start + old_count - 1))
-            if new_path is not None and new_count > 0:
-                ranges[(new_path, "RIGHT")].append((new_start, new_start + new_count - 1))
-            deletions += old_count
-            additions += new_count
-            state = "hunk"
+            if state != "hunk" or not line:
+                continue
+            if line.startswith("-"):
+                record(old_path, "LEFT", old_line)
+                old_line += 1
+                deletions += 1
+            elif line.startswith("+"):
+                record(new_path, "RIGHT", new_line)
+                new_line += 1
+                additions += 1
+            elif line.startswith(" "):
+                old_line += 1
+                new_line += 1
 
         return ChangedRanges(
             {key: tuple(value) for key, value in ranges.items()},

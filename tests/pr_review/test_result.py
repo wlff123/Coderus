@@ -6,6 +6,7 @@ from pydantic import ValidationError
 from coderus.pr_review.models import ChangedRanges, ReviewFinding, ReviewOutput
 from coderus.pr_review.result import (
     ReviewOutputError,
+    merge_review_outputs,
     parse_review_output,
     render_pr_comment,
     validate_findings,
@@ -89,6 +90,58 @@ def test_parse_review_output_accepts_complete_json() -> None:
 
     assert output.change_summary == CHANGE_SUMMARY
     assert output.findings == []
+
+
+def test_merge_review_outputs_combines_unique_summaries_and_findings() -> None:
+    first = ReviewOutput.model_validate(review_data([finding_data(title="第一项问题")]))
+    second = ReviewOutput.model_validate(
+        {
+            "change_summary": [CHANGE_SUMMARY[1], "补充发布流程。"],
+            "findings": [finding_data(title="第二项问题", line_start=15, line_end=15)],
+        }
+    )
+
+    merged = merge_review_outputs([first, second])
+
+    assert merged.change_summary == [*CHANGE_SUMMARY, "补充发布流程。"]
+    assert [finding.title for finding in merged.findings] == ["第一项问题", "第二项问题"]
+
+
+def test_merge_review_outputs_represents_each_chunk_before_extra_summaries() -> None:
+    first = ReviewOutput.model_validate(
+        {"change_summary": ["第一片主要修改。", "第一片补充修改。"], "findings": []}
+    )
+    second = ReviewOutput.model_validate(
+        {"change_summary": ["第二片主要修改。", "第二片补充修改。"], "findings": []}
+    )
+
+    merged = merge_review_outputs([first, second])
+
+    assert merged.change_summary == [
+        "第一片主要修改。",
+        "第二片主要修改。",
+        "第一片补充修改。",
+        "第二片补充修改。",
+    ]
+
+
+def test_merge_review_outputs_discloses_chunks_beyond_summary_limit() -> None:
+    outputs = [
+        ReviewOutput.model_validate(
+            {"change_summary": [f"第 {index} 片主要修改。"], "findings": []}
+        )
+        for index in range(1, 7)
+    ]
+
+    merged = merge_review_outputs(outputs)
+
+    assert merged.change_summary == [
+        "第 1 片主要修改。",
+        "第 2 片主要修改。",
+        "第 3 片主要修改。",
+        "第 4 片主要修改。",
+        "其余 2 个检视分片还包含其他代码修改，详见 PR 变更。",
+    ]
 
 
 def test_parse_review_output_accepts_codex_jsonl_final_message() -> None:

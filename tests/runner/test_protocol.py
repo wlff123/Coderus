@@ -9,32 +9,18 @@ def test_pr_reviewer_is_read_only() -> None:
     assert AgentRole.PR_REVIEWER.read_only is True
 
 
-def test_pr_review_requires_a_base_commit(tmp_path: Path) -> None:
+def test_pr_review_accepts_a_structured_output_schema(tmp_path: Path) -> None:
+    schema = tmp_path / "review.schema.json"
     spec = JobSpec(
         job_id="review-1",
         stage=Stage.PR_REVIEW,
         role=AgentRole.PR_REVIEWER,
         workspace=tmp_path,
-        prompt="Format the review",
-        review_base="a" * 40,
+        prompt="Review the diff",
+        output_schema=schema,
     )
 
-    assert spec.review_base == "a" * 40
-
-
-@pytest.mark.parametrize("review_base", [None, "main", "a" * 39, "-" * 40])
-def test_pr_review_rejects_a_missing_or_invalid_base_commit(
-    tmp_path: Path, review_base: str | None
-) -> None:
-    with pytest.raises(ValueError, match="review_base"):
-        JobSpec(
-            job_id="review-1",
-            stage=Stage.PR_REVIEW,
-            role=AgentRole.PR_REVIEWER,
-            workspace=tmp_path,
-            prompt="Format the review",
-            review_base=review_base,
-        )
+    assert spec.output_schema == schema
 
 
 def test_job_spec_accepts_the_role_assigned_to_a_stage(tmp_path: Path) -> None:

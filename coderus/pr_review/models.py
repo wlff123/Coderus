@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
@@ -16,8 +17,7 @@ def normalize_repository_path(file_path: str) -> str | None:
     if not path or path.startswith("/") or _WINDOWS_ABSOLUTE_PATH.match(path):
         return None
     if any(
-        (ord(character) < 32 and character != "\t") or ord(character) == 127
-        for character in path
+        (ord(character) < 32 and character != "\t") or ord(character) == 127 for character in path
     ):
         return None
     parts = path.split("/")
@@ -37,9 +37,7 @@ class ChangedRanges:
     def contains(self, file_path: str, side: str, start: int, end: int) -> bool:
         return self.clip(file_path, side, start, end) == (start, end)
 
-    def clip(
-        self, file_path: str, side: str, start: int, end: int
-    ) -> tuple[int, int] | None:
+    def clip(self, file_path: str, side: str, start: int, end: int) -> tuple[int, int] | None:
         path = normalize_repository_path(file_path)
         if path is None or side not in {"LEFT", "RIGHT"} or start < 1 or end < start:
             return None
@@ -55,6 +53,18 @@ class ChangedRanges:
         clipped_start, clipped_end = overlaps[0]
         context_lines = clipped_start - start + end - clipped_end
         return overlaps[0] if context_lines <= 1 else None
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewInput:
+    ranges: ChangedRanges
+    changed_files: str
+    diff_stat: str
+    unified_diff: str
+
+
+def review_output_schema_path() -> Path:
+    return Path(__file__).with_name("review_output.schema.json")
 
 
 class ReviewFinding(BaseModel):

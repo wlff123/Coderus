@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import json
 import re
+from collections.abc import Sequence
 from urllib.parse import quote
 
 from pydantic import ValidationError
@@ -42,6 +43,39 @@ def parse_review_output(stdout: str) -> ReviewOutput:
         return ReviewOutput.model_validate(decoded)
     except ValidationError as error:
         raise ReviewOutputError("检视结果格式无效") from error
+
+
+def merge_review_outputs(outputs: Sequence[ReviewOutput]) -> ReviewOutput:
+    if not outputs:
+        raise ReviewOutputError("检视结果为空")
+    if len(outputs) > 5:
+        summaries = list(
+            dict.fromkeys(output.change_summary[0] for output in outputs[:4])
+        )
+        summaries.append(
+            f"其余 {len(outputs) - 4} 个检视分片还包含其他代码修改，详见 PR 变更。"
+        )
+    else:
+        summaries = []
+        for summary_index in range(5):
+            for output in outputs:
+                if summary_index >= len(output.change_summary):
+                    continue
+                summary = output.change_summary[summary_index]
+                if summary not in summaries:
+                    summaries.append(summary)
+                if len(summaries) == 5:
+                    break
+            if len(summaries) == 5:
+                break
+    findings = [
+        finding.model_dump(mode="json")
+        for output in outputs
+        for finding in output.findings
+    ]
+    return ReviewOutput.model_validate(
+        {"change_summary": summaries, "findings": findings}
+    )
 
 
 def _final_agent_message(stdout: str) -> str | None:

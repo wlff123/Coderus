@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-
-_SHA_PATTERN = re.compile(r"[0-9A-Fa-f]{40}\Z")
 
 
 class RetryableAgentError(RuntimeError):
@@ -58,7 +55,6 @@ class JobSpec:
     max_output_bytes: int = 1_000_000
     output_schema: Path | None = None
     session_id: str | None = None
-    review_base: str | None = None
     proxy_token: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -70,11 +66,6 @@ class JobSpec:
             raise ValueError("timeout_seconds must be positive")
         if self.max_output_bytes <= 0:
             raise ValueError("max_output_bytes must be positive")
-        if self.stage is Stage.PR_REVIEW:
-            if self.review_base is None or _SHA_PATTERN.fullmatch(self.review_base) is None:
-                raise ValueError("review_base must be a 40-character hexadecimal SHA")
-        elif self.review_base is not None:
-            raise ValueError("review_base is only valid for PR review jobs")
 
 
 @dataclass(frozen=True, slots=True)
