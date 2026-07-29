@@ -394,10 +394,6 @@ async def test_review_input_reads_verified_git_material(
             return "b" * 40
         if command == ("git", "merge-base", "a" * 40, "b" * 40):
             return "c" * 40
-        if "--name-status" in command:
-            return "M\tsrc/app.py"
-        if "--stat=200" in command:
-            return "src/app.py | 2 +-"
         if command[:4] == ("git", "diff", "--no-ext-diff", "--no-color"):
             return "\n".join(
                 (
@@ -421,14 +417,20 @@ async def test_review_input_reads_verified_git_material(
     assert ranges.changed_file_count == 1
     assert ranges.additions == 1
     assert ranges.deletions == 1
-    assert material.changed_files == "M\tsrc/app.py"
-    assert material.diff_stat == "src/app.py | 2 +-"
+    assert material.review_base == "coderus-review-base"
     assert "@@ -1 +1 @@" in material.unified_diff
     assert ("git", "cat-file", "-e", f"{'a' * 40}^{{commit}}") in calls
     assert ("git", "merge-base", "a" * 40, "b" * 40) in calls
+    assert (
+        "git",
+        "update-ref",
+        "refs/heads/coderus-review-base",
+        "c" * 40,
+    ) in calls
     diff_call = next(call for call in calls if "--unified=5" in call)
     assert diff_call[-3:-1] == ("c" * 40, "b" * 40)
     assert "--unified=5" in diff_call
+    assert not any("--name-status" in call or "--stat=200" in call for call in calls)
 
 
 @pytest.mark.asyncio
@@ -444,6 +446,31 @@ async def test_review_input_rejects_checkout_at_a_different_revision(
 
     with pytest.raises(RuntimeError, match="revision"):
         await manager.review_input(tmp_path, "a" * 40, "b" * 40)
+
+
+@pytest.mark.asyncio
+async def test_assert_pristine_rejects_workspace_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = PRWorkspace(tmp_path / "workspaces")
+
+    async def record_run(*command: str, cwd: Path) -> str:
+        if command == ("git", "rev-parse", "HEAD^{commit}"):
+            return "b" * 40
+        if command == (
+            "git",
+            "rev-parse",
+            "refs/heads/coderus-review-base^{commit}",
+        ):
+            return "c" * 40
+        if command == ("git", "status", "--porcelain=v1", "--untracked-files=all"):
+            return " M src/app.py\n"
+        raise AssertionError(command)
+
+    monkeypatch.setattr(manager, "_run", record_run)
+
+    with pytest.raises(RuntimeError, match="workspace was modified"):
+        await manager.assert_pristine(tmp_path, "b" * 40, "c" * 40)
 
 
 def test_git_environment_excludes_github_tokens(
@@ -511,8 +538,11 @@ async def test_review_input_tracks_modified_added_and_deleted_lines(
         3, upstream.as_uri(), 7, "main", base_sha, head_sha, "review-head", upstream.as_uri()
     )
 
-    ranges = (await manager.review_input(workspace, base_sha, head_sha)).ranges
+    material = await manager.review_input(workspace, base_sha, head_sha)
+    ranges = material.ranges
 
+    assert material.review_base == "coderus-review-base"
+    assert git(workspace, "rev-parse", "refs/heads/coderus-review-base") == base_sha
     assert ranges.ranges == {
         ("src/app.py", "LEFT"): ((10, 11),),
         ("src/app.py", "RIGHT"): ((10, 13),),

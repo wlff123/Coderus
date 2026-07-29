@@ -12,6 +12,7 @@ import pytest
 import coderus.runner.local as local_runner_module
 from coderus.runner import (
     AgentRole,
+    JobResult,
     JobSpec,
     JobStatus,
     LocalCodexRunner,
@@ -27,7 +28,11 @@ import subprocess
 import sys
 import time
 
-prompt = sys.stdin.read() if sys.argv[-1] == "-" else sys.argv[-1]
+stdin = sys.stdin.read()
+if "review" in sys.argv:
+    print(json.dumps({"argv": sys.argv[1:], "stdin": stdin}))
+    raise SystemExit
+prompt = stdin if sys.argv[-1] == "-" else sys.argv[-1]
 if prompt == "show-env":
     print(json.dumps(dict(os.environ), sort_keys=True))
 elif prompt == "show-runtime":
@@ -145,6 +150,8 @@ def make_spec(workspace: Path, prompt: str, **changes: object) -> JobSpec:
         "prompt": prompt,
     }
     values.update(changes)
+    if values["stage"] is Stage.PR_REVIEW:
+        values.setdefault("review_base", "coderus-review-base")
     return JobSpec(**values)
 
 
@@ -204,10 +211,11 @@ def review_spec(tmp_path: Path) -> JobSpec:
         role=AgentRole.PR_REVIEWER,
         proxy_token="short-lived-token",
         output_schema=schema,
+        review_base="coderus-review-base",
     )
 
 
-def test_build_command_uses_structured_exec_for_pr_review(
+def test_build_command_uses_native_review_for_pr_review(
     fake_cli: tuple[str, ...], review_spec: JobSpec
 ) -> None:
     root = review_spec.workspace.parent
@@ -219,10 +227,11 @@ def test_build_command_uses_structured_exec_for_pr_review(
 
     assert command[: len(fake_cli)] == list(fake_cli)
     assert "exec" in command
-    assert "review" not in command
-    assert "--base" not in command
+    assert command[-3:] == ["review", "--base", "coderus-review-base"]
+    assert "developer_instructions=" in " ".join(command)
+    assert "-" not in command[-3:]
+    assert "resume" not in command
     assert review_spec.prompt not in command
-    assert command[-1] == "-"
     assert "project_doc_max_bytes=0" in command
     assert 'model_provider="coderus_proxy"' in command
     assert 'model_providers.coderus_proxy.base_url="http://127.0.0.1:9999/v1"' in command
@@ -232,7 +241,8 @@ def test_build_command_uses_structured_exec_for_pr_review(
     assert command[command.index("--model") + 1] == "test-model"
     assert command[command.index("--output-schema") + 1] == str(review_spec.output_schema)
     assert "--search" not in command
-    assert "danger-full-access" not in command
+    expected_sandbox = "danger-full-access" if sys.platform == "linux" else "read-only"
+    assert command[command.index("--sandbox") + 1] == expected_sandbox
 
 
 def test_pr_review_never_inherits_configured_danger_full_access_mode(
@@ -251,11 +261,24 @@ def test_pr_review_never_inherits_configured_danger_full_access_mode(
 
     assert command[: len(fake_cli)] == list(fake_cli)
     assert "--dangerously-bypass-approvals-and-sandbox" not in command
-    assert command[command.index("--sandbox") + 1] == "read-only"
+    expected = "danger-full-access" if sys.platform == "linux" else "read-only"
+    assert command[command.index("--sandbox") + 1] == expected
+
+
+def test_linux_pr_review_uses_landlock_instead_of_the_unavailable_inner_sandbox(
+    fake_cli: tuple[str, ...], review_spec: JobSpec, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(local_runner_module.sys, "platform", "linux")
+    runner = LocalCodexRunner(RunnerConfig(review_spec.workspace.parent, fake_cli))
+
+    command = runner.build_command(review_spec, output_schema=review_spec.output_schema)
+
+    assert command[command.index("--sandbox") + 1] == "danger-full-access"
+    assert "--dangerously-bypass-approvals-and-sandbox" not in command
 
 
 @pytest.mark.asyncio
-async def test_pr_review_runs_once_with_prompt_on_stdin_and_output_schema(
+async def test_pr_review_runs_without_stdin_and_with_output_schema(
     fake_cli: tuple[str, ...], review_spec: JobSpec
 ) -> None:
     runner = LocalCodexRunner(
@@ -273,14 +296,41 @@ async def test_pr_review_runs_once_with_prompt_on_stdin_and_output_schema(
     assert result.status is JobStatus.SUCCEEDED
     assert "exec" in payload["argv"]
     assert 'model_provider="coderus_proxy"' in payload["argv"]
-    assert payload["argv"][-1] == "-"
-    assert payload["prompt"] == review_spec.prompt
-    assert "review" not in payload["argv"]
+    assert payload["argv"][-3:] == ["review", "--base", "coderus-review-base"]
+    assert payload["stdin"] == ""
+    assert "review" in payload["argv"]
     assert "--output-schema" in payload["argv"]
 
 
 @pytest.mark.asyncio
-async def test_pr_review_sends_large_prompt_over_stdin(
+async def test_pr_review_passes_no_stdin_text_to_the_process(
+    fake_cli: tuple[str, ...], review_spec: JobSpec, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = LocalCodexRunner(RunnerConfig(review_spec.workspace.parent, fake_cli))
+    stdin_texts: list[str | None] = []
+
+    async def capture_process(*args, stdin_text: str | None = None, **kwargs) -> JobResult:
+        del args, kwargs
+        stdin_texts.append(stdin_text)
+        return JobResult(
+            job_id=review_spec.job_id,
+            status=JobStatus.SUCCEEDED,
+            exit_code=0,
+            stdout="",
+            stderr="",
+            output_truncated=False,
+            duration_seconds=0,
+        )
+
+    monkeypatch.setattr(runner, "_run_process", capture_process)
+
+    result = await runner.run(review_spec)
+
+    assert result.status is JobStatus.SUCCEEDED
+    assert stdin_texts == [None]
+
+
+def test_pr_review_adds_large_prompt_to_developer_instructions(
     fake_cli: tuple[str, ...], review_spec: JobSpec
 ) -> None:
     runner = LocalCodexRunner(RunnerConfig(review_spec.workspace.parent, fake_cli))
@@ -292,15 +342,14 @@ async def test_pr_review_sends_large_prompt_over_stdin(
         workspace=review_spec.workspace,
         prompt=prompt,
         output_schema=review_spec.output_schema,
+        review_base="coderus-review-base",
         max_output_bytes=2_000_000,
     )
 
-    result = await runner.run(spec)
-    payload = json.loads(result.stdout)
+    command = runner.build_command(spec, output_schema=spec.output_schema)
 
-    assert result.status is JobStatus.SUCCEEDED
-    assert payload["argv"][-1] == "-"
-    assert payload["prompt"] == prompt
+    assert f"developer_instructions={json.dumps(prompt)}" in command
+    assert command[-3:] == ["review", "--base", "coderus-review-base"]
 
 
 def test_build_command_uses_separate_arguments_and_role_sandbox(

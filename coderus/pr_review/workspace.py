@@ -22,6 +22,7 @@ from .models import ChangedRanges, ReviewInput, normalize_repository_path
 
 _HUNK_HEADER = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _SHA = re.compile(r"[0-9A-Fa-f]{40}\Z")
+REVIEW_BASE = "coderus-review-base"
 _INVALID_REF_CHARACTER = re.compile(r"[\x00-\x20\x7f~^:?*\[\\]")
 _SYSTEM_ENVIRONMENT_KEYS = {
     "COMSPEC",
@@ -143,25 +144,14 @@ class PRWorkspace:
         ).strip()
         if _SHA.fullmatch(comparison_sha) is None:
             raise RuntimeError("PR review merge base is unavailable")
+        await self._run(
+            "git",
+            "update-ref",
+            f"refs/heads/{REVIEW_BASE}",
+            comparison_sha,
+            cwd=workspace,
+        )
         comparison = ("--end-of-options", comparison_sha, head_sha, "--")
-        changed_files = await self._run(
-            "git",
-            "diff",
-            "--no-ext-diff",
-            "--find-renames",
-            "--name-status",
-            *comparison,
-            cwd=workspace,
-        )
-        diff_stat = await self._run(
-            "git",
-            "diff",
-            "--no-ext-diff",
-            "--find-renames",
-            "--stat=200",
-            *comparison,
-            cwd=workspace,
-        )
         unified_diff = await self._run(
             "git",
             "diff",
@@ -182,10 +172,40 @@ class PRWorkspace:
                 additions=parsed.additions,
                 deletions=parsed.deletions,
             ),
-            changed_files=changed_files,
-            diff_stat=diff_stat,
             unified_diff=unified_diff,
+            review_base=REVIEW_BASE,
         )
+
+    async def assert_pristine(
+        self, workspace: Path, head_sha: str, comparison_sha: str
+    ) -> None:
+        self._validate_revisions(comparison_sha, head_sha)
+        resolved_head = (
+            await self._run("git", "rev-parse", "HEAD^{commit}", cwd=workspace)
+        ).strip()
+        resolved_base = (
+            await self._run(
+                "git",
+                "rev-parse",
+                f"refs/heads/{REVIEW_BASE}^{{commit}}",
+                cwd=workspace,
+            )
+        ).strip()
+        revisions_changed = (
+            resolved_head.lower() != head_sha.lower()
+            or resolved_base.lower() != comparison_sha.lower()
+        )
+        if revisions_changed:
+            raise RuntimeError("PR review workspace revision changed during review")
+        status = await self._run(
+            "git",
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            cwd=workspace,
+        )
+        if status:
+            raise RuntimeError("PR review workspace was modified during review")
 
     def _validated_staging_root(self) -> Path:
         configured = Path(os.path.abspath(self.staging_root))

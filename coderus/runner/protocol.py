@@ -55,6 +55,7 @@ class JobSpec:
     max_output_bytes: int = 1_000_000
     output_schema: Path | None = None
     session_id: str | None = None
+    review_base: str | None = None
     proxy_token: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -62,6 +63,13 @@ class JobSpec:
             raise ValueError("job_id must not be empty")
         if _STAGE_ROLES[self.stage] is not self.role:
             raise ValueError(f"role {self.role} does not match stage {self.stage}")
+        if self.stage is Stage.PR_REVIEW:
+            if not self.review_base:
+                raise ValueError("review_base is required for PR review jobs")
+            if self.session_id is not None:
+                raise ValueError("session_id is not supported for PR review jobs")
+        elif self.review_base is not None:
+            raise ValueError("review_base is only supported for PR review jobs")
         if self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
         if self.max_output_bytes <= 0:

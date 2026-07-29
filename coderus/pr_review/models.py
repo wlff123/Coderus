@@ -3,7 +3,6 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
@@ -58,13 +57,8 @@ class ChangedRanges:
 @dataclass(frozen=True, slots=True)
 class ReviewInput:
     ranges: ChangedRanges
-    changed_files: str
-    diff_stat: str
     unified_diff: str
-
-
-def review_output_schema_path() -> Path:
-    return Path(__file__).with_name("review_output.schema.json")
+    review_base: str
 
 
 class ReviewFinding(BaseModel):

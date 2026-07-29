@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -6,7 +7,6 @@ from pydantic import ValidationError
 from coderus.pr_review.models import ChangedRanges, ReviewFinding, ReviewOutput
 from coderus.pr_review.result import (
     ReviewOutputError,
-    merge_review_outputs,
     parse_review_output,
     render_pr_comment,
     validate_findings,
@@ -92,58 +92,6 @@ def test_parse_review_output_accepts_complete_json() -> None:
     assert output.findings == []
 
 
-def test_merge_review_outputs_combines_unique_summaries_and_findings() -> None:
-    first = ReviewOutput.model_validate(review_data([finding_data(title="第一项问题")]))
-    second = ReviewOutput.model_validate(
-        {
-            "change_summary": [CHANGE_SUMMARY[1], "补充发布流程。"],
-            "findings": [finding_data(title="第二项问题", line_start=15, line_end=15)],
-        }
-    )
-
-    merged = merge_review_outputs([first, second])
-
-    assert merged.change_summary == [*CHANGE_SUMMARY, "补充发布流程。"]
-    assert [finding.title for finding in merged.findings] == ["第一项问题", "第二项问题"]
-
-
-def test_merge_review_outputs_represents_each_chunk_before_extra_summaries() -> None:
-    first = ReviewOutput.model_validate(
-        {"change_summary": ["第一片主要修改。", "第一片补充修改。"], "findings": []}
-    )
-    second = ReviewOutput.model_validate(
-        {"change_summary": ["第二片主要修改。", "第二片补充修改。"], "findings": []}
-    )
-
-    merged = merge_review_outputs([first, second])
-
-    assert merged.change_summary == [
-        "第一片主要修改。",
-        "第二片主要修改。",
-        "第一片补充修改。",
-        "第二片补充修改。",
-    ]
-
-
-def test_merge_review_outputs_discloses_chunks_beyond_summary_limit() -> None:
-    outputs = [
-        ReviewOutput.model_validate(
-            {"change_summary": [f"第 {index} 片主要修改。"], "findings": []}
-        )
-        for index in range(1, 7)
-    ]
-
-    merged = merge_review_outputs(outputs)
-
-    assert merged.change_summary == [
-        "第 1 片主要修改。",
-        "第 2 片主要修改。",
-        "第 3 片主要修改。",
-        "第 4 片主要修改。",
-        "其余 2 个检视分片还包含其他代码修改，详见 PR 变更。",
-    ]
-
-
 def test_parse_review_output_accepts_codex_jsonl_final_message() -> None:
     message = json.dumps(review_data([finding_data()]), ensure_ascii=False)
     stdout = "\n".join(
@@ -163,6 +111,254 @@ def test_parse_review_output_accepts_codex_jsonl_final_message() -> None:
     output = parse_review_output(stdout)
 
     assert output.findings[0].title == "空值未处理"
+
+
+def native_review_stdout(
+    message: str,
+    *,
+    command_exit_code: int = 0,
+    command: str | None = None,
+) -> str:
+    command_status = "completed" if command_exit_code == 0 else "failed"
+    command = command or f"git diff {BASE}...HEAD"
+    return "\n".join(
+        [
+            json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "command_execution",
+                        "command": command,
+                        "aggregated_output": "",
+                        "exit_code": command_exit_code,
+                        "status": command_status,
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": message},
+                },
+                ensure_ascii=False,
+            ),
+            json.dumps({"type": "turn.completed", "usage": {}}),
+        ]
+    )
+
+
+def test_parse_review_output_accepts_native_review_message() -> None:
+    message = """本次变更增加了配置校验并调整了请求处理流程。
+
+Review comment:
+
+- [P1] 空值会导致请求失败 — RIGHT /srv/work/pr-review-1/src/app.py:12-14
+  问题：当输入为空时会直接解引用。
+  影响：请求会抛出异常并中断。
+  建议：在读取属性前处理空值。"""
+    ranges = ChangedRanges({("src/app.py", "RIGHT"): ((12, 14),)})
+
+    output = parse_review_output(
+        native_review_stdout(message),
+        workspace=Path("/srv/work/pr-review-1"),
+        ranges=ranges,
+        fallback_summary="本次 PR 涉及 1 个变更文件，新增 3 行并删除 0 行。",
+        comparison_sha=BASE,
+    )
+
+    assert output.change_summary == ["本次变更增加了配置校验并调整了请求处理流程。"]
+    finding = output.findings[0]
+    assert finding.priority == "P1"
+    assert finding.title == "空值会导致请求失败"
+    assert finding.file_path == "src/app.py"
+    assert finding.line_side == "RIGHT"
+    assert (finding.line_start, finding.line_end) == (12, 14)
+    assert "直接解引用" in finding.problem
+    assert "请求会抛出异常" in finding.impact
+    assert finding.suggestion == "在读取属性前处理空值。"
+
+
+def test_parse_review_output_uses_stats_summary_when_native_review_has_no_findings() -> None:
+    output = parse_review_output(
+        native_review_stdout(
+            "本次变更调整了配置校验和错误处理。\n\n未发现需要反馈的具体问题。"
+        ),
+        workspace=Path("/srv/work/pr-review-1"),
+        ranges=ChangedRanges({}),
+        fallback_summary="本次 PR 涉及 2 个变更文件，新增 8 行并删除 1 行。",
+        comparison_sha=BASE,
+    )
+
+    assert output.change_summary == ["本次变更调整了配置校验和错误处理。"]
+    assert output.findings == []
+
+
+def test_parse_review_output_rejects_native_result_when_git_inspection_failed() -> None:
+    with pytest.raises(ReviewOutputError, match="Git"):
+        parse_review_output(
+            native_review_stdout(
+                "未发现可明确归因于本次变更且需要修复的问题。",
+                command_exit_code=1,
+            ),
+            workspace=Path("/srv/work/pr-review-1"),
+            ranges=ChangedRanges({}),
+            fallback_summary="本次 PR 涉及 1 个变更文件，新增 1 行并删除 0 行。",
+            comparison_sha=BASE,
+        )
+
+
+def test_native_json_output_still_requires_successful_git_inspection() -> None:
+    message = json.dumps(review_data([]), ensure_ascii=False)
+
+    with pytest.raises(ReviewOutputError, match="Git"):
+        parse_review_output(
+            native_review_stdout(message, command_exit_code=1),
+            workspace=Path("/srv/work/pr-review-1"),
+            ranges=ChangedRanges({}),
+            fallback_summary="本次 PR 涉及 1 个变更文件，新增 1 行并删除 0 行。",
+            comparison_sha=BASE,
+        )
+
+
+def test_native_context_rejects_raw_json_without_agent_event() -> None:
+    with pytest.raises(ReviewOutputError, match="Agent"):
+        parse_review_output(
+            json.dumps(review_data([]), ensure_ascii=False),
+            workspace=Path("/srv/work/pr-review-1"),
+            ranges=ChangedRanges({}),
+            fallback_summary="本次 PR 涉及 1 个变更文件，新增 1 行并删除 0 行。",
+            comparison_sha=BASE,
+        )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Review comment:\n- [P1] 损坏的格式: src/app.py:12\n  问题说明。",
+        "Review comment:\n- [P1] 缺少结构化正文 — RIGHT src/app.py:12\n  普通正文。",
+        "Review comment:\n- [P4] 未知优先级 — RIGHT src/app.py:12\n"
+        "  普通正文。\n\n未发现需要反馈的具体问题。",
+    ],
+)
+def test_native_review_rejects_unrecognized_finding_format(message: str) -> None:
+    with pytest.raises(ReviewOutputError, match="格式"):
+        parse_review_output(
+            native_review_stdout(message),
+            workspace=Path("/srv/work/pr-review-1"),
+            ranges=ChangedRanges({("src/app.py", "RIGHT"): ((12, 12),)}),
+            fallback_summary="本次 PR 涉及 1 个变更文件，新增 1 行并删除 0 行。",
+            comparison_sha=BASE,
+        )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "printf 'git diff aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'",
+        "git diff unrelated-branch...HEAD",
+        f"git diff {BASE}...HEAD || true",
+        f"git diff unrelated-branch...HEAD -- fixtures/{BASE}.txt",
+        f"echo -c 'git diff {BASE}...HEAD'",
+        f"git -C /tmp diff {BASE}...HEAD",
+        f"git diff --no-index {BASE}...HEAD",
+        f"git diff {BASE} {BASE}",
+        f"git diff {BASE}...HEAD &",
+        f"git diff --src-prefix {BASE}...HEAD",
+        f"git diff -S {BASE}",
+    ],
+)
+def test_native_review_rejects_untrusted_git_evidence(command: str) -> None:
+    with pytest.raises(ReviewOutputError, match="Git"):
+        parse_review_output(
+            native_review_stdout("未发现需要反馈的具体问题。", command=command),
+            workspace=Path("/srv/work/pr-review-1"),
+            ranges=ChangedRanges({}),
+            fallback_summary="本次 PR 涉及 1 个变更文件，新增 1 行并删除 0 行。",
+            comparison_sha=BASE,
+        )
+
+
+def test_native_review_accepts_safe_git_global_options_for_the_fixed_base() -> None:
+    output = parse_review_output(
+        native_review_stdout(
+            "未发现需要反馈的具体问题。",
+            command=f"git --no-pager diff {BASE}...HEAD",
+        ),
+        workspace=Path("/srv/work/pr-review-1"),
+        ranges=ChangedRanges({}),
+        fallback_summary="本次 PR 涉及 1 个变更文件，新增 1 行并删除 0 行。",
+        comparison_sha=BASE,
+    )
+
+    assert output.findings == []
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "本次变更调整了配置。\n- [PX] 疑似问题\n未发现需要反馈的具体问题。",
+        "本次变更调整了配置。\n- P1 疑似问题\n未发现需要反馈的具体问题。",
+        "本次变更调整了配置。\n+ P1 疑似问题\n未发现需要反馈的具体问题。",
+        "本次变更调整了配置。\n未发现需要反馈的具体问题。\n额外结论。",
+    ],
+)
+def test_native_review_rejects_finding_like_text_in_no_findings_result(message: str) -> None:
+    with pytest.raises(ReviewOutputError, match="格式"):
+        parse_review_output(
+            native_review_stdout(message),
+            workspace=Path("/srv/work/pr-review-1"),
+            ranges=ChangedRanges({}),
+            fallback_summary="本次 PR 涉及 1 个变更文件，新增 1 行并删除 0 行。",
+            comparison_sha=BASE,
+        )
+
+
+def test_native_review_rejects_overlong_finding_instead_of_truncating() -> None:
+    message = f"""修改摘要：本次变更调整了空值处理。
+
+Review comment:
+
+- [P1] {"长" * 201} — RIGHT src/app.py:12
+  问题：输入为空时会直接解引用。
+  影响：请求会抛出异常。
+  建议：在读取属性前处理空值。"""
+
+    with pytest.raises(ReviewOutputError, match="格式"):
+        parse_review_output(
+            native_review_stdout(message),
+            workspace=Path("/srv/work/pr-review-1"),
+            ranges=ChangedRanges({("src/app.py", "RIGHT"): ((12, 12),)}),
+            fallback_summary="本次 PR 涉及 1 个变更文件，新增 1 行并删除 0 行。",
+            comparison_sha=BASE,
+        )
+
+
+def test_native_review_uses_explicit_line_side_when_line_numbers_overlap() -> None:
+    message = """本次变更替换了鉴权检查。
+
+Review comment:
+
+- [P1] 删除了必要的鉴权检查 — LEFT src/app.py:12
+  问题：旧版本中的鉴权调用被删除。
+  影响：请求可能绕过访问控制。
+  建议：保留鉴权调用或增加等价校验。"""
+    ranges = ChangedRanges(
+        {
+            ("src/app.py", "LEFT"): ((12, 12),),
+            ("src/app.py", "RIGHT"): ((12, 12),),
+        }
+    )
+
+    output = parse_review_output(
+        native_review_stdout(message),
+        workspace=Path("/srv/work/pr-review-1"),
+        ranges=ranges,
+        fallback_summary="本次 PR 涉及 1 个变更文件，新增 1 行并删除 1 行。",
+        comparison_sha=BASE,
+    )
+
+    assert output.findings[0].line_side == "LEFT"
 
 
 @pytest.mark.parametrize(

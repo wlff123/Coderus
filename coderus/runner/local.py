@@ -221,8 +221,6 @@ class LocalCodexRunner:
         )
 
     def build_command(self, spec: JobSpec, *, output_schema: Path | None = None) -> list[str]:
-        if spec.stage is Stage.PR_REVIEW:
-            return self._build_exec_command(spec, output_schema=output_schema, prompt="-")
         return self._build_exec_command(spec, output_schema=output_schema)
 
     def _proxy_provider_options(self) -> tuple[str, ...]:
@@ -249,15 +247,16 @@ class LocalCodexRunner:
         output_schema: Path | None = None,
         prompt: str | None = None,
     ) -> list[str]:
-        sandbox = (
-            "read-only"
-            if spec.stage is Stage.PR_REVIEW
-            else "danger-full-access"
-            if self._config.sandbox_mode == "danger-full-access"
-            else "read-only"
-            if spec.role.read_only
-            else "workspace-write"
-        )
+        if spec.stage is Stage.PR_REVIEW:
+            # The service container cannot create Codex's bwrap namespace. On Linux the
+            # enclosing Landlock launcher blocks workspace content writes.
+            sandbox = "danger-full-access" if sys.platform == "linux" else "read-only"
+        elif self._config.sandbox_mode == "danger-full-access":
+            sandbox = "danger-full-access"
+        elif spec.role.read_only:
+            sandbox = "read-only"
+        else:
+            sandbox = "workspace-write"
         command = [
             *self._config.codex_command,
             "exec",
@@ -267,6 +266,7 @@ class LocalCodexRunner:
         command.extend(("--ephemeral", "--ignore-user-config", "--ignore-rules"))
         if spec.stage is Stage.PR_REVIEW:
             command.extend(("-c", "project_doc_max_bytes=0"))
+            command.extend(("-c", f"developer_instructions={json.dumps(spec.prompt)}"))
         if os.name == "nt":
             command.extend(("-c", 'windows.sandbox="unelevated"'))
         if self._config.network_access:
@@ -279,7 +279,10 @@ class LocalCodexRunner:
             command.extend(("--output-schema", str(output_schema)))
         if spec.session_id is not None:
             command.extend(("resume", spec.session_id))
-        command.append(prompt if prompt is not None else spec.prompt)
+        if spec.stage is Stage.PR_REVIEW:
+            command.extend(("review", "--base", spec.review_base))
+        else:
+            command.append(prompt if prompt is not None else spec.prompt)
         return command
 
     def build_environment(
@@ -347,7 +350,7 @@ class LocalCodexRunner:
                 environment,
                 started,
                 cancel_event,
-                stdin_text=spec.prompt if spec.stage is Stage.PR_REVIEW else None,
+                stdin_text=None,
             )
             return result
         finally:

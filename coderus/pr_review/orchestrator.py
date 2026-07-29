@@ -14,11 +14,10 @@ from sqlalchemy.orm import Session
 
 from coderus.forge import ForgeRegistry
 from coderus.models import PRReviewTask
-from coderus.pr_review.models import ReviewInput, ReviewOutput, review_output_schema_path
-from coderus.pr_review.prompt import ReviewPromptTooLarge, build_review_prompts
+from coderus.pr_review.instructions import build_review_instructions
+from coderus.pr_review.models import ReviewInput, ReviewOutput
 from coderus.pr_review.result import (
     ReviewOutputError,
-    merge_review_outputs,
     parse_review_output,
     render_pr_comment,
     validate_findings,
@@ -33,7 +32,6 @@ CLAIM_LEASE_SECONDS = 120.0
 CLAIM_HEARTBEAT_SECONDS = 10.0
 COMMENT_TIMEOUT_SECONDS = 90.0
 PR_REVIEW_MAX_OUTPUT_BYTES = 5_000_000
-PR_REVIEW_MAX_PROMPT_CHARS = 900_000
 
 
 class Runner(Protocol):
@@ -129,13 +127,19 @@ class PRReviewOrchestrator:
                 if ranges.comparison_sha is None:
                     raise PRReviewError("无法确认 PR 的实际比较基准")
                 self._assert_claim(task_id, claim_token, claim_lost)
-                generated_output, proxy_token, review_chunks = await self._run_review(
+                generated_output, proxy_token = await self._run_review(
                     task,
                     prepared,
                     ranges.comparison_sha,
                     details.head_sha,
                     material,
                     claim_lost,
+                )
+                self._assert_claim(task_id, claim_token, claim_lost)
+                await self.workspace.assert_pristine(
+                    prepared,
+                    details.head_sha,
+                    ranges.comparison_sha,
                 )
                 self._assert_claim(task_id, claim_token, claim_lost)
                 output = validate_findings(generated_output, ranges)
@@ -160,7 +164,7 @@ class PRReviewOrchestrator:
                     "changed_files": ranges.changed_file_count,
                     "additions": ranges.additions,
                     "deletions": ranges.deletions,
-                    "review_chunks": review_chunks,
+                    "review_mode": "native",
                     "generated_findings": len(generated_output.findings),
                     "validated_findings": len(output.findings),
                     "filtered_findings": filtered_finding_count,
@@ -275,67 +279,65 @@ class PRReviewOrchestrator:
         material: ReviewInput,
         claim_lost: asyncio.Event,
     ):
-        try:
-            prompts = build_review_prompts(
-                provider=task.provider,
-                owner=task.owner,
-                name=task.name,
-                pr_number=task.pr_number,
-                base_sha=base_sha,
-                head_sha=head_sha,
-                material=material,
-                max_chars=PR_REVIEW_MAX_PROMPT_CHARS,
-            )
-        except ReviewPromptTooLarge as exc:
-            raise PRReviewError(str(exc)) from exc
+        prompt = build_review_instructions(
+            provider=task.provider,
+            owner=task.owner,
+            name=task.name,
+            pr_number=task.pr_number,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            material=material,
+        )
         token = None
         if self.credential_broker is not None:
             token = self.credential_broker.issue(
                 task_id=f"task-{task.id}",
                 stage=Stage.PR_REVIEW.value,
-                ttl_seconds=self.stage_timeout_seconds * len(prompts) + 300,
+                ttl_seconds=self.stage_timeout_seconds + 300,
             )
         try:
-            outputs = []
-            for index, prompt in enumerate(prompts, start=1):
-                spec = JobSpec(
-                    job_id=(
-                        f"pr-review-{task.id}"
-                        if len(prompts) == 1
-                        else f"pr-review-{task.id}-{index}"
+            spec = JobSpec(
+                job_id=f"pr-review-{task.id}",
+                stage=Stage.PR_REVIEW,
+                role=AgentRole.PR_REVIEWER,
+                workspace=workspace,
+                prompt=prompt,
+                timeout_seconds=self.stage_timeout_seconds,
+                max_output_bytes=PR_REVIEW_MAX_OUTPUT_BYTES,
+                proxy_token=token,
+                review_base=material.review_base,
+            )
+
+            async def run_agent():
+                return await self.runner.run(spec, cancel_event=claim_lost)
+
+            async def restore_checkpoint() -> None:
+                return None
+
+            result = await retry_agent_operation(
+                run_agent,
+                restore_checkpoint,
+                max_retries=2,
+            )
+            if result.status is not JobStatus.SUCCEEDED:
+                raise PRReviewError(f"Codex 检视失败（{result.status.value}）")
+            try:
+                return (
+                    parse_review_output(
+                        result.stdout,
+                        workspace=workspace,
+                        ranges=material.ranges,
+                        fallback_summary=(
+                            f"本次 PR 涉及 {material.ranges.changed_file_count} 个变更文件，"
+                            f"新增 {material.ranges.additions} 行并删除 "
+                            f"{material.ranges.deletions} 行。"
+                        ),
+                        comparison_sha=base_sha,
                     ),
-                    stage=Stage.PR_REVIEW,
-                    role=AgentRole.PR_REVIEWER,
-                    workspace=workspace,
-                    prompt=prompt,
-                    timeout_seconds=self.stage_timeout_seconds,
-                    max_output_bytes=PR_REVIEW_MAX_OUTPUT_BYTES,
-                    output_schema=review_output_schema_path(),
-                    proxy_token=token,
+                    token,
                 )
-
-                async def run_agent(current_spec=spec):
-                    return await self.runner.run(current_spec, cancel_event=claim_lost)
-
-                async def restore_checkpoint() -> None:
-                    return None
-
-                result = await retry_agent_operation(
-                    run_agent,
-                    restore_checkpoint,
-                    max_retries=2,
-                )
-                if result.status is not JobStatus.SUCCEEDED:
-                    raise PRReviewError(
-                        f"Codex 检视分片 {index}/{len(prompts)} 失败（{result.status.value}）"
-                    )
-                try:
-                    outputs.append(parse_review_output(result.stdout))
-                except ReviewOutputError as exc:
-                    raise PRReviewError(
-                        f"Codex 检视分片 {index}/{len(prompts)} 输出无效：{exc}"
-                    ) from exc
-            return merge_review_outputs(outputs), token, len(prompts)
+            except ReviewOutputError as exc:
+                raise PRReviewError(f"Codex 检视输出无效：{exc}") from exc
         finally:
             if token is not None:
                 self.credential_broker.revoke(token)
