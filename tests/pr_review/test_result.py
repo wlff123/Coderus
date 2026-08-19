@@ -194,6 +194,43 @@ def test_parse_review_output_uses_stats_summary_when_native_review_has_no_findin
     assert output.findings == []
 
 
+def test_parse_review_output_accepts_native_no_findings_wording() -> None:
+    message = (
+        "本次修改迁移了会话释放流程，并增加了身份保存和释放重试。"
+        "静态检视未发现本次变更引入的明确、可执行问题。"
+    )
+
+    output = parse_review_output(
+        native_review_stdout(message),
+        workspace=Path("/srv/work/pr-review-1"),
+        ranges=ChangedRanges({}),
+        fallback_summary="本次 PR 涉及 2 个变更文件，新增 8 行并删除 1 行。",
+        comparison_sha=BASE,
+    )
+
+    assert output.change_summary == [
+        "本次修改迁移了会话释放流程，并增加了身份保存和释放重试。"
+    ]
+    assert output.findings == []
+
+
+def test_parse_review_output_accepts_no_findings_review_comment_prefix() -> None:
+    output = parse_review_output(
+        native_review_stdout(
+            "Review comment:\n\n"
+            "本次变更完成了检视流程调整。\n"
+            "未发现需要修改的问题。"
+        ),
+        workspace=Path("/srv/work/pr-review-1"),
+        ranges=ChangedRanges({}, comparison_sha=BASE),
+        fallback_summary="本次 PR 涉及 1 个变更文件，新增 1 行并删除 0 行。",
+        comparison_sha=BASE,
+    )
+
+    assert output.change_summary == ["本次变更完成了检视流程调整。"]
+    assert output.findings == []
+
+
 def test_parse_review_output_rejects_native_result_when_git_inspection_failed() -> None:
     with pytest.raises(ReviewOutputError, match="Git"):
         parse_review_output(

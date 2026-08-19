@@ -19,6 +19,13 @@ _NATIVE_FINDING_HEADER = re.compile(
     r"(?m)^-\s+\[(P[0-3])\]\s+(.+?)\s+(?:—|–|-)\s+"
     r"(LEFT|RIGHT)\s+(.+?):(\d+)(?:-(\d+))?\s*$"
 )
+_NO_FINDINGS_CONCLUSION = re.compile(
+    r"(?:静态检视)?(?:未发现|没有发现)(?:需要反馈的具体问题|"
+    r"本次变更引入的明确[、，]?可执行问题|"
+    r"可明确归因于本次变更且需要修复的问题|"
+    r"需要(?:修改|修复)的问题|"
+    r"可执行问题|明显问题|问题)"
+)
 _SAFE_DIFF_OPTIONS = {
     "--check",
     "--find-copies",
@@ -102,7 +109,7 @@ def _parse_native_review_output(
 ) -> ReviewOutput:
     matches = list(_NATIVE_FINDING_HEADER.finditer(message))
     priority_markers = re.findall(r"\[P[^\]\r\n]*\]", message)
-    if len(priority_markers) != len(matches) or ("Review comment:" in message and not matches):
+    if len(priority_markers) != len(matches):
         raise ReviewOutputError("原生检视意见格式无效")
     if not matches:
         _validate_no_findings_message(message)
@@ -246,7 +253,9 @@ def _native_change_summary(
 ) -> list[str]:
     prefix = message[: matches[0].start()] if matches else message
     prefix = prefix.replace("Review comment:", "").strip()
-    prefix = prefix.split("未发现需要反馈的具体问题", 1)[0].strip()
+    conclusion = _NO_FINDINGS_CONCLUSION.search(prefix)
+    if conclusion is not None:
+        prefix = prefix[: conclusion.start()].strip()
     prefix = prefix.replace("修改摘要：", "").strip()
     summaries = []
     for block in re.split(r"\n\s*\n|\n", prefix):
@@ -259,8 +268,13 @@ def _native_change_summary(
 
 
 def _validate_no_findings_message(message: str) -> None:
-    conclusion = "未发现需要反馈的具体问题"
-    match = re.fullmatch(rf"(?s)(?P<summary>.*?)\n*{conclusion}。?\s*", message.strip())
+    normalized = message.strip()
+    if normalized.startswith("Review comment:"):
+        normalized = normalized[len("Review comment:") :].lstrip()
+    match = re.fullmatch(
+        rf"(?s)(?P<summary>.*?)\n*(?:{_NO_FINDINGS_CONCLUSION.pattern})。?\s*",
+        normalized,
+    )
     if match is None:
         raise ReviewOutputError("原生检视结论格式无效")
     summary = match.group("summary")
