@@ -416,6 +416,7 @@ async def test_run_reviews_fixed_pr_revision_once_and_persists_safe_result(
         f"<!-- coderus-pr-review:{persisted.review_key}:{BASE_SHA}:{HEAD_SHA} -->"
     )
     assert str(publisher.comment_calls[0]["body"]).startswith("## Coderus 代码检视")
+    assert all(call["body"] != "/lgtm" for call in publisher.comment_calls)
     assert notifier.messages == [
         (
             "chat-1",
@@ -653,6 +654,34 @@ async def test_run_drops_unpublishable_locations_and_completes(
     assert len(publisher.comment_calls) == 1
     assert "1 条意见因无法安全定位未发布" in publisher.comment_calls[0]["body"]
     assert "未发现需要反馈的具体问题" not in publisher.comment_calls[0]["body"]
+    assert all(call["body"] != "/lgtm" for call in publisher.comment_calls)
+
+
+@pytest.mark.asyncio
+async def test_successful_clean_review_publishes_exactly_one_lgtm_comment(
+    engine, session: Session, tmp_path: Path
+) -> None:
+    task = add_review_task(session)
+    runner = FakeRunner(
+        engine,
+        stdout=(
+            "本次修改完善了检视任务的完成流程。\n"
+            "未发现需要反馈的具体问题。"
+        ),
+    )
+    orchestrator, publisher, _, _, _, _ = build_orchestrator(
+        engine, tmp_path, runner=runner
+    )
+
+    await orchestrator.run(task.id)
+    await orchestrator.run(task.id)
+
+    session.expire_all()
+    persisted = session.get(PRReviewTask, task.id)
+    assert persisted.status == "completed"
+    lgtm_calls = [call for call in publisher.comment_calls if call["body"] == "/lgtm"]
+    assert len(lgtm_calls) == 1
+    assert lgtm_calls[0]["marker"] == "/lgtm"
 
 
 @pytest.mark.asyncio

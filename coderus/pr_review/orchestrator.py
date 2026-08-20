@@ -32,6 +32,7 @@ CLAIM_LEASE_SECONDS = 120.0
 CLAIM_HEARTBEAT_SECONDS = 10.0
 COMMENT_TIMEOUT_SECONDS = 90.0
 PR_REVIEW_MAX_OUTPUT_BYTES = 5_000_000
+LGTM_COMMENT = "/lgtm"
 
 
 class Runner(Protocol):
@@ -197,6 +198,18 @@ class PRReviewOrchestrator:
                     ),
                     timeout=COMMENT_TIMEOUT_SECONDS,
                 )
+                if not generated_output.findings:
+                    self._assert_claim(task_id, claim_token, claim_lost)
+                    await asyncio.wait_for(
+                        self.forges.require(task.provider).publish_pr_comment(
+                            task.owner,
+                            task.name,
+                            task.pr_number,
+                            LGTM_COMMENT,
+                            LGTM_COMMENT,
+                        ),
+                        timeout=COMMENT_TIMEOUT_SECONDS,
+                    )
                 self._complete(task_id, state, claim_token, comment.url)
             except _ClaimLost:
                 return
