@@ -658,7 +658,7 @@ async def test_run_drops_unpublishable_locations_and_completes(
 
 
 @pytest.mark.asyncio
-async def test_successful_clean_review_publishes_exactly_one_lgtm_comment(
+async def test_successful_clean_review_scopes_lgtm_comment_to_head_sha(
     engine, session: Session, tmp_path: Path
 ) -> None:
     task = add_review_task(session)
@@ -679,9 +679,13 @@ async def test_successful_clean_review_publishes_exactly_one_lgtm_comment(
     session.expire_all()
     persisted = session.get(PRReviewTask, task.id)
     assert persisted.status == "completed"
-    lgtm_calls = [call for call in publisher.comment_calls if call["body"] == "/lgtm"]
+    lgtm_marker = f"<!-- coderus-pr-review-lgtm:{HEAD_SHA} -->"
+    lgtm_calls = [
+        call for call in publisher.comment_calls if str(call["body"]).startswith("/lgtm\n")
+    ]
     assert len(lgtm_calls) == 1
-    assert lgtm_calls[0]["marker"] == "/lgtm"
+    assert lgtm_calls[0]["body"] == f"/lgtm\n{lgtm_marker}"
+    assert lgtm_calls[0]["marker"] == lgtm_marker
 
 
 @pytest.mark.asyncio

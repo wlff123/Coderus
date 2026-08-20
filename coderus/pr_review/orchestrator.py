@@ -199,14 +199,17 @@ class PRReviewOrchestrator:
                     timeout=COMMENT_TIMEOUT_SECONDS,
                 )
                 if not generated_output.findings:
+                    lgtm_marker = (
+                        f"<!-- coderus-pr-review-lgtm:{details.head_sha} -->"
+                    )
                     self._assert_claim(task_id, claim_token, claim_lost)
                     await asyncio.wait_for(
                         self.forges.require(task.provider).publish_pr_comment(
                             task.owner,
                             task.name,
                             task.pr_number,
-                            LGTM_COMMENT,
-                            LGTM_COMMENT,
+                            f"{LGTM_COMMENT}\n{lgtm_marker}",
+                            lgtm_marker,
                         ),
                         timeout=COMMENT_TIMEOUT_SECONDS,
                     )
