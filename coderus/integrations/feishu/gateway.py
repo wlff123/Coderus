@@ -12,6 +12,7 @@ from typing import Any
 from .commands import IncomingFeishuMessage
 
 QUEUE_CAPACITY = 256
+BOT_DISPLAY_NAME = "Coderus"
 logger = logging.getLogger(__name__)
 
 
@@ -157,7 +158,11 @@ def normalize_message_event(data: Any) -> IncomingFeishuMessage | None:
         return None
 
     mentions = list(getattr(message, "mentions", None) or [])
+    mentioned_bot = False
     for mention in mentions:
+        name = getattr(mention, "name", None)
+        if isinstance(name, str) and name.strip().casefold() == BOT_DISPLAY_NAME.casefold():
+            mentioned_bot = True
         key = getattr(mention, "key", None)
         if isinstance(key, str) and key:
             placeholder = key if key.startswith("@") else f"@{key}"
@@ -177,5 +182,5 @@ def normalize_message_event(data: Any) -> IncomingFeishuMessage | None:
         chat_type=chat_type,
         sender_open_id=sender_open_id,
         text=" ".join(text.split()),
-        mentioned_bot=bool(mentions),
+        mentioned_bot=mentioned_bot,
     )

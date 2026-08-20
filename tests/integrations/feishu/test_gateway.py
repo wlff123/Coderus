@@ -76,6 +76,19 @@ def test_normalize_group_message_without_mention_is_retained_for_filtering() -> 
     assert message.mentioned_bot is False
 
 
+def test_normalize_group_message_mentioning_another_bot_is_not_for_coderus() -> None:
+    message = normalize_message_event(
+        event(
+            text="@_user_2 帮助",
+            mentions=[SimpleNamespace(key="@_user_2", name="Other Bot")],
+        )
+    )
+
+    assert message is not None
+    assert message.text == "帮助"
+    assert message.mentioned_bot is False
+
+
 def test_normalize_personal_message_does_not_require_mention() -> None:
     message = normalize_message_event(event(text="状态", chat_type="p2p"))
 
