@@ -179,6 +179,29 @@ Review comment:
     assert finding.suggestion == "在读取属性前处理空值。"
 
 
+def test_parse_native_review_accepts_common_markdown_finding_layouts() -> None:
+    message = """本次变更增加了配置校验并调整了请求处理流程。
+
+Review comment:
+
+### 1. [P1 严重] 空值会导致请求失败 — RIGHT /srv/work/pr-review-1/src/app.py:12-14
+  - **问题**：当输入为空时会直接解引用。
+  - 影响: 请求会抛出异常并中断。
+  - **建议**：在读取属性前处理空值。"""
+    output = parse_review_output(
+        native_review_stdout(message),
+        workspace=Path("/srv/work/pr-review-1"),
+        ranges=ChangedRanges({("src/app.py", "RIGHT"): ((12, 14),)}),
+        fallback_summary="本次 PR 涉及 1 个变更文件，新增 3 行并删除 0 行。",
+        comparison_sha=BASE,
+    )
+
+    assert output.findings[0].priority == "P1"
+    assert output.findings[0].problem == "当输入为空时会直接解引用。"
+    assert output.findings[0].impact == "请求会抛出异常并中断。"
+    assert output.findings[0].suggestion == "在读取属性前处理空值。"
+
+
 def test_parse_review_output_uses_stats_summary_when_native_review_has_no_findings() -> None:
     output = parse_review_output(
         native_review_stdout(

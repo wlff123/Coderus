@@ -16,7 +16,8 @@ from .models import ChangedRanges, ReviewFinding, ReviewOutput, normalize_reposi
 MAX_REVIEW_OUTPUT_CHARS = 65_536
 _FENCED_JSON_BLOCK = re.compile(r"```json[ \t]*\r?\n(?P<payload>.*?)\r?\n```", re.DOTALL)
 _NATIVE_FINDING_HEADER = re.compile(
-    r"(?m)^-\s+\[(P[0-3])\]\s+(.+?)\s+(?:—|–|-)\s+"
+    r"(?m)^\s*(?:(?:#{1,6}\s*)?\d+[.)、]\s*)?(?:-\s*)?"
+    r"\[(P[0-3])(?:[^\]\r\n]*)\]\s+(.+?)\s+(?:—|–|-)\s+"
     r"(LEFT|RIGHT)\s+(.+?):(\d+)(?:-(\d+))?\s*$"
 )
 _NO_FINDINGS_CONCLUSION = re.compile(
@@ -296,6 +297,18 @@ def _repository_relative_location(value: str, workspace: Path) -> str:
 
 
 def _structured_finding_details(body: str) -> tuple[str, str, str]:
+    normalized_lines = []
+    for line in body.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        line = re.sub(
+            r"^(?:[-*+]\s+)?(?:\*\*)?(问题|影响|建议)(?:\*\*)?\s*[:：]\s*",
+            r"\1：",
+            line,
+        )
+        normalized_lines.append(line)
+    body = "\n".join(normalized_lines)
     match = re.fullmatch(
         r"问题：\s*(?P<problem>[^\n]+)\n影响：\s*(?P<impact>[^\n]+)"
         r"\n建议：\s*(?P<suggestion>[^\n]+)",
