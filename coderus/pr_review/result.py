@@ -16,9 +16,9 @@ from .models import ChangedRanges, ReviewFinding, ReviewOutput, normalize_reposi
 MAX_REVIEW_OUTPUT_CHARS = 65_536
 _FENCED_JSON_BLOCK = re.compile(r"```json[ \t]*\r?\n(?P<payload>.*?)\r?\n```", re.DOTALL)
 _NATIVE_FINDING_HEADER = re.compile(
-    r"(?m)^\s*(?:(?:#{1,6}\s*)?\d+[.)、]\s*)?(?:-\s*)?"
-    r"\[(P[0-3])(?:[^\]\r\n]*)\]\s+(.+?)\s+(?:—|–|-)\s+"
-    r"(LEFT|RIGHT)\s+(.+?):(\d+)(?:-(\d+))?\s*$"
+    r"(?m)^\s*(?:(?:#{1,6}\s*)?\d+[.)、]\s*)?(?:[-*+]\s*)?"
+    r"(?:\*\*)?\[(P[0-3])(?:[^\]\r\n]*)\](?:\*\*)?\s+(.+?)\s+"
+    r"(?:—|–|-)\s+(LEFT|RIGHT)\s+(.+?):(\d+)(?:-(\d+))?\s*\*{0,2}\s*$"
 )
 _NO_FINDINGS_CONCLUSION = re.compile(
     r"(?:静态检视)?(?:未发现|没有发现)(?:需要反馈的具体问题|"
@@ -111,7 +111,9 @@ def _parse_native_review_output(
     matches = list(_NATIVE_FINDING_HEADER.finditer(message))
     priority_markers = re.findall(r"\[P[^\]\r\n]*\]", message)
     if len(priority_markers) != len(matches):
-        raise ReviewOutputError("原生检视意见格式无效")
+        raise ReviewOutputError(
+            "原生检视意见格式无效：优先级标记数量与意见标题数量不一致"
+        )
     if not matches:
         _validate_no_findings_message(message)
     summaries = _native_change_summary(message, matches, fallback_summary)
@@ -286,7 +288,7 @@ def _validate_no_findings_message(message: str) -> None:
 
 
 def _repository_relative_location(value: str, workspace: Path) -> str:
-    location = value.strip().replace("\\", "/")
+    location = value.strip().strip("`*_[]() ").replace("\\", "/")
     workspace_prefix = str(workspace).replace("\\", "/").rstrip("/") + "/"
     if location.casefold().startswith(workspace_prefix.casefold()):
         location = location[len(workspace_prefix) :]
@@ -297,7 +299,7 @@ def _repository_relative_location(value: str, workspace: Path) -> str:
 
 
 def _structured_finding_details(body: str) -> tuple[str, str, str]:
-    normalized_lines = []
+    normalized_lines: list[str] = []
     for line in body.splitlines():
         line = line.strip()
         if not line:
@@ -308,18 +310,28 @@ def _structured_finding_details(body: str) -> tuple[str, str, str]:
             line,
         )
         normalized_lines.append(line)
-    body = "\n".join(normalized_lines)
-    match = re.fullmatch(
-        r"问题：\s*(?P<problem>[^\n]+)\n影响：\s*(?P<impact>[^\n]+)"
-        r"\n建议：\s*(?P<suggestion>[^\n]+)",
-        body,
-    )
-    if match is None:
+    fields: dict[str, str] = {}
+    current: str | None = None
+    for line in normalized_lines:
+        match = re.fullmatch(r"(?P<label>问题|影响|建议)：?\s*(?P<value>.*)", line)
+        if match is not None:
+            label = match.group("label")
+            if label in fields:
+                raise ReviewOutputError("原生检视意见包含重复正文标签")
+            current = label
+            value = match.group("value").strip()
+            if value:
+                fields[label] = value
+            continue
+        if current is None or current in fields:
+            raise ReviewOutputError("原生检视意见格式无效")
+        fields[current] = line
+    if set(fields) != {"问题", "影响", "建议"}:
         raise ReviewOutputError("原生检视意见格式无效")
     return (
-        match.group("problem").strip(),
-        match.group("impact").strip(),
-        match.group("suggestion").strip(),
+        fields["问题"],
+        fields["影响"],
+        fields["建议"],
     )
 
 

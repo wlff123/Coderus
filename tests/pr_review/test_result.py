@@ -202,6 +202,32 @@ Review comment:
     assert output.findings[0].suggestion == "在读取属性前处理空值。"
 
 
+def test_parse_native_review_accepts_wrapped_fields_and_markdown_location() -> None:
+    message = """本次变更增加了配置校验。
+
+Review comment:
+
+* **[P2 一般]** 缺少空值保护 — RIGHT `src/app.py`:12-14**
+  - 问题：
+    输入为空时会直接解引用。
+  - 影响：
+    请求会抛出异常。
+  - 建议：
+    在读取属性前处理空值。"""
+    output = parse_review_output(
+        native_review_stdout(message),
+        workspace=Path("/srv/work/pr-review-1"),
+        ranges=ChangedRanges({("src/app.py", "RIGHT"): ((12, 14),)}),
+        fallback_summary="本次 PR 涉及 1 个变更文件，新增 3 行并删除 0 行。",
+        comparison_sha=BASE,
+    )
+
+    finding = output.findings[0]
+    assert finding.priority == "P2"
+    assert finding.file_path == "src/app.py"
+    assert finding.problem == "输入为空时会直接解引用。"
+
+
 def test_parse_review_output_uses_stats_summary_when_native_review_has_no_findings() -> None:
     output = parse_review_output(
         native_review_stdout(
