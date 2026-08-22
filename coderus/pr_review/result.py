@@ -18,7 +18,12 @@ _FENCED_JSON_BLOCK = re.compile(r"```json[ \t]*\r?\n(?P<payload>.*?)\r?\n```", r
 _NATIVE_FINDING_HEADER = re.compile(
     r"(?m)^\s*(?:(?:#{1,6}\s*)?\d+[.)、]\s*)?(?:[-*+]\s*)?"
     r"(?:\*\*)?\[(P[0-3])(?:[^\]\r\n]*)\](?:\*\*)?\s+(.+?)\s+"
-    r"(?:—|–|-)\s+(LEFT|RIGHT)\s+(.+?):(\d+)(?:-(\d+))?\s*\*{0,2}\s*$"
+    r"(?:(?:—|–|-)\s+|:\s*|\(\s*)(LEFT|RIGHT)\s+"
+    r"(.+?)(?::L?|#L)(\d+)(?:[-–]L?(\d+))?\s*\**\s*\)?\s*$"
+)
+_NATIVE_PRIORITY_MARKER_LINE = re.compile(
+    r"(?m)^\s*(?:(?:#{1,6}\s*)?\d+[.)、]\s*)?(?:[-*+]\s*)?"
+    r"(?:\*\*)?\[P[^\]\r\n]*\]"
 )
 _NO_FINDINGS_CONCLUSION = re.compile(
     r"(?:静态检视)?(?:未发现|没有发现)(?:需要反馈的具体问题|"
@@ -109,7 +114,7 @@ def _parse_native_review_output(
     fallback_summary: str,
 ) -> ReviewOutput:
     matches = list(_NATIVE_FINDING_HEADER.finditer(message))
-    priority_markers = re.findall(r"\[P[^\]\r\n]*\]", message)
+    priority_markers = list(_NATIVE_PRIORITY_MARKER_LINE.finditer(message))
     if len(priority_markers) != len(matches):
         raise ReviewOutputError(
             "原生检视意见格式无效：优先级标记数量与意见标题数量不一致"

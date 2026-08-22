@@ -228,6 +228,27 @@ Review comment:
     assert finding.problem == "输入为空时会直接解引用。"
 
 
+def test_native_review_ignores_priority_reference_in_finding_body() -> None:
+    message = """本次变更增加了配置校验。
+
+Review comment:
+
+- [P1] 空值会导致请求失败 — RIGHT src/app.py:L12-L14
+  问题：正文引用了 [P2] 作为对比级别。
+  影响：请求会抛出异常。
+  建议：在读取属性前处理空值。"""
+    output = parse_review_output(
+        native_review_stdout(message),
+        workspace=Path("/srv/work/pr-review-1"),
+        ranges=ChangedRanges({("src/app.py", "RIGHT"): ((12, 14),)}),
+        fallback_summary="本次 PR 涉及 1 个变更文件，新增 3 行并删除 0 行。",
+        comparison_sha=BASE,
+    )
+
+    assert len(output.findings) == 1
+    assert output.findings[0].line_start == 12
+
+
 def test_parse_review_output_uses_stats_summary_when_native_review_has_no_findings() -> None:
     output = parse_review_output(
         native_review_stdout(
