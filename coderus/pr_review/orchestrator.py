@@ -166,7 +166,7 @@ class PRReviewOrchestrator:
                     "changed_files": ranges.changed_file_count,
                     "additions": ranges.additions,
                     "deletions": ranges.deletions,
-                    "review_mode": "native",
+                    "review_mode": "json_schema",
                     "generated_findings": len(generated_output.findings),
                     "validated_findings": len(output.findings),
                     "filtered_findings": filtered_finding_count,

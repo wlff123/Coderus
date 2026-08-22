@@ -215,7 +215,7 @@ def review_spec(tmp_path: Path) -> JobSpec:
     )
 
 
-def test_build_command_uses_native_review_for_pr_review(
+def test_build_command_uses_schema_driven_exec_for_pr_review(
     fake_cli: tuple[str, ...], review_spec: JobSpec
 ) -> None:
     root = review_spec.workspace.parent
@@ -227,9 +227,10 @@ def test_build_command_uses_native_review_for_pr_review(
 
     assert command[: len(fake_cli)] == list(fake_cli)
     assert "exec" in command
-    assert command[-3:] == ["review", "--base", "coderus-review-base"]
+    assert command[-1] == "请按开发者检视规范完成本次静态检视，并严格输出 Schema 对象。"
+    assert "review" not in command
+    assert "--base" not in command
     assert "developer_instructions=" in " ".join(command)
-    assert "-" not in command[-3:]
     assert "resume" not in command
     assert review_spec.prompt not in command
     assert "project_doc_max_bytes=0" in command
@@ -296,9 +297,11 @@ async def test_pr_review_runs_without_stdin_and_with_output_schema(
     assert result.status is JobStatus.SUCCEEDED
     assert "exec" in payload["argv"]
     assert 'model_provider="coderus_proxy"' in payload["argv"]
-    assert payload["argv"][-3:] == ["review", "--base", "coderus-review-base"]
-    assert payload["stdin"] == ""
-    assert "review" in payload["argv"]
+    assert payload["argv"][-1] == "请按开发者检视规范完成本次静态检视，并严格输出 Schema 对象。"
+    assert payload["prompt"] == payload["argv"][-1]
+    assert "stdin" not in payload
+    assert "review" not in payload["argv"]
+    assert "--base" not in payload["argv"]
     assert "--output-schema" in payload["argv"]
 
 
@@ -349,7 +352,9 @@ def test_pr_review_adds_large_prompt_to_developer_instructions(
     command = runner.build_command(spec, output_schema=spec.output_schema)
 
     assert f"developer_instructions={json.dumps(prompt)}" in command
-    assert command[-3:] == ["review", "--base", "coderus-review-base"]
+    assert command[-1] == "请按开发者检视规范完成本次静态检视，并严格输出 Schema 对象。"
+    assert "review" not in command
+    assert "--base" not in command
 
 
 def test_build_command_uses_separate_arguments_and_role_sandbox(

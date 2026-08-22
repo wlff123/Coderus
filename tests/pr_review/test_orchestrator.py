@@ -398,7 +398,7 @@ async def test_run_reviews_fixed_pr_revision_once_and_persists_safe_result(
         "changed_files": 1,
         "additions": 3,
         "deletions": 0,
-        "review_mode": "native",
+        "review_mode": "json_schema",
         "generated_findings": 1,
         "validated_findings": 1,
         "filtered_findings": 0,
@@ -488,7 +488,7 @@ async def test_run_reviews_fixed_pr_revision_once_and_persists_safe_result(
 
 
 @pytest.mark.asyncio
-async def test_run_starts_one_native_review_for_large_diff_without_putting_diff_in_prompt(
+async def test_run_starts_one_schema_review_for_large_diff_without_putting_diff_in_prompt(
     engine,
     session: Session,
     tmp_path: Path,
@@ -525,7 +525,7 @@ async def test_run_starts_one_native_review_for_large_diff_without_putting_diff_
     assert len(runner.specs) == 1
     assert runner.specs[0].review_base == "coderus-review-base"
     assert large_diff not in runner.specs[0].prompt
-    assert persisted.structured_result["review_audit"]["review_mode"] == "native"
+    assert persisted.structured_result["review_audit"]["review_mode"] == "json_schema"
     assert len(publisher.comment_calls) == 1
 
 
@@ -649,7 +649,7 @@ async def test_run_drops_unpublishable_locations_and_completes(
         "changed_files": 1,
         "additions": 1,
         "deletions": 0,
-        "review_mode": "native",
+        "review_mode": "json_schema",
         "generated_findings": 1,
         "validated_findings": 0,
         "filtered_findings": 1,

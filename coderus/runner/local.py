@@ -280,7 +280,10 @@ class LocalCodexRunner:
         if spec.session_id is not None:
             command.extend(("resume", spec.session_id))
         if spec.stage is Stage.PR_REVIEW:
-            command.extend(("review", "--base", spec.review_base))
+            # The native `review` subcommand owns its final-message format and can
+            # override --output-schema with a Review comment. Use generic exec so
+            # the schema is the only output contract for PR reviews.
+            command.append("请按开发者检视规范完成本次静态检视，并严格输出 Schema 对象。")
         else:
             command.append(prompt if prompt is not None else spec.prompt)
         return command
