@@ -61,6 +61,10 @@ class ReviewOutputError(ValueError):
     """Raised when a review result cannot be safely published."""
 
 
+def review_output_schema_path() -> Path:
+    return Path(__file__).with_name("review_output.schema.json")
+
+
 def parse_review_output(
     stdout: str,
     *,

@@ -20,6 +20,7 @@ from coderus.pr_review.result import (
     ReviewOutputError,
     parse_review_output,
     render_pr_comment,
+    review_output_schema_path,
     validate_findings,
 )
 from coderus.providers import ProviderName
@@ -320,6 +321,7 @@ class PRReviewOrchestrator:
                 prompt=prompt,
                 timeout_seconds=self.stage_timeout_seconds,
                 max_output_bytes=PR_REVIEW_MAX_OUTPUT_BYTES,
+                output_schema=review_output_schema_path(),
                 proxy_token=token,
                 review_base=material.review_base,
             )

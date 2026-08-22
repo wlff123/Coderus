@@ -9,6 +9,7 @@ from coderus.pr_review.result import (
     ReviewOutputError,
     parse_review_output,
     render_pr_comment,
+    review_output_schema_path,
     validate_findings,
 )
 
@@ -69,6 +70,16 @@ def test_parse_review_output_accepts_json_block() -> None:
     )
 
     assert output.findings[0].line_end == 14
+
+
+def test_review_output_schema_is_packaged_with_the_parser() -> None:
+    schema = review_output_schema_path()
+
+    assert schema.is_file()
+    assert json.loads(schema.read_text(encoding="utf-8"))["required"] == [
+        "change_summary",
+        "findings",
+    ]
 
 
 @pytest.mark.parametrize(
