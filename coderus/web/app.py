@@ -474,11 +474,16 @@ def create_app(
                         app.state.feishu_connection_error = error
                         app.state.feishu_running = False
 
+                    def connection_recovered() -> None:
+                        app.state.feishu_connection_error = None
+                        app.state.feishu_running = True
+
                     return FeishuGateway(
                         resolved_feishu.app_id,
                         resolved_feishu.app_secret.get_secret_value(),
                         on_message=callback,
                         on_error=connection_failed,
+                        on_recovered=connection_recovered,
                     )
 
                 feishu_bot = FeishuBot(

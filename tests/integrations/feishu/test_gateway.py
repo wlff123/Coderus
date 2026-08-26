@@ -1,6 +1,7 @@
 import json
 import queue
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -9,7 +10,9 @@ import coderus.integrations.feishu.gateway as gateway_module
 from coderus.integrations.feishu.commands import IncomingFeishuMessage
 from coderus.integrations.feishu.gateway import (
     FeishuGateway,
+    GatewayConnected,
     GatewayFailure,
+    GatewayReconnecting,
     _put_gateway_item,
     normalize_message_event,
 )
@@ -156,9 +159,13 @@ class FakeProcess:
 class FakeContext:
     def __init__(self) -> None:
         self.queue: queue.Queue[object] = queue.Queue()
-        self.process = FakeProcess()
+        self.processes: list[FakeProcess] = []
         self.process_target = None
         self.process_args = None
+
+    @property
+    def process(self) -> FakeProcess:
+        return self.processes[-1]
 
     def Queue(self, *, maxsize: int):
         assert maxsize == 256
@@ -168,7 +175,9 @@ class FakeContext:
         self.process_target = target
         self.process_args = args
         assert daemon is True
-        return self.process
+        process = FakeProcess()
+        self.processes.append(process)
+        return process
 
 
 def incoming() -> IncomingFeishuMessage:
@@ -281,3 +290,89 @@ def test_gateway_reports_sanitized_child_failure() -> None:
     assert delivered.wait(1)
     assert errors == ["RuntimeError"]
     gateway.stop()
+
+
+def test_gateway_recycles_child_after_prolonged_reconnect() -> None:
+    context = FakeContext()
+    errors: list[str] = []
+    recovered = threading.Event()
+    gateway = FeishuGateway(
+        "cli-test",
+        "secret",
+        on_message=lambda _message: None,
+        on_error=errors.append,
+        on_recovered=recovered.set,
+        process_context=context,
+        reconnect_timeout_seconds=0.02,
+        restart_backoff_seconds=0,
+        max_restart_backoff_seconds=0,
+    )
+
+    gateway.start()
+    first_process = context.process
+    context.queue.put(GatewayReconnecting())
+
+    deadline = time.monotonic() + 1
+    while len(context.processes) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert errors == ["ReconnectTimeout"]
+    assert first_process.terminated is True
+    assert first_process.joined is True
+    assert len(context.processes) == 2
+    assert context.process.started is True
+
+    context.queue.put(GatewayConnected())
+    assert recovered.wait(1)
+    gateway.stop()
+
+
+def test_gateway_restarts_failed_child_with_backoff() -> None:
+    context = FakeContext()
+    errors: list[str] = []
+    gateway = FeishuGateway(
+        "cli-test",
+        "secret",
+        on_message=lambda _message: None,
+        on_error=errors.append,
+        process_context=context,
+        restart_backoff_seconds=0.02,
+        max_restart_backoff_seconds=0.02,
+    )
+
+    gateway.start()
+    first_process = context.process
+    started_at = time.monotonic()
+    context.queue.put(GatewayFailure("RuntimeError"))
+
+    deadline = time.monotonic() + 1
+    while len(context.processes) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert time.monotonic() - started_at >= 0.02
+    assert errors == ["RuntimeError"]
+    assert first_process.terminated is True
+    assert len(context.processes) == 2
+    gateway.stop()
+
+
+def test_gateway_stop_during_restart_backoff_prevents_new_child() -> None:
+    context = FakeContext()
+    failed = threading.Event()
+    gateway = FeishuGateway(
+        "cli-test",
+        "secret",
+        on_message=lambda _message: None,
+        on_error=lambda _error: failed.set(),
+        process_context=context,
+        restart_backoff_seconds=0.5,
+        max_restart_backoff_seconds=0.5,
+    )
+
+    gateway.start()
+    context.queue.put(GatewayFailure("RuntimeError"))
+    assert failed.wait(1)
+
+    gateway.stop()
+
+    assert len(context.processes) == 1
