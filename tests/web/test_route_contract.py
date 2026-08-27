@@ -10,7 +10,7 @@ from pydantic import SecretStr
 
 from coderus.auth.service import create_user
 from coderus.config import DatabaseSettings, Settings
-from coderus.providers.models import Issue, Repository
+from coderus.forge.models import Issue, Repository
 from coderus.web.app import create_app
 
 EXPECTED_ROUTES = {

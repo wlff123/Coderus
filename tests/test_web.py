@@ -20,7 +20,14 @@ from sqlalchemy.orm import Session
 from coderus.auth.service import create_user
 from coderus.config import DatabaseSettings, Settings
 from coderus.db import create_engine_from_settings
-from coderus.forge import ForgeCapability, ForgeRegistration, GitCodeForge
+from coderus.forge import (
+    ForgeCapability,
+    ForgeRegistration,
+    GitCodeForge,
+    GitCodeProvider,
+    PRFeedbackItem,
+)
+from coderus.forge.models import Issue, Repository
 from coderus.models import (
     AgentRun,
     Base,
@@ -34,9 +41,6 @@ from coderus.models import (
 from coderus.models import Issue as DbIssue
 from coderus.models import PRFeedback as DbPRFeedback
 from coderus.models import Repository as DbRepository
-from coderus.providers import GitCodeProvider
-from coderus.providers.models import Issue, Repository
-from coderus.publisher import PRFeedbackItem
 from coderus.web.app import create_app
 
 

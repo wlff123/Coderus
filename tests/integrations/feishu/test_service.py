@@ -10,12 +10,12 @@ import coderus.application.reviews as application_reviews_module
 from coderus.application import IssueCommands, ReviewCommands
 from coderus.db import create_session_factory
 from coderus.forge import ForgeRegistry
+from coderus.forge.models import Issue as ProviderIssue
+from coderus.forge.models import Repository as ProviderRepository
 from coderus.integrations.feishu.commands import IncomingFeishuMessage
 from coderus.integrations.feishu.service import FeishuCommandService
 from coderus.issues.service import add_and_dispatch_issue
 from coderus.models import FeishuEvent, Issue, PRReviewTask, Repository, Task, User
-from coderus.providers.models import Issue as ProviderIssue
-from coderus.providers.models import Repository as ProviderRepository
 
 
 class FakeReviewForge:

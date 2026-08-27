@@ -8,8 +8,8 @@ from dataclasses import dataclass
 from sqlalchemy.orm import Session
 
 from coderus.forge import ForgeCapability, ForgeNotConfigured, ForgeRegistry
+from coderus.forge.urls import parse_pull_request_url
 from coderus.pr_review.service import enqueue_pr_review
-from coderus.providers.urls import parse_pull_request_url
 
 
 @dataclass(frozen=True, slots=True)

@@ -10,9 +10,9 @@ from sqlalchemy.orm import Session
 
 from coderus.application.errors import CommandError, Conflict, Forbidden, NotFound
 from coderus.forge import ForgeCapability, ForgeRegistry
+from coderus.forge.urls import parse_repository_url
 from coderus.issues.service import sync_repository
 from coderus.models import Repository, User
-from coderus.providers.urls import parse_repository_url
 
 
 @dataclass(frozen=True, slots=True)

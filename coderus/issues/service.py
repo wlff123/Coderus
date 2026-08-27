@@ -8,10 +8,10 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from coderus.forge.models import Issue as ProviderIssue
+from coderus.forge.models import Repository as ProviderRepository
+from coderus.forge.urls import parse_issue_url
 from coderus.models import Issue, Repository, Task, User
-from coderus.providers.models import Issue as ProviderIssue
-from coderus.providers.models import Repository as ProviderRepository
-from coderus.providers.urls import parse_issue_url
 from coderus.tasks.statuses import TERMINAL_TASK_STATES
 
 

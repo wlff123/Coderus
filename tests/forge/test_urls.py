@@ -1,7 +1,7 @@
 import pytest
 
-from coderus.providers import InvalidProviderUrl, parse_issue_url, parse_repository_url
-from coderus.providers.urls import parse_pull_request_url
+from coderus.forge import InvalidProviderUrl, parse_issue_url, parse_repository_url
+from coderus.forge.urls import parse_pull_request_url
 
 
 @pytest.mark.parametrize(

@@ -3,8 +3,8 @@ import secrets
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from coderus.forge.urls import parse_pull_request_url
 from coderus.models import PRReviewTask, Repository
-from coderus.providers.urls import parse_pull_request_url
 
 
 def enqueue_pr_review(

@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from coderus.publisher import (
+from coderus.forge import (
     GitCommandResult,
     GitPushError,
     HttpsGitPusher,

@@ -14,8 +14,8 @@ from sqlalchemy.orm import Session, selectinload
 
 from coderus.application import ReviewCommands, ReviewSource
 from coderus.auth.security import verify_csrf_token
+from coderus.forge.errors import InvalidProviderUrl
 from coderus.models import PRReviewTask
-from coderus.providers.errors import InvalidProviderUrl
 from coderus.web.ui import WebUI, enabled_repository, redirect
 
 REVIEWS_PAGE_SIZE = 20

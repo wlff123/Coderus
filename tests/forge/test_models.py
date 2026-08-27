@@ -2,7 +2,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from coderus.providers import (
+from coderus.forge import (
     Issue,
     Repository,
 )

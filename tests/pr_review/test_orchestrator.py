@@ -10,13 +10,12 @@ from pathlib import Path
 import pytest
 from sqlalchemy.orm import Session
 
-from coderus.forge import ForgeRegistry
+from coderus.forge import ForgeRegistry, PRCommentResult, PublisherRemoteError, PullRequestDetails
 from coderus.model_proxy import CredentialBroker
 from coderus.models import PRReviewTask, Repository, User
 from coderus.pr_review import orchestrator as orchestrator_module
 from coderus.pr_review.models import ChangedRanges, ReviewInput
 from coderus.pr_review.orchestrator import PRReviewOrchestrator, _ClaimLost
-from coderus.publisher import PRCommentResult, PublisherRemoteError, PullRequestDetails
 from coderus.runner import AgentRole, JobResult, JobStatus, RetryableAgentError, Stage
 
 BASE_SHA = "a" * 40

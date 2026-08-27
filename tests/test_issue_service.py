@@ -3,10 +3,10 @@ from datetime import UTC, datetime
 import pytest
 from sqlalchemy.exc import IntegrityError
 
+from coderus.forge.models import Issue as ProviderIssue
+from coderus.forge.models import Repository as ProviderRepository
 from coderus.issues.service import dispatch_issue, sync_repository, upsert_provider_issue
 from coderus.models import Issue, Repository, Task, User
-from coderus.providers.models import Issue as ProviderIssue
-from coderus.providers.models import Repository as ProviderRepository
 
 
 def provider_issue(title: str = "First title") -> ProviderIssue:

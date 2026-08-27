@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from coderus.publisher import (
+from coderus.forge import (
     ForkResult,
     GitCommandResult,
     GitHubPublisher,
@@ -461,7 +461,7 @@ def test_get_pull_request_returns_verified_metadata() -> None:
 
 
 def test_publisher_exports_pull_request_result_models() -> None:
-    from coderus.publisher import PRCommentResult, PullRequestDetails
+    from coderus.forge import PRCommentResult, PullRequestDetails
 
     assert PullRequestDetails.__name__ == "PullRequestDetails"
     assert PRCommentResult.__name__ == "PRCommentResult"

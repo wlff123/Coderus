@@ -8,8 +8,8 @@ from sqlalchemy import select
 from coderus.application.errors import Conflict, Forbidden, NotFound
 from coderus.application.repositories import RepositoryCommands, SyncFailed
 from coderus.forge import ForgeCapability, ForgeRegistration, ForgeRegistry
+from coderus.forge.models import Repository as ProviderRepository
 from coderus.models import Repository
-from coderus.providers.models import Repository as ProviderRepository
 
 from .conftest import seed_issue, seed_user
 

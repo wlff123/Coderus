@@ -9,8 +9,8 @@ from sqlalchemy import select
 
 from coderus.application.errors import Conflict, Forbidden, NotFound
 from coderus.application.tasks import TaskCommands
+from coderus.forge import PRFeedbackItem
 from coderus.models import PRFeedback, Task
-from coderus.publisher import PRFeedbackItem
 
 from .conftest import seed_task, seed_user
 

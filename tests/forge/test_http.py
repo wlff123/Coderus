@@ -2,8 +2,8 @@ from collections import deque
 
 import pytest
 
-from coderus.providers.errors import ProviderRemoteError
-from coderus.providers.http import RetryPolicy, request_with_backoff
+from coderus.forge.errors import ProviderRemoteError
+from coderus.forge.http import RetryPolicy, request_with_backoff
 
 
 class Response:

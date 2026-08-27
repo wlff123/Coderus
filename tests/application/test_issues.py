@@ -7,9 +7,9 @@ from sqlalchemy import func, select
 
 from coderus.application.errors import Conflict, Forbidden, NotFound
 from coderus.application.issues import IssueCommands
+from coderus.forge.models import Issue as ProviderIssue
+from coderus.forge.models import Repository as ProviderRepository
 from coderus.models import Issue, Task
-from coderus.providers.models import Issue as ProviderIssue
-from coderus.providers.models import Repository as ProviderRepository
 
 from .conftest import seed_issue, seed_task, seed_user
 

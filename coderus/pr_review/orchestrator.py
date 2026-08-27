@@ -12,7 +12,7 @@ from typing import Protocol, cast
 from sqlalchemy import case, update
 from sqlalchemy.orm import Session
 
-from coderus.forge import ForgeRegistry
+from coderus.forge import ForgeRegistry, ProviderName
 from coderus.models import PRReviewTask
 from coderus.pr_review.instructions import build_review_instructions
 from coderus.pr_review.models import ReviewInput, ReviewOutput
@@ -23,7 +23,6 @@ from coderus.pr_review.result import (
     review_output_schema_path,
     validate_findings,
 )
-from coderus.providers import ProviderName
 from coderus.runner import AgentRole, JobSpec, JobStatus, Stage
 from coderus.workflow.limited_runner import retry_agent_operation
 

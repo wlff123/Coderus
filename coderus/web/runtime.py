@@ -28,7 +28,7 @@ from coderus.db import (
     create_session_factory,
     ensure_schema_compatibility,
 )
-from coderus.forge import ForgeRegistry
+from coderus.forge import ForgeRegistry, GitCodeProvider, GitHubProvider
 from coderus.integrations.feishu import FeishuClient, FeishuConfig
 from coderus.integrations.feishu.bot import FeishuBot
 from coderus.integrations.feishu.commands import IncomingFeishuMessage
@@ -49,7 +49,6 @@ from coderus.models import Base, FeishuEvent, Repository
 from coderus.pr_review.orchestrator import PRReviewOrchestrator
 from coderus.pr_review.scheduler import PRReviewScheduler
 from coderus.pr_review.workspace import PRWorkspace
-from coderus.providers import GitCodeProvider, GitHubProvider
 from coderus.release_gate import ReleaseGate
 from coderus.runner import LocalCodexRunner, RunnerConfig, resolve_codex_command
 from coderus.security import CredentialCipher

@@ -9,7 +9,7 @@ from urllib.parse import quote
 
 from pydantic import ValidationError
 
-from coderus.providers import ProviderName
+from coderus.forge import ProviderName
 
 from .models import ChangedRanges, ReviewFinding, ReviewOutput, normalize_repository_path
 

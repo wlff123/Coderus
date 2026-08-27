@@ -1,7 +1,35 @@
-from .errors import ForgeError, ForgeRemoteError, InvalidForgeInput
-from .gitcode import GitCodeForge
-from .github import GitHubForge
-from .models import ProviderName
+"""平台适配层：Issue 读取、PR 发布、能力注册与共享模型的唯一入口。"""
+
+from .errors import (
+    ForgeError,
+    ForgeRemoteError,
+    ForkNotReady,
+    GitPushError,
+    InvalidForgeInput,
+    InvalidProviderUrl,
+    InvalidPublisherInput,
+    ProviderError,
+    ProviderNotConfiguredError,
+    ProviderRemoteError,
+    PublisherError,
+    PublisherRemoteError,
+    RegisteredForkMismatch,
+    UnsupportedPublisher,
+)
+from .git_transport import GitRunner, HttpsGitPusher, SubprocessGitRunner
+from .gitcode import GitCodeForge, GitCodeProvider, GitCodePublisher
+from .github import GitHubForge, GitHubProvider, GitHubPublisher
+from .models import (
+    ForkResult,
+    GitCommandResult,
+    Issue,
+    PRCommentResult,
+    PRFeedbackItem,
+    ProviderName,
+    PublishResult,
+    PullRequestDetails,
+    Repository,
+)
 from .protocols import Forge, PublishRequest
 from .registry import (
     ALL_FORGE_CAPABILITIES,
@@ -10,6 +38,7 @@ from .registry import (
     ForgeRegistration,
     ForgeRegistry,
 )
+from .urls import parse_issue_url, parse_pull_request_url, parse_repository_url
 
 __all__ = [
     "ALL_FORGE_CAPABILITIES",
@@ -20,9 +49,38 @@ __all__ = [
     "ForgeRegistration",
     "ForgeRegistry",
     "ForgeRemoteError",
+    "ForkNotReady",
+    "ForkResult",
+    "GitCommandResult",
     "GitCodeForge",
+    "GitCodeProvider",
+    "GitCodePublisher",
     "GitHubForge",
+    "GitHubProvider",
+    "GitHubPublisher",
+    "GitPushError",
+    "GitRunner",
+    "HttpsGitPusher",
     "InvalidForgeInput",
+    "InvalidProviderUrl",
+    "InvalidPublisherInput",
+    "Issue",
+    "PRCommentResult",
+    "PRFeedbackItem",
+    "ProviderError",
     "ProviderName",
+    "ProviderNotConfiguredError",
+    "ProviderRemoteError",
     "PublishRequest",
+    "PublishResult",
+    "PublisherError",
+    "PublisherRemoteError",
+    "PullRequestDetails",
+    "RegisteredForkMismatch",
+    "Repository",
+    "SubprocessGitRunner",
+    "UnsupportedPublisher",
+    "parse_issue_url",
+    "parse_pull_request_url",
+    "parse_repository_url",
 ]

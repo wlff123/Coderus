@@ -2,8 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from coderus.forge import ForgeRegistration, GitCodeForge, GitHubForge
-from coderus.providers import GitCodeProvider, GitHubProvider, ProviderName
+from coderus.forge import (
+    ForgeRegistration,
+    GitCodeForge,
+    GitCodeProvider,
+    GitHubForge,
+    GitHubProvider,
+    ProviderName,
+)
 
 
 @dataclass(frozen=True)

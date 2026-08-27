@@ -4,12 +4,12 @@ from typing import Any
 
 import pytest
 
-from coderus.providers import (
+from coderus.forge import (
     GitHubProvider,
     ProviderRemoteError,
     Repository,
 )
-from coderus.providers.http import RetryPolicy
+from coderus.forge.http import RetryPolicy
 
 
 class FakeResponse:

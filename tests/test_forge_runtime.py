@@ -8,12 +8,13 @@ from coderus.forge import (
     ForgeRegistration,
     ForgeRegistry,
     GitCodeForge,
+    GitCodeProvider,
     GitHubForge,
+    GitHubProvider,
 )
 from coderus.integrations.feishu.commands import IncomingFeishuMessage
 from coderus.integrations.feishu.service import FeishuCommandService
 from coderus.models import PRReviewTask, Repository, User
-from coderus.providers import GitCodeProvider, GitHubProvider
 from coderus.web.forge_runtime import (
     ForgeRuntime,
     build_gitcode_runtime,

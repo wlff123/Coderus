@@ -9,9 +9,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from coderus.application import IssueCommands, ReviewCommands, ReviewSource
+from coderus.forge.errors import InvalidProviderUrl, ProviderError
 from coderus.integrations.feishu.settings import ensure_feishu_bot_user
 from coderus.models import FeishuEvent, Task
-from coderus.providers.errors import InvalidProviderUrl, ProviderError
 from coderus.tasks.statuses import RUNNING_TASK_STATES
 
 from .commands import IncomingFeishuMessage, parse_command
