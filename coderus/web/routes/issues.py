@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import UTC, datetime
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, Form, Request
@@ -11,7 +10,7 @@ from fastapi.responses import HTMLResponse
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
-from coderus.application import IssueCommands
+from coderus.application import Conflict, IssueCommands, NotFound
 from coderus.auth.security import verify_csrf_token
 from coderus.models import Issue, Repository
 from coderus.web.presentation import provider_error_message
@@ -209,25 +208,18 @@ def build_issue_router(
                 return redirect("/login")
             if current.role != "admin":
                 return HTMLResponse("Forbidden", status_code=403)
-            if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
-                return HTMLResponse("Invalid CSRF token", status_code=400)
-            issue = session.get(Issue, issue_id)
-            if issue is None:
-                return HTMLResponse("Not found", status_code=404)
-            repository_id = (
-                issue.repository_id if repository == issue.repository_id else None
-            )
-            if issue.triage_state != "discovered" or issue.state != "open":
-                ui.flash(request, "只有待处理 Issue 可以忽略", "danger")
-                return redirect(
-                    repository_scoped_path("/issues", repository_id, triage="all")
-                )
-            issue.triage_state = "ignored"
-            issue.ignored_by = current.id
-            issue.ignored_reason = reason.strip()[:1000] or None
-            issue.ignored_at = datetime.now(UTC)
-            session.commit()
-            ui.flash(request, f"Issue #{issue.number} 已忽略")
+            current_id = current.id
+        if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
+            return HTMLResponse("Invalid CSRF token", status_code=400)
+        try:
+            ref = issues.ignore(issue_id, current_id, reason)
+        except NotFound:
+            return HTMLResponse("Not found", status_code=404)
+        except Conflict as exc:
+            ui.flash(request, str(exc), "danger")
+            return redirect(repository_scoped_path("/issues", repository, triage="all"))
+        repository_id = ref.repository_id if repository == ref.repository_id else None
+        ui.flash(request, f"Issue #{ref.number} 已忽略")
         return redirect(
             repository_scoped_path("/issues", repository_id, triage="ignored")
         )
@@ -245,25 +237,18 @@ def build_issue_router(
                 return redirect("/login")
             if current.role != "admin":
                 return HTMLResponse("Forbidden", status_code=403)
-            if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
-                return HTMLResponse("Invalid CSRF token", status_code=400)
-            issue = session.get(Issue, issue_id)
-            if issue is None:
-                return HTMLResponse("Not found", status_code=404)
-            repository_id = (
-                issue.repository_id if repository == issue.repository_id else None
-            )
-            if issue.triage_state != "ignored":
-                ui.flash(request, "只有已忽略 Issue 可以恢复", "danger")
-                return redirect(
-                    repository_scoped_path("/issues", repository_id, triage="all")
-                )
-            issue.triage_state = "discovered"
-            issue.ignored_by = None
-            issue.ignored_reason = None
-            issue.ignored_at = None
-            session.commit()
-            ui.flash(request, f"Issue #{issue.number} 已恢复到待处理")
+            current_id = current.id
+        if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
+            return HTMLResponse("Invalid CSRF token", status_code=400)
+        try:
+            ref = issues.restore(issue_id, current_id)
+        except NotFound:
+            return HTMLResponse("Not found", status_code=404)
+        except Conflict as exc:
+            ui.flash(request, str(exc), "danger")
+            return redirect(repository_scoped_path("/issues", repository, triage="all"))
+        repository_id = ref.repository_id if repository == ref.repository_id else None
+        ui.flash(request, f"Issue #{ref.number} 已恢复到待处理")
         return redirect(repository_scoped_path("/issues", repository_id))
 
     return router

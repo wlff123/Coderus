@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from sqlalchemy.orm import Session
 
+from coderus.application.errors import Conflict, Forbidden, NotFound
 from coderus.issues.service import (
     IssueProvider,
     add_and_dispatch_issue,
@@ -13,6 +16,12 @@ from coderus.issues.service import (
     dispatch_issue,
 )
 from coderus.models import Issue, User
+
+
+@dataclass(frozen=True, slots=True)
+class IssueRef:
+    number: int
+    repository_id: int
 
 
 def _active_user(session: Session, actor_id: int) -> User:
@@ -76,3 +85,41 @@ class IssueCommands:
             session, self._providers, issue_url, actor, commit=False
         )
         return task.id
+
+    def ignore(self, issue_id: int, actor_id: int, reason: str = "") -> IssueRef:
+        """把待处理 Issue 标记为已忽略。"""
+        with self._sessions() as session:
+            issue = self._admin_issue(session, issue_id, actor_id)
+            if issue.triage_state != "discovered" or issue.state != "open":
+                raise Conflict("只有待处理 Issue 可以忽略")
+            issue.triage_state = "ignored"
+            issue.ignored_by = actor_id
+            issue.ignored_reason = reason.strip()[:1000] or None
+            issue.ignored_at = datetime.now(UTC)
+            ref = IssueRef(number=issue.number, repository_id=issue.repository_id)
+            session.commit()
+            return ref
+
+    def restore(self, issue_id: int, actor_id: int) -> IssueRef:
+        """把已忽略 Issue 恢复到待处理。"""
+        with self._sessions() as session:
+            issue = self._admin_issue(session, issue_id, actor_id)
+            if issue.triage_state != "ignored":
+                raise Conflict("只有已忽略 Issue 可以恢复")
+            issue.triage_state = "discovered"
+            issue.ignored_by = None
+            issue.ignored_reason = None
+            issue.ignored_at = None
+            ref = IssueRef(number=issue.number, repository_id=issue.repository_id)
+            session.commit()
+            return ref
+
+    @staticmethod
+    def _admin_issue(session: Session, issue_id: int, actor_id: int) -> Issue:
+        issue = session.get(Issue, issue_id)
+        if issue is None:
+            raise NotFound("Issue 不存在")
+        actor = session.get(User, actor_id)
+        if actor is None or actor.role != "admin":
+            raise Forbidden("没有权限操作该 Issue")
+        return issue
