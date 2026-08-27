@@ -132,11 +132,22 @@ def login_as(client: TestClient, username: str, password: str) -> str:
     return csrf_token
 
 
+def _api_routes(routes):
+    """展开 include_router 产生的嵌套路由，收集全部 APIRoute。"""
+    for route in routes:
+        if isinstance(route, APIRoute):
+            yield route
+        elif hasattr(route, "original_router"):
+            yield from _api_routes(route.original_router.routes)
+        else:
+            yield from _api_routes(getattr(route, "routes", []))
+
+
 def test_active_route_snapshot_is_stable(app) -> None:
     actual = {
         (method, route.path, route.name)
-        for route in app.routes
-        if isinstance(route, APIRoute) and route.name not in _AUTO_ROUTE_NAMES
+        for route in _api_routes(app.routes)
+        if route.name not in _AUTO_ROUTE_NAMES
         for method in route.methods - {"HEAD", "OPTIONS"}
     }
     assert actual == EXPECTED_ROUTES

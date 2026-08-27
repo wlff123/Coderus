@@ -17,9 +17,8 @@ from urllib.parse import urlencode
 import httpx
 import uvicorn
 from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 from starlette.middleware.sessions import SessionMiddleware
@@ -27,12 +26,9 @@ from starlette.middleware.sessions import SessionMiddleware
 from coderus.application import IssueCommands, ReviewCommands
 from coderus.assistant import ModelAssistant
 from coderus.auth.security import (
-    hash_password,
-    new_csrf_token,
     verify_csrf_token,
-    verify_password,
 )
-from coderus.auth.service import authenticate, create_user, ensure_bootstrap_admin
+from coderus.auth.service import ensure_bootstrap_admin
 from coderus.config import Settings, load_settings
 from coderus.db import (
     create_engine_from_settings,
@@ -96,13 +92,12 @@ from coderus.web.presentation import (
     provider_error_message,
     review_status_label,
     review_status_tone,
-    role_label,
-    severity_label,
     status_label,
     status_tone,
-    task_failure_message,
-    task_summary,
 )
+from coderus.web.routes.auth import build_auth_router
+from coderus.web.routes.users import build_user_router
+from coderus.web.ui import WebUI, redirect, templates
 from coderus.workflow.feedback import upsert_pr_feedback
 from coderus.workflow.limited_runner import LimitedRunner
 from coderus.workflow.notifications import FeishuTaskNotifier
@@ -114,7 +109,6 @@ from coderus.workflow.workspace_git import WorkspaceGit
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 logger = logging.getLogger(__name__)
-templates = Jinja2Templates(directory=PACKAGE_ROOT / "templates")
 ISSUES_PAGE_SIZE = 25
 REVIEWS_PAGE_SIZE = 20
 DEFAULT_TASK_HIDDEN_STATUSES = frozenset(
@@ -125,23 +119,6 @@ CLOSABLE_TASK_STATUSES = frozenset(
 )
 RuntimeMode = Literal["active", "preview", "maintenance"]
 RUNTIME_MODES = frozenset({"active", "preview", "maintenance"})
-
-templates.env.globals.update(
-    status_label=status_label,
-    status_tone=status_tone,
-    task_summary=task_summary,
-    role_label=role_label,
-    task_failure=task_failure_message,
-    severity_label=severity_label,
-    provider_error=provider_error_message,
-    review_status_label=review_status_label,
-    review_status_tone=review_status_tone,
-)
-
-
-def redirect(path: str) -> RedirectResponse:
-    return RedirectResponse(path, status_code=303)
-
 
 def create_maintenance_app(settings: Settings) -> FastAPI:
     app = FastAPI(
@@ -734,35 +711,10 @@ def create_app(
     )
     app.mount("/static", StaticFiles(directory=PACKAGE_ROOT / "static"), name="static")
 
-    def csrf(request: Request) -> str:
-        token = request.session.get("csrf_token")
-        if not token:
-            token = new_csrf_token()
-            request.session["csrf_token"] = token
-        return token
-
-    def user_for(request: Request, session: Session) -> User | None:
-        user_id = request.session.get("user_id")
-        version = request.session.get("session_version")
-        if not isinstance(user_id, int):
-            return None
-        user = session.get(User, user_id)
-        if user is None or not user.is_active or user.session_version != version:
-            request.session.clear()
-            return None
-        return user
-
-    def flash(request: Request, message: str, tone: str = "ok") -> None:
-        request.session["flash"] = {"message": message, "tone": tone}
-
-    def context(request: Request, current_user: User | None = None, **values: object) -> dict:
-        return {
-            "request": request,
-            "current_user": current_user,
-            "csrf_token": csrf(request),
-            "flash": request.session.pop("flash", None),
-            **values,
-        }
+    ui = WebUI(templates)
+    user_for = ui.current_user
+    flash = ui.flash
+    context = ui.context
 
     @app.get("/healthz")
     def healthz() -> JSONResponse:
@@ -807,90 +759,14 @@ def create_app(
                 payload["error_codes"] = ["components_unavailable"]
         return JSONResponse(payload, status_code=status_code)
 
-    @app.get("/login", response_class=HTMLResponse)
-    def login_page(request: Request):
-        with sessions() as session:
-            if user_for(request, session):
-                return redirect("/")
-        return templates.TemplateResponse(request, "login.html", context(request))
-
-    @app.post("/login")
-    def login(
-        request: Request,
-        username: str = Form(),
-        password: str = Form(),
-        csrf_token: str = Form(),
-    ):
-        if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
-            return templates.TemplateResponse(
-                request,
-                "login.html",
-                context(request, error="页面已过期，请重试"),
-                status_code=400,
-            )
-        with sessions() as session:
-            user = authenticate(session, username, password)
-            if user is None:
-                return templates.TemplateResponse(
-                    request,
-                    "login.html",
-                    context(request, error="用户名或密码错误"),
-                    status_code=401,
-                )
-            request.session.clear()
-            request.session.update(
-                {
-                    "user_id": user.id,
-                    "session_version": user.session_version,
-                    "csrf_token": new_csrf_token(),
-                }
-            )
-        return redirect("/")
-
-    @app.post("/logout")
-    def logout(request: Request, csrf_token: str = Form()):
-        if verify_csrf_token(request.session.get("csrf_token"), csrf_token):
-            request.session.clear()
-        return redirect("/login")
-
-    @app.get("/account", response_class=HTMLResponse)
-    def account_page(request: Request):
-        with sessions() as session:
-            current = user_for(request, session)
-            if current is None:
-                return redirect("/login")
-            return templates.TemplateResponse(
-                request,
-                "account.html",
-                context(request, current),
-            )
-
-    @app.post("/account/password")
-    def change_own_password(
-        request: Request,
-        csrf_token: str = Form(),
-        current_password: str = Form(),
-        new_password: str = Form(min_length=8),
-    ):
-        with sessions() as session:
-            current = user_for(request, session)
-            if current is None:
-                return redirect("/login")
-            if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
-                return HTMLResponse("Invalid CSRF token", status_code=400)
-            if not verify_password(current_password, current.password_hash):
-                return templates.TemplateResponse(
-                    request,
-                    "account.html",
-                    context(request, current, error="当前密码错误"),
-                    status_code=400,
-                )
-            current.password_hash = hash_password(new_password)
-            current.session_version += 1
-            session.commit()
-            request.session["session_version"] = current.session_version
-            flash(request, "密码已更新")
-        return redirect("/account")
+    app.include_router(build_auth_router(ui=ui, session_factory=sessions))
+    app.include_router(
+        build_user_router(
+            ui=ui,
+            session_factory=sessions,
+            cancel_running_task=lambda task_id: app.state.orchestrator.cancel(task_id),
+        )
+    )
 
     @app.get("/", response_class=HTMLResponse)
     def dashboard(request: Request, repository: int | None = None):
@@ -1033,21 +909,6 @@ def create_app(
                     ),
                     forge_status=forge_status(),
                 ),
-            )
-
-    @app.get("/users", response_class=HTMLResponse)
-    def users_page(request: Request):
-        with sessions() as session:
-            current = user_for(request, session)
-            if current is None:
-                return redirect("/login")
-            if current.role != "admin":
-                return HTMLResponse("Forbidden", status_code=403)
-            users = session.scalars(select(User).order_by(User.created_at)).all()
-            return templates.TemplateResponse(
-                request,
-                "users.html",
-                context(request, current, users=users),
             )
 
     @app.get("/system", response_class=HTMLResponse)
@@ -1326,111 +1187,6 @@ def create_app(
                 return redirect("/system")
         flash(request, "飞书测试消息已发送")
         return redirect("/system")
-
-    @app.post("/users")
-    def add_user(
-        request: Request,
-        username: str = Form(),
-        password: str = Form(),
-        csrf_token: str = Form(),
-    ):
-        with sessions() as session:
-            current = user_for(request, session)
-            if current is None:
-                return redirect("/login")
-            if current.role != "admin":
-                return HTMLResponse("Forbidden", status_code=403)
-            if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
-                return HTMLResponse("Invalid CSRF token", status_code=400)
-            try:
-                user = create_user(session, username, password)
-                flash(request, f"用户 {user.username} 已添加")
-            except ValueError as exc:
-                message = {
-                    "invalid user": "用户名格式无效",
-                    "password too short": "密码至少需要 8 位",
-                    "username already exists": "用户名已存在",
-                }.get(str(exc), str(exc))
-                flash(request, message, "danger")
-        return redirect("/users")
-
-    @app.post("/users/{user_id}/toggle")
-    def toggle_user(request: Request, user_id: int, csrf_token: str = Form()):
-        running_task_ids: list[int] = []
-        with sessions() as session:
-            current = user_for(request, session)
-            if current is None:
-                return redirect("/login")
-            if current.role != "admin":
-                return HTMLResponse("Forbidden", status_code=403)
-            if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
-                return HTMLResponse("Invalid CSRF token", status_code=400)
-            target = session.get(User, user_id)
-            if target is None:
-                return HTMLResponse("Not found", status_code=404)
-            if target.id == current.id:
-                return HTMLResponse("管理员不能停用当前账号", status_code=409)
-            target.is_active = not target.is_active
-            target_username = target.username
-            target_is_active = target.is_active
-            target.session_version += 1
-            if not target.is_active:
-                tasks = session.scalars(
-                    select(Task).where(
-                        Task.created_by == target.id,
-                        Task.status.in_(("queued", *RUNNING_TASK_STATES)),
-                    )
-                ).all()
-                for task in tasks:
-                    if task.status == "queued":
-                        cas_task_status(
-                            session,
-                            task.id,
-                            expected="queued",
-                            new_status="cancelled",
-                            updates={"finished_at": datetime.now(UTC)},
-                        )
-                    else:
-                        if cas_task_status(
-                            session,
-                            task.id,
-                            expected=task.status,
-                            new_status="cancelling",
-                        ):
-                            running_task_ids.append(task.id)
-            session.commit()
-        for task_id in running_task_ids:
-            app.state.orchestrator.cancel(task_id)
-        flash(
-            request,
-            f"用户 {target_username} 已{'启用' if target_is_active else '停用'}",
-        )
-        return redirect("/users")
-
-    @app.post("/users/{user_id}/reset-password")
-    def reset_user_password(
-        request: Request,
-        user_id: int,
-        csrf_token: str = Form(),
-        password: str = Form(min_length=8),
-    ):
-        with sessions() as session:
-            current = user_for(request, session)
-            if current is None:
-                return redirect("/login")
-            if current.role != "admin":
-                return HTMLResponse("Forbidden", status_code=403)
-            if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
-                return HTMLResponse("Invalid CSRF token", status_code=400)
-            target = session.get(User, user_id)
-            if target is None:
-                return HTMLResponse("Not found", status_code=404)
-            target.password_hash = hash_password(password)
-            target.session_version += 1
-            target_username = target.username
-            session.commit()
-            flash(request, f"用户 {target_username} 的密码已重置")
-        return redirect("/users")
 
     @app.get("/repositories", response_class=HTMLResponse)
     def repositories_page(request: Request):
