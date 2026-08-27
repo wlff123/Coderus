@@ -11,14 +11,15 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+import uvicorn
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-import coderus.web.app as app_module
 from coderus.auth.service import create_user
 from coderus.config import DatabaseSettings, Settings
+from coderus.db import create_engine_from_settings
 from coderus.forge import ForgeCapability, ForgeRegistration, GitCodeForge
 from coderus.models import (
     AgentRun,
@@ -247,7 +248,7 @@ def test_explicit_preview_requires_isolated_runtime_confirmation(
 def test_explicit_preview_does_not_run_active_recovery(
     app_settings: Settings,
 ) -> None:
-    engine = app_module.create_engine_from_settings(app_settings.database)
+    engine = create_engine_from_settings(app_settings.database)
     Base.metadata.create_all(engine)
     with Session(engine) as session:
         owner = create_user(session, "preview-owner", "password-123", role="admin")
@@ -520,7 +521,7 @@ def test_proxy_task_failure_cleans_owned_resources_and_preserves_error(
             await asyncio.sleep(0)
             raise RuntimeError("proxy task exploded")
 
-    monkeypatch.setattr(app_module.uvicorn, "Server", FailingProxyServer)
+    monkeypatch.setattr(uvicorn, "Server", FailingProxyServer)
     settings = app_settings.model_copy(
         update={
                 "model_api_key": SecretStr("model-api-key"),
