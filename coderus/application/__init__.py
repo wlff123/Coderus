@@ -2,6 +2,11 @@
 
 from coderus.application.errors import CommandError, Conflict, Forbidden, NotFound
 from coderus.application.issues import IssueCommands, IssueRef
+from coderus.application.repositories import (
+    RepositoryCommands,
+    RepositoryRef,
+    SyncFailed,
+)
 from coderus.application.reviews import ReviewCommands, ReviewSource
 from coderus.application.tasks import CancelResult, TaskCommands
 
@@ -13,7 +18,10 @@ __all__ = [
     "IssueCommands",
     "IssueRef",
     "NotFound",
+    "RepositoryCommands",
+    "RepositoryRef",
     "ReviewCommands",
     "ReviewSource",
+    "SyncFailed",
     "TaskCommands",
 ]

@@ -257,8 +257,7 @@ def create_app(
         build_repository_router(
             ui=ui,
             session_factory=sessions,
-            providers=app.state.providers,
-            forges=app.state.forges,
+            repositories=components.repository_commands,
             issue_poller=components.issue_poller,
             forge_status=forge_status,
         )

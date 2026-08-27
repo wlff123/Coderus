@@ -19,6 +19,7 @@ import uvicorn
 from sqlalchemy import select
 
 from coderus.application import IssueCommands, ReviewCommands, TaskCommands
+from coderus.application.repositories import RepositoryCommands
 from coderus.assistant import ModelAssistant
 from coderus.auth.service import ensure_bootstrap_admin
 from coderus.config import Settings
@@ -53,6 +54,7 @@ from coderus.release_gate import ReleaseGate
 from coderus.runner import LocalCodexRunner, RunnerConfig, resolve_codex_command
 from coderus.security import CredentialCipher
 from coderus.web.forge_runtime import build_gitcode_runtime, build_github_runtime
+from coderus.web.presentation import provider_error_message
 from coderus.workflow.limited_runner import LimitedRunner
 from coderus.workflow.notifications import FeishuTaskNotifier
 from coderus.workflow.orchestrator import TaskOrchestrator
@@ -80,6 +82,7 @@ class RuntimeComponents:
         issue_commands: IssueCommands,
         review_commands: ReviewCommands,
         task_commands: TaskCommands,
+        repository_commands: RepositoryCommands,
         issue_poller: IssuePoller,
         scheduler: TaskScheduler,
         pr_status_poller: PRStatusPoller,
@@ -98,6 +101,7 @@ class RuntimeComponents:
         self.issue_commands = issue_commands
         self.review_commands = review_commands
         self.task_commands = task_commands
+        self.repository_commands = repository_commands
         self.issue_poller = issue_poller
         self.scheduler = scheduler
         self.pr_status_poller = pr_status_poller
@@ -374,6 +378,12 @@ def build_runtime(
     issue_commands = IssueCommands(session_factory=sessions, providers=state.providers)
     review_commands = ReviewCommands(session_factory=sessions, forges=state.forges)
     task_commands = TaskCommands(session_factory=sessions, forges=state.forges)
+    repository_commands = RepositoryCommands(
+        session_factory=sessions,
+        providers=state.providers,
+        forges=state.forges,
+        error_formatter=provider_error_message,
+    )
 
     assistant = None
     if settings.assistant.enabled and settings.model_api_key is not None:
@@ -547,6 +557,7 @@ def build_runtime(
         issue_commands=issue_commands,
         review_commands=review_commands,
         task_commands=task_commands,
+        repository_commands=repository_commands,
         issue_poller=issue_poller,
         scheduler=scheduler,
         pr_status_poller=pr_status_poller,

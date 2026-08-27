@@ -2,20 +2,18 @@
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from coderus.application import Conflict, NotFound
+from coderus.application.repositories import RepositoryCommands, SyncFailed
 from coderus.auth.security import verify_csrf_token
-from coderus.forge import ForgeCapability, ForgeRegistry
 from coderus.issues.poller import IssuePoller
-from coderus.issues.service import sync_repository
 from coderus.models import Repository
-from coderus.providers.urls import parse_repository_url
 from coderus.web.presentation import provider_error_message
 from coderus.web.ui import WebUI, redirect
 
@@ -24,12 +22,23 @@ def build_repository_router(
     *,
     ui: WebUI,
     session_factory: Callable[[], Session],
-    providers: Mapping[str, object],
-    forges: ForgeRegistry,
+    repositories: RepositoryCommands,
     issue_poller: IssuePoller,
     forge_status: Callable[[], dict[str, dict[str, bool | str]]],
 ) -> APIRouter:
     router = APIRouter()
+
+    def admin_or_response(request: Request, csrf_token: str):
+        with session_factory() as session:
+            current = ui.current_user(request, session)
+            if current is None:
+                return None, redirect("/login")
+            if current.role != "admin":
+                return None, HTMLResponse("Forbidden", status_code=403)
+            current_id = current.id
+        if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
+            return None, HTMLResponse("Invalid CSRF token", status_code=400)
+        return current_id, None
 
     @router.get("/repositories", response_class=HTMLResponse)
     def repositories_page(request: Request):
@@ -39,7 +48,7 @@ def build_repository_router(
                 return redirect("/login")
             if current.role != "admin":
                 return HTMLResponse("Forbidden", status_code=403)
-            repositories = session.scalars(
+            rows = session.scalars(
                 select(Repository).order_by(Repository.created_at)
             ).all()
             return ui.templates.TemplateResponse(
@@ -48,7 +57,7 @@ def build_repository_router(
                 ui.context(
                     request,
                     current,
-                    repositories=repositories,
+                    repositories=rows,
                     forge_status=forge_status(),
                 ),
             )
@@ -59,108 +68,57 @@ def build_repository_router(
         url: str = Form(),
         csrf_token: str = Form(),
     ):
-        with session_factory() as session:
-            current = ui.current_user(request, session)
-            if current is None:
-                return redirect("/login")
-            if current.role != "admin":
-                return HTMLResponse("Forbidden", status_code=403)
-            if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
-                return HTMLResponse("Invalid CSRF token", status_code=400)
-            try:
-                parsed = parse_repository_url(url)
-                provider = providers[parsed.provider]
-                metadata = await asyncio.to_thread(
-                    provider.get_repository, parsed.canonical_url
-                )
-                if metadata.is_private or metadata.issues_enabled is False:
-                    raise ValueError("仓库必须公开且启用 Issue")
-                fork = None
-                forge = forges.get(metadata.provider)
-                if forges.supports(metadata.provider, ForgeCapability.ENSURE_FORK):
-                    fork = await forge.ensure_fork(metadata.owner, metadata.name)
-                repository = Repository(
-                    provider=metadata.provider,
-                    owner=metadata.owner,
-                    name=metadata.name,
-                    canonical_url=metadata.canonical_url,
-                    default_branch=metadata.default_branch or "main",
-                    fork_owner=fork.owner if fork else None,
-                    fork_url=fork.url if fork else None,
-                    created_by=current.id,
-                )
-                session.add(repository)
-                session.commit()
-                ui.flash(request, f"仓库 {repository.owner}/{repository.name} 已添加")
-            except Exception as exc:
-                session.rollback()
-                ui.flash(request, provider_error_message(exc), "danger")
+        current_id, error = admin_or_response(request, csrf_token)
+        if error is not None:
+            return error
+        try:
+            ref = await repositories.add(url, current_id)
+            ui.flash(request, f"仓库 {ref.owner}/{ref.name} 已添加")
+        except Exception as exc:
+            ui.flash(request, provider_error_message(exc), "danger")
         return redirect("/repositories")
 
     @router.post("/repositories/{repository_id}/sync")
     def force_sync(request: Request, repository_id: int, csrf_token: str = Form()):
-        with session_factory() as session:
-            current = ui.current_user(request, session)
-            if current is None:
-                return redirect("/login")
-            if current.role != "admin":
-                return HTMLResponse("Forbidden", status_code=403)
-            if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
-                return HTMLResponse("Invalid CSRF token", status_code=400)
-            repository = session.get(Repository, repository_id)
-            if repository is None:
-                return HTMLResponse("Not found", status_code=404)
-            if repository.sync_status == "running":
-                ui.flash(request, "仓库正在同步，请稍后刷新状态", "warning")
-                return redirect("/repositories")
-            try:
-                sync_repository(session, repository, providers[repository.provider])
-                session.commit()
-                ui.flash(request, f"{repository.owner}/{repository.name} 同步完成")
-            except Exception as exc:
-                repository.sync_status = "failed"
-                repository.last_sync_error = provider_error_message(exc)[:1000]
-                session.commit()
-                ui.flash(request, repository.last_sync_error, "danger")
+        _, error = admin_or_response(request, csrf_token)
+        if error is not None:
+            return error
+        try:
+            ref = repositories.sync(repository_id)
+            ui.flash(request, f"{ref.owner}/{ref.name} 同步完成")
+        except NotFound:
+            return HTMLResponse("Not found", status_code=404)
+        except Conflict as exc:
+            ui.flash(request, str(exc), "warning")
+        except SyncFailed as exc:
+            ui.flash(request, str(exc), "danger")
         return redirect("/repositories")
 
     @router.post("/repositories/{repository_id}/toggle")
     def toggle_repository(
         request: Request, repository_id: int, csrf_token: str = Form()
     ):
-        with session_factory() as session:
-            current = ui.current_user(request, session)
-            if current is None:
-                return redirect("/login")
-            if current.role != "admin":
-                return HTMLResponse("Forbidden", status_code=403)
-            if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
-                return HTMLResponse("Invalid CSRF token", status_code=400)
-            repository = session.get(Repository, repository_id)
-            if repository is None:
-                return HTMLResponse("Not found", status_code=404)
-            if repository.sync_status == "running":
-                ui.flash(request, "仓库正在同步，当前不能修改启用状态", "warning")
-                return redirect("/repositories")
-            repository.is_enabled = not repository.is_enabled
-            session.commit()
+        _, error = admin_or_response(request, csrf_token)
+        if error is not None:
+            return error
+        try:
+            ref = repositories.toggle(repository_id)
             ui.flash(
                 request,
-                f"{repository.owner}/{repository.name} "
-                f"已{'启用' if repository.is_enabled else '停用'}",
+                f"{ref.owner}/{ref.name} 已{'启用' if ref.is_enabled else '停用'}",
             )
+        except NotFound:
+            return HTMLResponse("Not found", status_code=404)
+        except Conflict as exc:
+            ui.flash(request, str(exc), "warning")
         return redirect("/repositories")
 
     @router.post("/repositories/sync-all")
     async def force_sync_all(request: Request, csrf_token: str = Form()):
+        _, error = admin_or_response(request, csrf_token)
+        if error is not None:
+            return error
         with session_factory() as session:
-            current = ui.current_user(request, session)
-            if current is None:
-                return redirect("/login")
-            if current.role != "admin":
-                return HTMLResponse("Forbidden", status_code=403)
-            if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
-                return HTMLResponse("Invalid CSRF token", status_code=400)
             if session.scalar(
                 select(func.count())
                 .select_from(Repository)
