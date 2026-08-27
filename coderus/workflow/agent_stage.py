@@ -14,6 +14,7 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from coderus.model_proxy import issued_stage_token
 from coderus.models import AgentRun
 from coderus.runner import AgentRole, JobSpec, JobStatus, Stage
 from coderus.workflow.developer_report import (
@@ -81,14 +82,12 @@ class AgentStageExecutor:
         self.transition(task_id, status, claim_token)
         run_id, attempt = self._begin_agent_run(task_id, role)
         try:
-            proxy_token = None
-            if self.credential_broker is not None:
-                proxy_token = self.credential_broker.issue(
-                    task_id=f"task-{task_id}",
-                    stage=stage.value,
-                    ttl_seconds=self.stage_timeout_seconds + 300,
-                )
-            try:
+            with issued_stage_token(
+                self.credential_broker,
+                task_id=f"task-{task_id}",
+                stage=stage.value,
+                ttl_seconds=self.stage_timeout_seconds + 300,
+            ) as proxy_token:
                 spec = JobSpec(
                     job_id=f"task-{task_id}-{role.value}-{attempt}",
                     stage=stage,
@@ -107,9 +106,6 @@ class AgentStageExecutor:
                     lambda: self.runner.run(spec, cancel_event=cancel_event),
                     _noop_checkpoint_restore,
                 )
-            finally:
-                if proxy_token is not None:
-                    self.credential_broker.revoke(proxy_token)
             developer_report = None
             if result.status is JobStatus.SUCCEEDED and role == AgentRole.DEVELOPER:
                 developer_report = parse_developer_report(final_message(result.stdout))

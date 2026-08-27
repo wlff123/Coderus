@@ -4,10 +4,30 @@ import hashlib
 import secrets
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 _RESPONSES_ENDPOINT = "/v1/responses"
+
+
+@contextmanager
+def issued_stage_token(
+    broker: CredentialBroker | None,
+    *,
+    task_id: str,
+    stage: str,
+    ttl_seconds: float,
+) -> Iterator[str | None]:
+    """为一个 Agent 阶段签发短时令牌，退出时撤销；未配置代理时产出 None。"""
+    if broker is None:
+        yield None
+        return
+    token = broker.issue(task_id=task_id, stage=stage, ttl_seconds=ttl_seconds)
+    try:
+        yield token
+    finally:
+        broker.revoke(token)
 
 
 class LeaseRejected(Exception):

@@ -13,6 +13,7 @@ from sqlalchemy import case, update
 from sqlalchemy.orm import Session
 
 from coderus.forge import ForgeRegistry, ProviderName
+from coderus.model_proxy import issued_stage_token
 from coderus.models import PRReviewTask
 from coderus.pr_review.instructions import build_review_instructions
 from coderus.pr_review.models import ReviewInput, ReviewOutput
@@ -288,14 +289,12 @@ class PRReviewOrchestrator:
             head_sha=head_sha,
             material=material,
         )
-        token = None
-        if self.credential_broker is not None:
-            token = self.credential_broker.issue(
-                task_id=f"task-{task.id}",
-                stage=Stage.PR_REVIEW.value,
-                ttl_seconds=self.stage_timeout_seconds + 300,
-            )
-        try:
+        with issued_stage_token(
+            self.credential_broker,
+            task_id=f"task-{task.id}",
+            stage=Stage.PR_REVIEW.value,
+            ttl_seconds=self.stage_timeout_seconds + 300,
+        ) as token:
             spec = JobSpec(
                 job_id=f"pr-review-{task.id}",
                 stage=Stage.PR_REVIEW,
@@ -339,9 +338,6 @@ class PRReviewOrchestrator:
                 )
             except ReviewOutputError as exc:
                 raise PRReviewError(f"Codex 检视输出无效：{exc}") from exc
-        finally:
-            if token is not None:
-                self.credential_broker.revoke(token)
 
     def _load_task(self, task_id: int) -> _TaskContext:
         with self.sessions() as session:
