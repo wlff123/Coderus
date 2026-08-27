@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import shutil
@@ -497,7 +498,9 @@ class PRWorkspace:
                     watch_path=watch_path,
                     max_path_bytes=self.max_workspace_bytes,
                 )
-                if path_size_exceeds(watch_path, self.max_workspace_bytes):
+                if await asyncio.to_thread(
+                    path_size_exceeds, watch_path, self.max_workspace_bytes
+                ):
                     raise CommandResourceLimitExceeded("command path size limit exceeded")
             except CommandTimedOut:
                 raise RuntimeError("Git command timed out") from None

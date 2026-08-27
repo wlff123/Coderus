@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
 
+import coderus.pr_review.workspace as workspace_module
 from coderus.pr_review.workspace import PRWorkspace
+from coderus.processes import ProcessResult
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -18,6 +22,30 @@ def git(cwd: Path, *args: str) -> str:
         text=True,
     )
     return completed.stdout.strip()
+
+
+@pytest.mark.asyncio
+async def test_git_size_check_does_not_block_the_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = PRWorkspace(tmp_path / "workspaces")
+    event_loop = asyncio.get_running_loop()
+    event_loop_responsive = asyncio.Event()
+
+    async def fake_run_process(*args, **kwargs) -> ProcessResult:
+        return ProcessResult(returncode=0, stdout=b"", stderr=b"")
+
+    def slow_size_check(path: Path, limit: int) -> bool:
+        event_loop.call_soon_threadsafe(event_loop_responsive.set)
+        time.sleep(0.05)
+        return False
+
+    monkeypatch.setattr(workspace_module, "run_process", fake_run_process)
+    monkeypatch.setattr(workspace_module, "path_size_exceeds", slow_size_check)
+
+    await manager._run("git", "status", cwd=tmp_path)
+
+    assert event_loop_responsive.is_set()
 
 
 def create_upstream(tmp_path: Path) -> tuple[Path, str, str]:
