@@ -2,14 +2,25 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import json
 import os
 import secrets
+import sqlite3
+import sys
 from base64 import urlsafe_b64encode
 from pathlib import Path
 
 import uvicorn
+import yaml
+from sqlalchemy import create_engine, select
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import Session, selectinload
 
 from coderus.config import Settings, load_settings
+from coderus.evaluation.collector import collect_baseline
+from coderus.evaluation.io import load_selection, write_report
+from coderus.models import Issue, Task
+from coderus.tasks.statuses import TERMINAL_TASK_STATES
 from coderus.web.app import create_app
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -149,18 +160,97 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--database", type=Path)
     serve.add_argument("--workspace", type=Path)
     serve.add_argument("--artifacts", type=Path)
+    evaluation = subparsers.add_parser(
+        "eval", help="read-only evaluation baseline commands"
+    )
+    eval_commands = evaluation.add_subparsers(dest="eval_command", required=True)
+    candidates = eval_commands.add_parser(
+        "candidates", help="list recent terminal issue tasks"
+    )
+    candidates.add_argument("--config", type=Path, default=Path("config.yaml"))
+    candidates.add_argument("--limit", type=int, default=20)
+    baseline = eval_commands.add_parser(
+        "baseline", help="collect a baseline report from a selection file"
+    )
+    baseline.add_argument("--config", type=Path, default=Path("config.yaml"))
+    baseline.add_argument("--selection", type=Path, required=True)
+    baseline.add_argument("--output", type=Path, required=True)
     return parser
 
 
-def main() -> None:
-    args = build_parser().parse_args()
+def _configured_database_path(config_path: Path) -> Path:
+    settings = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    raw = Path((settings.get("database") or {}).get("path") or "data/coderus.db")
+    raw = raw.expanduser()
+    if raw.is_absolute():
+        return raw.resolve()
+    return (config_path.parent.expanduser().resolve() / raw).resolve()
+
+
+def _read_only_engine(database_path: Path):
+    return create_engine(
+        "sqlite://",
+        creator=lambda: sqlite3.connect(
+            f"file:{database_path.as_posix()}?mode=ro", uri=True
+        ),
+    )
+
+
+def _list_candidates(session: Session, limit: int) -> list[dict]:
+    tasks = session.scalars(
+        select(Task)
+        .where(Task.status.in_(TERMINAL_TASK_STATES))
+        .options(selectinload(Task.issue).selectinload(Issue.repository))
+        .order_by(Task.finished_at.desc().nullslast(), Task.id.desc())
+        .limit(limit)
+    )
+    return [
+        {
+            "task_key": f"RE-{task.id}",
+            "provider": task.issue.repository.provider,
+            "repository": (
+                f"{task.issue.repository.owner}/{task.issue.repository.name}"
+            ),
+            "issue_number": task.issue.number,
+            "status": task.status,
+        }
+        for task in tasks
+    ]
+
+
+def run_eval(args: argparse.Namespace) -> int:
+    if args.eval_command == "candidates" and not 10 <= args.limit <= 100:
+        print("error: --limit must be between 10 and 100", file=sys.stderr)
+        return 1
+    engine = _read_only_engine(_configured_database_path(args.config))
+    try:
+        with Session(engine) as session:
+            if args.eval_command == "candidates":
+                listed = _list_candidates(session, args.limit)
+                print(json.dumps(listed, ensure_ascii=False, indent=2))
+                return 0
+            report = collect_baseline(session, load_selection(args.selection))
+            write_report(args.output, report)
+            print(f"{args.output.name}: {len(report.records)} tasks")
+            return 0
+    except (ValueError, OperationalError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        engine.dispose()
+
+
+def run_cli(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
     if args.command == "init":
         password = args.admin_password
         if password is None and os.isatty(0):
             password = getpass.getpass("管理员初始密码（留空自动生成）: ") or None
         password = initialize_local(args.config, args.secrets, admin_password=password)
         print(f"配置已创建。管理员用户名：admin，初始密码：{password}")
-        return
+        return 0
+    if args.command == "eval":
+        return run_eval(args)
 
     environment = {**load_env_file(args.secrets), **os.environ}
     settings = load_settings(args.config, environment)
@@ -177,6 +267,11 @@ def main() -> None:
         workers=1,
         proxy_headers=settings.server.mode == "public",
     )
+    return 0
+
+
+def main() -> None:
+    raise SystemExit(run_cli())
 
 
 if __name__ == "__main__":
