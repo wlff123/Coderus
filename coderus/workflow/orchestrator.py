@@ -14,16 +14,19 @@ from sqlalchemy.orm import Session, selectinload
 
 from coderus.forge import ForgeCapability, ForgeRegistry
 from coderus.models import AgentRun, Issue, PRFeedback, Review, Task
-from coderus.runner import AgentRole, JobSpec, JobStatus, Stage
+from coderus.runner import AgentRole, JobStatus, Stage
 from coderus.tasks.statuses import TERMINAL_TASK_STATES
+from coderus.workflow.agent_stage import (
+    AgentStageExecutor,
+    TaskCancelled,
+    final_message,
+)
 from coderus.workflow.developer_report import (
     DeveloperReport,
     DeveloperReportError,
-    developer_report_schema_path,
     parse_developer_report,
     render_developer_report,
 )
-from coderus.workflow.limited_runner import retry_agent_operation
 from coderus.workflow.prompts import (
     developer_prompt,
     feedback_prompt,
@@ -35,17 +38,11 @@ from coderus.workflow.reviewer_result import (
     REVIEWER_CONTRACT_VERSION,
     ReviewerResultError,
     parse_reviewer_result,
-    reviewer_result_schema_path,
 )
 from coderus.workflow.task_state import cas_task_status, claim_queued_task
 
 CLAIM_LEASE_SECONDS = 120.0
 CLAIM_HEARTBEAT_SECONDS = 10.0
-
-
-async def _noop_checkpoint_restore() -> None:
-    # RetryableAgentError is only raised before the child process starts.
-    return None
 
 _STATUS_EXPECTED = {
     "preparing": {"queued"},
@@ -59,11 +56,7 @@ _CLAIMED_STATES = (*_STATUS_EXPECTED, "cancelling")
 
 
 class Runner(Protocol):
-    async def run(self, spec: JobSpec, *, cancel_event: asyncio.Event): ...
-
-
-class TaskCancelled(Exception):
-    pass
+    async def run(self, spec, *, cancel_event: asyncio.Event): ...
 
 
 class _ClaimLost(Exception):
@@ -96,6 +89,13 @@ class TaskOrchestrator:
         self.notifier = notifier
         self.credential_broker = credential_broker
         self._cancel_events: dict[int, asyncio.Event] = {}
+        self.stage_executor = AgentStageExecutor(
+            session_factory=session_factory,
+            runner=runner,
+            credential_broker=credential_broker,
+            stage_timeout_seconds=stage_timeout_seconds,
+            transition=self._set_status,
+        )
 
     def cancel(self, task_id: int) -> bool:
         event = self._cancel_events.get(task_id)
@@ -624,113 +624,16 @@ class TaskOrchestrator:
         prompt: str,
         claim_token: str,
     ):
-        self._set_status(task_id, status, claim_token)
-        with self.sessions() as session:
-            attempt = (
-                session.scalar(
-                    select(AgentRun.attempt)
-                    .where(AgentRun.task_id == task_id, AgentRun.role == role.value)
-                    .order_by(AgentRun.attempt.desc())
-                    .limit(1)
-                )
-                or 0
-            ) + 1
-            run = AgentRun(
-                task_id=task_id,
-                role=role.value,
-                attempt=attempt,
-                status="running",
-                started_at=datetime.now(UTC),
-            )
-            session.add(run)
-            session.commit()
-            run_id = run.id
-        try:
-            proxy_token = None
-            if self.credential_broker is not None:
-                proxy_token = self.credential_broker.issue(
-                    task_id=f"task-{task_id}",
-                    stage=stage.value,
-                    ttl_seconds=self.stage_timeout_seconds + 300,
-                )
-            try:
-                spec = JobSpec(
-                        job_id=f"task-{task_id}-{role.value}-{attempt}",
-                        stage=stage,
-                        role=role,
-                        workspace=workspace,
-                        prompt=prompt,
-                        timeout_seconds=self.stage_timeout_seconds,
-                        proxy_token=proxy_token,
-                        output_schema=(
-                            developer_report_schema_path()
-                            if role == AgentRole.DEVELOPER
-                            else reviewer_result_schema_path()
-                        ),
-                )
-                result = await retry_agent_operation(
-                    lambda: self.runner.run(
-                        spec,
-                        cancel_event=self._cancel_events[task_id],
-                    ),
-                    _noop_checkpoint_restore,
-                )
-            finally:
-                if proxy_token is not None:
-                    self.credential_broker.revoke(proxy_token)
-            developer_report = None
-            if result.status is JobStatus.SUCCEEDED and role == AgentRole.DEVELOPER:
-                developer_report = parse_developer_report(final_message(result.stdout))
-        except BaseException as exc:
-            self._finish_agent_run(
-                run_id,
-                status=(
-                    "interrupted"
-                    if isinstance(exc, asyncio.CancelledError)
-                    else "failed"
-                ),
-                error_summary=str(exc)[-2000:] or type(exc).__name__,
-            )
-            raise
-        self._finish_agent_run(
-            run_id,
-            status=result.status.value,
-            exit_code=result.exit_code,
-            stdout=result.stdout,
-            error_summary=result.stderr[-2000:] or None,
-            developer_report=developer_report,
+        return await self.stage_executor.execute(
+            task_id=task_id,
+            status=status,
+            stage=stage,
+            role=role,
+            workspace=workspace,
+            prompt=prompt,
+            claim_token=claim_token,
+            cancel_event=self._cancel_events[task_id],
         )
-        if result.status is JobStatus.CANCELLED:
-            raise TaskCancelled
-        if result.status is not JobStatus.SUCCEEDED:
-            raise RuntimeError(f"{role.value} failed: {result.stderr[-500:]}")
-        return result
-
-    def _finish_agent_run(
-        self,
-        run_id: int,
-        *,
-        status: str,
-        exit_code: int | None = None,
-        stdout: str | None = None,
-        error_summary: str | None = None,
-        developer_report: DeveloperReport | None = None,
-    ) -> None:
-        with self.sessions() as session:
-            run = session.get(AgentRun, run_id)
-            if run is None or run.status != "running":
-                return
-            run.status = status
-            run.finished_at = datetime.now(UTC)
-            run.exit_code = exit_code
-            if stdout is not None:
-                run.structured_result = {"stdout": stdout[-100_000:]}
-                if developer_report is not None:
-                    run.structured_result["developer_report"] = (
-                        developer_report.model_dump()
-                    )
-            run.error_summary = error_summary
-            session.commit()
 
     def _record_review(
         self, task_id: int, role: str, decision: str, findings: list[dict[str, Any]]
@@ -934,19 +837,6 @@ def deduplicate_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]
             seen.add(key)
             unique.append(finding)
     return unique
-
-
-def final_message(stdout: str) -> str:
-    message = ""
-    for line in stdout.splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        item = event.get("item", {}) if isinstance(event, dict) else {}
-        if event.get("type") == "item.completed" and item.get("type") == "agent_message":
-            message = str(item.get("text", ""))
-    return message or stdout[-8000:]
 
 
 def review_result(stdout: str) -> tuple[str, list[dict[str, Any]]]:
