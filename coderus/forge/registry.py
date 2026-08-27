@@ -5,10 +5,11 @@ from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
 
-from coderus.providers import ProviderName
+from coderus.forge.errors import ForgeError
+from coderus.forge.models import ProviderName
 
 
-class ForgeNotConfigured(ValueError):
+class ForgeNotConfigured(ForgeError, ValueError):
     _PLATFORM_NAMES = {"github": "GitHub", "gitcode": "GitCode"}
 
     def __init__(self, provider: ProviderName) -> None:

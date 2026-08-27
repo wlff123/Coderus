@@ -1,10 +1,16 @@
 from datetime import datetime
 from typing import Any, Literal, cast
 
-from .errors import ProviderRemoteError
-from .http import DEFAULT_RETRY_POLICY, HttpClient, RetryPolicy, default_http_client, get_json
-from .models import Issue, ProviderName, Repository
-from .urls import parse_issue_url, parse_repository_url
+from coderus.forge.errors import ProviderRemoteError
+from coderus.forge.http import (
+    DEFAULT_RETRY_POLICY,
+    HttpClient,
+    RetryPolicy,
+    default_http_client,
+    get_json,
+)
+from coderus.forge.models import Issue, ProviderName, Repository
+from coderus.forge.urls import parse_issue_url, parse_repository_url
 
 
 class GitCodeProvider:

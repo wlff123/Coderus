@@ -3,8 +3,8 @@ from datetime import datetime
 from typing import Any, cast
 from urllib.parse import parse_qs, urlsplit
 
-from .errors import ProviderRemoteError
-from .http import (
+from coderus.forge.errors import ProviderRemoteError
+from coderus.forge.http import (
     DEFAULT_RETRY_POLICY,
     HttpClient,
     RetryPolicy,
@@ -12,8 +12,8 @@ from .http import (
     get_json,
     get_json_response,
 )
-from .models import Issue, ProviderName, Repository
-from .urls import parse_issue_url, parse_repository_url
+from coderus.forge.models import Issue, ProviderName, Repository
+from coderus.forge.urls import parse_issue_url, parse_repository_url
 
 
 class GitHubProvider:

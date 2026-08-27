@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from coderus.forge.protocols import PublishRequest
 from coderus.models import Repository
-from coderus.publisher import GitCodePublisher
+from coderus.publisher.gitcode import GitCodePublisher
 
 
 class GitCodeForge:

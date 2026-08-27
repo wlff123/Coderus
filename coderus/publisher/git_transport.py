@@ -10,9 +10,9 @@ from pathlib import Path
 from typing import Protocol
 from urllib.parse import urlsplit
 
+from coderus.forge.errors import GitPushError, InvalidPublisherInput
 from coderus.processes import run_process_sync
 
-from .errors import GitPushError, InvalidPublisherInput
 from .models import GitCommandResult
 
 _GITHUB_OWNER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\Z")

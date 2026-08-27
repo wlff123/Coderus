@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from coderus.publisher import (
+from coderus.publisher.models import (
     ForkResult,
     PRCommentResult,
     PRFeedbackItem,
