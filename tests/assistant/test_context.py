@@ -34,7 +34,9 @@ def test_empty_database_snapshot(session: Session) -> None:
     context = build_context(session, "现在忙吗")
 
     assert "任务统计：" in context
-    assert "最近任务：暂无" in context
+    assert "PR 检视任务（RV）共 0" in context
+    assert "最近开发任务：暂无" in context
+    assert "最近 PR 检视任务：暂无" in context
     assert "已启用仓库：暂无" in context
 
 
@@ -45,6 +47,26 @@ def test_snapshot_lists_tasks_and_repositories(session: Session) -> None:
 
     assert f"RE-{task.id} [developer_working] octo/demo#1 crash on start" in context
     assert "github/octo/demo" in context
+
+
+def test_snapshot_counts_and_lists_review_tasks(session: Session) -> None:
+    task = seed_task(session)
+    review = PRReviewTask(
+        repository=task.issue.repository,
+        pr_number=7,
+        pr_url="https://github.com/octo/demo/pull/7",
+        status="completed",
+        source_chat_id="oc_1",
+        source_message_id="om_review",
+        source_sender_open_id="ou_1",
+    )
+    session.add(review)
+    session.commit()
+
+    context = build_context(session, "处理了多少检视任务")
+
+    assert "PR 检视任务（RV）共 1：completed 1" in context
+    assert f"RV-{review.id} [completed] octo/demo PR#7" in context
 
 
 def test_referenced_tasks_include_details_once(session: Session) -> None:
