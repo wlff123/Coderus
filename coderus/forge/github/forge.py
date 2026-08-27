@@ -6,9 +6,9 @@ from collections.abc import Callable
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from coderus.forge.github.pulls import GitHubPublisher
 from coderus.forge.protocols import PublishRequest
 from coderus.models import Repository
-from coderus.publisher.github import GitHubPublisher
 
 
 class GitHubForge:

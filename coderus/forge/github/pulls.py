@@ -15,10 +15,9 @@ from coderus.forge.errors import (
     UnsupportedPublisher,
 )
 from coderus.forge.errors import ProviderRemoteError as ProviderRequestError
+from coderus.forge.git_transport import GitRunner, HttpsGitPusher
 from coderus.forge.http import DEFAULT_RETRY_POLICY, RetryPolicy, request_with_backoff
-
-from .git_transport import GitRunner, HttpsGitPusher
-from .models import (
+from coderus.forge.models import (
     ForkResult,
     PRCommentResult,
     PRFeedbackItem,

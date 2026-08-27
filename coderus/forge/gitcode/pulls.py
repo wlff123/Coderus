@@ -17,17 +17,16 @@ from coderus.forge.errors import (
     UnsupportedPublisher,
 )
 from coderus.forge.errors import ProviderRemoteError as ProviderRequestError
+from coderus.forge.git_transport import HttpsGitPusher
 from coderus.forge.http import RetryPolicy, request_with_backoff
-from coderus.forge.urls import parse_pull_request_url
-
-from .git_transport import HttpsGitPusher
-from .models import (
+from coderus.forge.models import (
     ForkResult,
     PRCommentResult,
     PRFeedbackItem,
     PublishResult,
     PullRequestDetails,
 )
+from coderus.forge.urls import parse_pull_request_url
 
 _API_ROOT = "https://api.gitcode.com/api/v5"
 _NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\Z")

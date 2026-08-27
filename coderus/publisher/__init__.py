@@ -1,4 +1,6 @@
-from .errors import (
+"""迁移期转发：发布实现已并入 coderus.forge 的平台子包。"""
+
+from coderus.forge.errors import (
     ForkNotReady,
     GitPushError,
     InvalidPublisherInput,
@@ -7,10 +9,10 @@ from .errors import (
     RegisteredForkMismatch,
     UnsupportedPublisher,
 )
-from .git_transport import GitRunner, HttpsGitPusher, SubprocessGitRunner
-from .gitcode import GitCodePublisher
-from .github import GitHubPublisher
-from .models import (
+from coderus.forge.git_transport import GitRunner, HttpsGitPusher, SubprocessGitRunner
+from coderus.forge.gitcode.pulls import GitCodePublisher
+from coderus.forge.github.pulls import GitHubPublisher
+from coderus.forge.models import (
     ForkResult,
     GitCommandResult,
     PRCommentResult,

@@ -11,9 +11,8 @@ from typing import Protocol
 from urllib.parse import urlsplit
 
 from coderus.forge.errors import GitPushError, InvalidPublisherInput
+from coderus.forge.models import GitCommandResult
 from coderus.processes import run_process_sync
-
-from .models import GitCommandResult
 
 _GITHUB_OWNER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\Z")
 _REPOSITORY_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")

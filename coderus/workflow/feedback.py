@@ -6,8 +6,8 @@ from sqlalchemy import select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
+from coderus.forge.models import PRFeedbackItem
 from coderus.models import PRFeedback
-from coderus.publisher.models import PRFeedbackItem
 
 
 def upsert_pr_feedback(
