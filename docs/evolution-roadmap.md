@@ -13,7 +13,7 @@ Coderus 已经具备从人工派发 Issue 到开发 Agent 修复、双 Reviewer 
 
 下一阶段的主要问题是：
 
-1. **模块耦合**：`web/app.py` 承担装配、路由和业务逻辑（依赖 18 个内部模块）；`forge`、`providers`、`publisher` 三个模块重叠实现平台适配；`workflow/orchestrator.py` 将全部阶段逻辑内联；飞书入口直接编排 7 个业务模块，与网页各写一遍相同用例。
+1. **模块耦合**（阶段 1 已解决）：`web/app.py` 曾承担装配、路由和业务逻辑；`forge`、`providers`、`publisher` 曾三处重叠实现平台适配；`workflow/orchestrator.py` 曾将全部阶段逻辑内联；飞书入口曾与网页各写一遍相同用例。
 2. **任务类型硬编码**：Issue 修复（RE）和 PR 检视（RV）是两套独立写死的状态机，新增任务类型没有可复用骨架，与"工作平台"的目标冲突。
 3. **诊断与评测不足**：任务失败诊断成本较高，Agent 效果缺少统一评测基线。
 4. **首次部署门槛**：开源用户首次部署仍需要较多人工判断，缺少环境诊断和配置向导。
@@ -120,7 +120,9 @@ Issue 修复（RE）和 PR 检视（RV）是最先注册的两个任务类型；
 - 分支发布和 PR 创建、查询；
 - PR 元数据、差异和评论操作。
 
-GitHub 和 GitCode 分别实现该协议。现有 `provider`、`publisher` 和 `forge` 中重叠的网络、错误处理及模型转换逐步迁入平台适配器，迁移期间保持原接口兼容，不一次性重写。做完后接入新平台只需新增一个协议实现。
+GitHub 和 GitCode 分别实现该协议。原 `providers`、`publisher` 与 `forge` 的重叠实现已合并进 `coderus/forge`：统一错误层级、共享 HTTP 重试客户端、URL 解析和数据模型，平台实现收敛到 `forge/github/`、`forge/gitcode/` 子包。接入新平台只需新增一个子包实现。
+
+Issue 读取仍通过 `providers` 映射注入（允许无 Token 的匿名读取），将来任务类型注册阶段再评估是否并入 Forge 能力注册表。
 
 ### 5.5 基础设施层
 
@@ -284,17 +286,19 @@ coderus upgrade
 
 验收：后续工作流或提示词变更都能与统一基线比较。
 
-### 阶段 1：架构收敛（已完成主体）
+### 阶段 1：架构收敛（已完成）
 
 已交付：
 
 - `web/app.py` 拆分为 8 个路由模块（`web/routes/`）与运行时装配（`web/runtime.py`，lifespan 驱动）；
-- 应用服务层 `coderus/application`（IssueCommands、ReviewCommands、TaskCommands）上线，网页和飞书调用同一用例；
+- 应用服务层 `coderus/application`（IssueCommands、ReviewCommands、TaskCommands、RepositoryCommands）上线，网页和飞书调用同一用例；领域状态变更（派发、忽略/恢复、仓库管理、任务操作）全部经应用服务落库；
 - 编排器只保留租约、状态推进与顶层异常策略；Agent 阶段执行（`agent_stage`）、Reviewer 周期（`review_cycle`）、发布封装（`publication`）、提示词（`prompts`）各自独立且有专属测试；
+- `providers`、`publisher` 包删除，平台适配合并进 `coderus/forge`：统一错误层级（`ForgeError`/`InvalidForgeInput`/`ForgeRemoteError`）、共享 HTTP 重试客户端、URL 解析与数据模型，GitHub/GitCode 收敛为 `forge/github/`、`forge/gitcode/` 子包；
+- Issue 工作流与 PR 检视编排器共用基建原语：任务租约（`tasks/lease.py`）、短时凭据生命周期（`model_proxy.issued_stage_token`）、Agent 启动重试（`limited_runner`）；
 - Forge 发布接口收紧为 typed `PublishRequest`；
 - 页面、URL、数据库和任务行为保持兼容（由路由契约快照测试固定）。
 
-遗留（顺延后续阶段）：`providers`、`publisher`、`forge` 的重叠实现与平台错误模型合并；Issue provider 接口迁移。
+评估后不做：`pr_review` 复用 `AgentStageExecutor`（两者持久化模型不同——AgentRun 记账 vs `PRReviewTask.structured_result`，强行复用需要注入持久化策略，收益低于复杂度）；Issue 读取并入 Forge 能力注册表（会破坏无 Token 匿名读取，顺延至任务类型注册阶段一并考虑）。
 
 ### 阶段 2：可靠性与诊断
 

@@ -34,9 +34,11 @@ Coderus 将自动化编码限制在管理员授权的仓库和人工派发的任
 
 - `coderus/web/app.py` 只负责应用创建、middleware、health/readiness、静态文件和 Router 注册；运行时对象的构建和生命周期在 `coderus/web/runtime.py`（`build_runtime` + `RuntimeComponents.start/stop/close`，通过 FastAPI lifespan 驱动）。
 - 页面路由按域拆分在 `coderus/web/routes/`（auth、users、repositories、issues、dashboard、tasks、reviews、system），公共 UI 助手在 `coderus/web/ui.py`；依赖全部通过构造参数显式注入。
-- `coderus/application` 提供网页和飞书共用的用例入口：`IssueCommands`（添加与派发）、`ReviewCommands`（PR 检视入队）、`TaskCommands`（取消、关闭、意见同步、再发布），错误统一为 `NotFound`/`Forbidden`/`Conflict`。
+- `coderus/application` 提供网页和飞书共用的用例入口：`IssueCommands`（添加、派发、忽略/恢复）、`ReviewCommands`（PR 检视入队）、`TaskCommands`（取消、关闭、意见同步、再发布）、`RepositoryCommands`（仓库添加、同步、启停），错误统一为 `NotFound`/`Forbidden`/`Conflict`。领域状态变更全部经应用服务落库；路由仅保留鉴权、CSRF、纯查询和管理性 CRUD（用户、系统配置）。
 - `TaskOrchestrator` 只保留租约、状态推进、分支选择和顶层异常策略；Agent 阶段执行在 `workflow/agent_stage.py`、双 Reviewer 周期在 `workflow/review_cycle.py`、提交封装与 PR 发布在 `workflow/publication.py`、提示词纯函数在 `workflow/prompts.py`。
-- Forge 发布使用 typed `PublishRequest`（构造即校验 workspace、owner、分支等），不再接收任意 kwargs；Issue provider 接口暂未迁移。
+- `coderus/forge` 是平台适配的唯一入口：`forge/errors.py`（统一错误层级 `ForgeError`/`InvalidForgeInput`/`ForgeRemoteError`）、`forge/http.py`（带退避重试的共享 HTTP 客户端）、`forge/urls.py`（URL 解析）、`forge/models.py`（仓库/Issue/PR 数据模型）、`forge/git_transport.py`（受控 git 推送）；GitHub 与 GitCode 各自在 `forge/github/`、`forge/gitcode/` 子包内实现 `issues.py`（读取）、`pulls.py`（发布）与 `forge.py`（门面）。原 `providers`、`publisher` 包已删除。
+- Forge 发布使用 typed `PublishRequest`（构造即校验 workspace、owner、分支等），不再接收任意 kwargs。
+- 两个编排器共用的基建原语下沉：任务租约续期与心跳在 `tasks/lease.py`（`TaskLease` + `heartbeat_loop`），Agent 短时凭据生命周期在 `model_proxy`（`issued_stage_token`），Agent 启动重试在 `workflow/limited_runner.py`。
 
 ## 可靠性机制
 
