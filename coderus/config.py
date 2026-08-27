@@ -59,6 +59,10 @@ class CodexSettings(BaseModel):
     auth_mode: Literal["api_proxy"] = "api_proxy"
 
 
+class AssistantSettings(BaseModel):
+    enabled: bool = True
+
+
 class GitSettings(BaseModel):
     user_name: str = "Coderus Bot"
     user_email: str = "coderus@example.com"
@@ -72,6 +76,7 @@ class Settings(BaseModel):
     artifacts: ArtifactsSettings = Field(default_factory=ArtifactsSettings)
     scheduler: SchedulerSettings = Field(default_factory=SchedulerSettings)
     codex: CodexSettings = Field(default_factory=CodexSettings)
+    assistant: AssistantSettings = Field(default_factory=AssistantSettings)
     git: GitSettings = Field(default_factory=GitSettings)
     session_secret: SecretStr = Field(
         validation_alias=AliasChoices("session_secret", "CODERUS_SESSION_SECRET"),

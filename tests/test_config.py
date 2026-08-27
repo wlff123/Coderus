@@ -31,6 +31,13 @@ def test_local_mode_uses_safe_defaults(tmp_path: Path) -> None:
     assert settings.scheduler.max_agent_processes == 16
     assert settings.codex.sandbox_mode == "workspace-write"
     assert settings.codex.auth_mode == "api_proxy"
+    assert settings.assistant.enabled is True
+
+
+def test_assistant_can_be_disabled() -> None:
+    settings = Settings.model_validate({**SECRETS, "assistant": {"enabled": False}})
+
+    assert settings.assistant.enabled is False
 
 
 def test_codex_sandbox_mode_can_be_configured_for_container() -> None:

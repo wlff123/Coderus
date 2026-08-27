@@ -24,6 +24,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 from starlette.middleware.sessions import SessionMiddleware
 
+from coderus.assistant import ModelAssistant
 from coderus.auth.security import (
     hash_password,
     new_csrf_token,
@@ -426,6 +427,13 @@ def create_app(
             params["repository"] = str(repository_id)
         return f"{path}?{urlencode(params)}" if params else path
 
+    assistant = None
+    if settings.assistant.enabled and settings.model_api_key is not None:
+        assistant = ModelAssistant(
+            base_url=settings.codex.base_url,
+            api_key=settings.model_api_key.get_secret_value(),
+            model=settings.codex.model,
+        )
     notifier = None
     feishu_bot = None
     feishu_client = None
@@ -452,6 +460,7 @@ def create_app(
                     session_factory=sessions,
                     providers=app.state.providers,
                     forges=app.state.forges,
+                    assistant=assistant,
                     can_mutate=lambda: (
                         release_gate.allows_work() and app.state.codex_auth.ready
                     ),

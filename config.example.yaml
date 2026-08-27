@@ -35,6 +35,10 @@ codex:
   stage_timeout_seconds: 3600
   sandbox_mode: workspace-write
 
+# 飞书智能回答：默认开启；需要同时配置模型 API（CODERUS_MODEL_API_KEY 等）才会生效。
+assistant:
+  enabled: true
+
 git:
   user_name: Coderus Bot
   user_email: coderus@example.com

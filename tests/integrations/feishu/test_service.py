@@ -61,11 +61,18 @@ def test_missing_sender_is_rejected_and_audited(engine) -> None:
         assert event.reply_status == "pending"
 
 
-def service(engine, providers=None, *, forges: ForgeRegistry | None = None) -> FeishuCommandService:
+def service(
+    engine,
+    providers=None,
+    *,
+    forges: ForgeRegistry | None = None,
+    assistant=None,
+) -> FeishuCommandService:
     return FeishuCommandService(
         session_factory=create_session_factory(engine),
         providers=providers or {},
         forges=forges or ForgeRegistry({"github": FakeReviewForge()}),
+        assistant=assistant,
     )
 
 
@@ -633,3 +640,55 @@ def test_review_hides_invalid_provider_url_error(engine) -> None:
         event = session.query(FeishuEvent).one()
         assert event.status == "failed"
         assert event.error_summary == "InvalidProviderUrl"
+
+
+class FakeAssistant:
+    def __init__(self, reply: str = "智能回答内容") -> None:
+        self.reply = reply
+        self.questions: list[str] = []
+
+    def answer(self, question: str, session) -> str:
+        self.questions.append(question)
+        return self.reply
+
+
+def test_free_form_question_routes_to_assistant(engine) -> None:
+    assistant = FakeAssistant()
+
+    reply = service(engine, assistant=assistant).handle(message("如何写好单元测试？"))
+
+    assert reply == "智能回答内容"
+    assert assistant.questions == ["如何写好单元测试？"]
+    with create_session_factory(engine)() as session:
+        event = session.query(FeishuEvent).one()
+        assert event.status == "processed"
+        assert event.reply_text == reply
+
+
+def test_fixed_commands_bypass_assistant(engine) -> None:
+    assistant = FakeAssistant()
+
+    reply = service(engine, assistant=assistant).handle(message("状态"))
+
+    assert reply is not None
+    assert reply.startswith("任务状态：")
+    assert assistant.questions == []
+
+
+def test_help_mentions_natural_language_when_assistant_enabled(engine) -> None:
+    reply = service(engine, assistant=FakeAssistant()).handle(message("帮助"))
+
+    assert reply is not None
+    assert "自然语言" in reply
+
+
+def test_assistant_internal_error_reports_generic_failure(engine) -> None:
+    class BrokenAssistant:
+        def answer(self, question: str, session) -> str:
+            raise RuntimeError("boom")
+
+    reply = service(engine, assistant=BrokenAssistant()).handle(message("随便问问"))
+
+    assert reply == "处理失败：内部错误，请稍后重试"
+    with create_session_factory(engine)() as session:
+        assert session.query(FeishuEvent).one().status == "failed"

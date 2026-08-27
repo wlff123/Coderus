@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
+from typing import Protocol
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
@@ -29,6 +30,8 @@ HELP_TEXT = """我是 Coderus，您的代码仓管家。
 派发 <Issue URL>
 检视 <GitHub 或 GitCode PR URL>"""
 
+ASSISTANT_HELP_TEXT = HELP_TEXT + "\n\n除命令外，也可以直接用自然语言向我提问。"
+
 TASK_STATUS_LABELS = {
     "queued": "排队中",
     "preparing": "准备工作区",
@@ -48,6 +51,14 @@ TASK_STATUS_LABELS = {
 }
 
 
+class Assistant(Protocol):
+    def answer(self, question: str, session: Session) -> str: ...
+
+
+def _operation_label(kind: str) -> str:
+    return {"review": "检视", "dispatch": "派发"}.get(kind, "处理")
+
+
 class FeishuCommandService:
     def __init__(
         self,
@@ -55,12 +66,14 @@ class FeishuCommandService:
         session_factory: Callable[[], Session],
         providers: Mapping[str, IssueProvider],
         forges: ForgeRegistry,
+        assistant: Assistant | None = None,
         can_mutate: Callable[[], bool] | None = None,
         mutation_block_reason: Callable[[], str] | None = None,
     ) -> None:
         self.sessions = session_factory
         self.providers = providers
         self.forges = forges
+        self.assistant = assistant
         self.can_mutate = can_mutate or (lambda: True)
         self.mutation_block_reason = mutation_block_reason or (
             lambda: "系统正在发布新版本，暂不接收新任务，请稍后重试"
@@ -97,7 +110,7 @@ class FeishuCommandService:
                 if command.kind in {"dispatch", "review"} and not self.can_mutate():
                     reply = self.mutation_block_reason()
                 elif command.kind == "help":
-                    reply = HELP_TEXT
+                    reply = HELP_TEXT if self.assistant is None else ASSISTANT_HELP_TEXT
                 elif command.kind == "status":
                     reply = self._status(session)
                 elif command.kind == "tasks":
@@ -136,6 +149,8 @@ class FeishuCommandService:
                         f"已派发为 RE-{task.id}：{repository.provider}/"
                         f"{repository.owner}/{repository.name}#{issue.number} {issue.title}"
                     )
+                elif self.assistant is not None:
+                    reply = self.assistant.answer(message.text, session)
                 else:
                     reply = f"无法识别命令。\n{HELP_TEXT}"
             except (ProviderError, ValueError) as exc:
@@ -151,8 +166,7 @@ class FeishuCommandService:
                 event.status = "failed"
                 event.error_summary = error_summary
                 event.processed_at = datetime.now(UTC)
-                operation = "检视" if command.kind == "review" else "派发"
-                reply = f"{operation}失败：{reason}"
+                reply = f"{_operation_label(command.kind)}失败：{reason}"
                 self._queue_reply(event, reply)
                 session.commit()
                 return reply
@@ -163,8 +177,7 @@ class FeishuCommandService:
                 event.status = "failed"
                 event.error_summary = type(exc).__name__
                 event.processed_at = datetime.now(UTC)
-                operation = "检视" if command.kind == "review" else "派发"
-                reply = f"{operation}失败：内部错误，请稍后重试"
+                reply = f"{_operation_label(command.kind)}失败：内部错误，请稍后重试"
                 self._queue_reply(event, reply)
                 session.commit()
                 return reply
