@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-import secrets
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -12,7 +11,7 @@ from typing import Any, Protocol
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session, selectinload
 
-from coderus.forge import ForgeCapability, ForgeRegistry
+from coderus.forge import ForgeRegistry
 from coderus.models import AgentRun, Issue, PRFeedback, Review, Task
 from coderus.runner import AgentRole, JobStatus, Stage
 from coderus.tasks.statuses import TERMINAL_TASK_STATES
@@ -30,11 +29,15 @@ from coderus.workflow.developer_report import (
 from coderus.workflow.prompts import (
     developer_prompt,
     feedback_prompt,
-    pull_request_body,
     revision_prompt,
 )
+from coderus.workflow.publication import TaskPublication
 from coderus.workflow.review_cycle import ReviewCycle, deduplicate_findings
-from coderus.workflow.task_state import cas_task_status, claim_queued_task
+from coderus.workflow.task_state import (
+    ClaimLost,
+    cas_task_status,
+    claim_queued_task,
+)
 
 CLAIM_LEASE_SECONDS = 120.0
 CLAIM_HEARTBEAT_SECONDS = 10.0
@@ -52,10 +55,6 @@ _CLAIMED_STATES = (*_STATUS_EXPECTED, "cancelling")
 
 class Runner(Protocol):
     async def run(self, spec, *, cancel_event: asyncio.Event): ...
-
-
-class _ClaimLost(Exception):
-    pass
 
 
 class TaskOrchestrator:
@@ -94,6 +93,15 @@ class TaskOrchestrator:
         self.review_cycle = ReviewCycle(
             executor=self.stage_executor,
             session_factory=session_factory,
+        )
+        self.publication = TaskPublication(
+            session_factory=session_factory,
+            workspace_git=workspace_git,
+            forges=forges,
+            artifacts_root=artifacts_root,
+            git_user_name=git_user_name,
+            git_user_email=git_user_email,
+            transition=self._set_status,
         )
 
     def cancel(self, task_id: int) -> bool:
@@ -230,12 +238,11 @@ class TaskOrchestrator:
                 prepared.workspace,
                 branch,
                 reports,
-                findings,
                 patch_name="fixed.patch",
                 commit_title=f"Fix #{task.issue.number}: {task.issue.title}"[:200],
                 claim_token=claim_token,
             )
-        except _ClaimLost:
+        except ClaimLost:
             return
         except TaskCancelled:
             self._mark_cancelled(task_id, claim_token)
@@ -281,7 +288,6 @@ class TaskOrchestrator:
             workspace,
             task.branch_name,
             [report],
-            [],
             patch_name="pr-feedback.patch",
             commit_title=f"Address PR feedback for #{task.issue.number}"[:200],
             claim_token=claim_token,
@@ -295,11 +301,10 @@ class TaskOrchestrator:
         if not workspace.is_dir():
             raise ValueError("任务工作区不存在")
         await self.git.assert_branch(workspace, task.branch_name)
-        reports, findings = self._existing_reports_and_findings(task.id)
+        reports, _ = self._existing_reports_and_findings(task.id)
         if task.commit_sha:
-            await self.git.assert_clean_commit(workspace, task.commit_sha)
-            published = await self._publish(
-                task, workspace, task.branch_name, reports, findings, claim_token
+            published = await self.publication.publish_existing(
+                task, workspace, reports, claim_token
             )
             self._awaiting_review(task.id, claim_token, published)
             await self._notify(task, published)
@@ -309,7 +314,6 @@ class TaskOrchestrator:
             workspace,
             task.branch_name,
             reports,
-            findings,
             patch_name="fixed.patch",
             commit_title=f"Fix #{task.issue.number}: {task.issue.title}"[:200],
             claim_token=claim_token,
@@ -355,26 +359,19 @@ class TaskOrchestrator:
         workspace: Path,
         branch: str,
         reports: list[DeveloperReport],
-        findings: list[dict[str, Any]],
         *,
         patch_name: str,
         commit_title: str,
         claim_token: str,
     ) -> None:
-        await self.git.assert_has_changes(workspace)
-        self._set_status(task.id, "sealing", claim_token)
-        patch_path = self.artifacts_root / f"task-{task.id}" / patch_name
-        sealed = await self.git.seal(workspace, patch_path)
-        self._set_sealed(task.id, claim_token, sealed)
-        await self.git.assert_no_secrets(workspace)
-        await self.git.assert_tree(workspace, sealed.tree_sha)
-        commit_sha = await self.git.commit(
-            workspace, commit_title, self.git_user_name, self.git_user_email
-        )
-        await self.git.assert_committed_tree(workspace, commit_sha, sealed.tree_sha)
-        self._set_commit(task.id, claim_token, commit_sha)
-        published = await self._publish(
-            task, workspace, branch, reports, findings, claim_token
+        published = await self.publication.finalize(
+            task,
+            workspace,
+            branch,
+            reports,
+            patch_name=patch_name,
+            commit_title=commit_title,
+            claim_token=claim_token,
         )
         self._awaiting_review(task.id, claim_token, published)
         await self._notify(task, published)
@@ -423,64 +420,6 @@ class TaskOrchestrator:
                 row.processed_at = now
             session.commit()
 
-    async def _publish(
-        self,
-        task: Task,
-        workspace: Path,
-        branch: str,
-        reports: list[DeveloperReport],
-        findings: list[dict[str, Any]],
-        claim_token: str,
-    ):
-        provider = task.issue.repository.provider
-        forge = self.forges.require(provider)
-        if not self.forges.supports(provider, ForgeCapability.PUBLISH):
-            raise ValueError("未配置代码平台发布凭据")
-        publication_key = self._begin_publication(task.id, claim_token)
-        body = pull_request_body(task, reports)
-        body += f"\n\n<!-- coderus-publication:{publication_key} -->"
-        published = await forge.publish(
-            workspace=workspace,
-            upstream_owner=task.issue.repository.owner,
-            repository_name=task.issue.repository.name,
-            default_branch=task.issue.repository.default_branch,
-            branch=branch,
-            title=task.issue.title[:240],
-            body=body,
-        )
-        if inspect.isawaitable(published):
-            published = await published
-        return published
-
-    def _begin_publication(self, task_id: int, claim_token: str) -> str:
-        with self.sessions() as session:
-            task = session.execute(
-                select(Task.publication_key, Task.publication_started_at).where(
-                    Task.id == task_id,
-                    Task.claim_token == claim_token,
-                )
-            ).one_or_none()
-            if task is None:
-                raise _ClaimLost
-            publication_key = task.publication_key or secrets.token_urlsafe(32)
-            started_at = task.publication_started_at or datetime.now(UTC)
-            changed = cas_task_status(
-                session,
-                task_id,
-                expected=_STATUS_EXPECTED["publishing"],
-                new_status="publishing",
-                claim_token=claim_token,
-                actor="publisher",
-                updates={
-                    "publication_key": publication_key,
-                    "publication_started_at": started_at,
-                },
-            )
-            session.commit()
-            if not changed:
-                raise _ClaimLost
-            return publication_key
-
     def _load_task(self, task_id: int) -> Task:
         with self.sessions() as session:
             task = session.scalar(
@@ -517,7 +456,7 @@ class TaskOrchestrator:
             if current is None:
                 raise ValueError(f"task {task_id} does not exist")
             if current.claim_token != claim_token:
-                raise _ClaimLost
+                raise ClaimLost
             if current.status in {"cancelling", "cancelled", "dismissed"}:
                 raise TaskCancelled
             raise RuntimeError(
@@ -543,40 +482,7 @@ class TaskOrchestrator:
             )
             session.commit()
             if result.rowcount != 1:
-                raise _ClaimLost
-
-    def _set_sealed(self, task_id: int, claim_token: str, sealed: object) -> None:
-        with self.sessions() as session:
-            result = session.execute(
-                update(Task)
-                .where(
-                    Task.id == task_id,
-                    Task.status == "sealing",
-                    Task.claim_token == claim_token,
-                )
-                .values(
-                    fixed_patch_path=str(sealed.patch_path),
-                    reviewed_tree_sha=sealed.tree_sha,
-                )
-            )
-            session.commit()
-            if result.rowcount != 1:
-                raise _ClaimLost
-
-    def _set_commit(self, task_id: int, claim_token: str, commit_sha: str) -> None:
-        with self.sessions() as session:
-            result = session.execute(
-                update(Task)
-                .where(
-                    Task.id == task_id,
-                    Task.status == "sealing",
-                    Task.claim_token == claim_token,
-                )
-                .values(commit_sha=commit_sha)
-            )
-            session.commit()
-            if result.rowcount != 1:
-                raise _ClaimLost
+                raise ClaimLost
 
     async def _run_stage(
         self,
@@ -611,7 +517,7 @@ class TaskOrchestrator:
                 )
             ).one_or_none()
             if task is None:
-                raise _ClaimLost
+                raise ClaimLost
             target = (
                 "cancelled" if task.status == "cancelling" else "awaiting_human_review"
             )
@@ -635,7 +541,7 @@ class TaskOrchestrator:
             )
             session.commit()
             if not changed:
-                raise _ClaimLost
+                raise ClaimLost
 
     def _fail(self, task_id: int, claim_token: str, exc: Exception) -> None:
         with self.sessions() as session:

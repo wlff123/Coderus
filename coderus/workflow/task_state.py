@@ -13,6 +13,10 @@ from coderus.tasks.statuses import RUNNING_TASK_STATES
 TASK_CONTRACT_VERSION = 1
 
 
+class ClaimLost(Exception):
+    """任务租约丢失或状态被他人变更，当前执行者必须立即放弃。"""
+
+
 def cas_task_status(
     session: Session,
     task_id: int,
