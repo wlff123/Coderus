@@ -123,7 +123,7 @@ def test_promotion_script_drains_then_switches_with_automatic_rollback() -> None
     rollback = (ROOT / "scripts" / "rollback-release.sh").read_text(encoding="utf-8")
 
     assert "flock" in promote
-    assert 'CUTOVER_TIMEOUT="${CODERUS_CUTOVER_TIMEOUT:-30}"' in promote
+    assert 'CUTOVER_TIMEOUT="${CODERUS_CUTOVER_TIMEOUT:-120}"' in promote
     assert 'touch "$DRAIN_GATE"' in promote
     assert "coderus.release_ops check-idle" in promote
     assert "--verify-release" in promote
