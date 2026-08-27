@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import urlencode
 
 from fastapi import Request
 from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from coderus.auth.security import new_csrf_token
-from coderus.models import User
+from coderus.models import Repository, User
 from coderus.web.presentation import (
     provider_error_message,
     review_status_label,
@@ -41,6 +43,25 @@ templates.env.globals.update(
 
 def redirect(path: str) -> RedirectResponse:
     return RedirectResponse(path, status_code=303)
+
+
+def enabled_repository(session: Session, repository_id: int | None) -> Repository | None:
+    if repository_id is None:
+        return None
+    return session.scalar(
+        select(Repository).where(
+            Repository.id == repository_id,
+            Repository.is_enabled.is_(True),
+        )
+    )
+
+
+def repository_scoped_path(
+    path: str, repository_id: int | None, **params: str
+) -> str:
+    if repository_id is not None:
+        params["repository"] = str(repository_id)
+    return f"{path}?{urlencode(params)}" if params else path
 
 
 class WebUI:

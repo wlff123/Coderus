@@ -19,8 +19,8 @@ import uvicorn
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import func, or_, select
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy import func, select
+from sqlalchemy.orm import selectinload
 from starlette.middleware.sessions import SessionMiddleware
 
 from coderus.application import IssueCommands, ReviewCommands
@@ -57,7 +57,6 @@ from coderus.integrations.github_credentials import (
     ResolvedGitHubCredential,
 )
 from coderus.issues.poller import IssuePoller
-from coderus.issues.service import dispatch_issue, sync_repository, upsert_provider_issue
 from coderus.model_proxy import CredentialBroker, create_proxy_app
 from coderus.models import (
     Base,
@@ -75,7 +74,7 @@ from coderus.pr_review.service import enqueue_pr_review
 from coderus.pr_review.workspace import PRWorkspace
 from coderus.providers import GitCodeProvider, GitHubProvider
 from coderus.providers.errors import InvalidProviderUrl
-from coderus.providers.urls import parse_issue_url, parse_pull_request_url, parse_repository_url
+from coderus.providers.urls import parse_pull_request_url
 from coderus.readiness import readiness_report
 from coderus.release_gate import ReleaseGate
 from coderus.release_status import load_release_status
@@ -89,15 +88,21 @@ from coderus.web.forge_runtime import (
     install_forge_runtime,
 )
 from coderus.web.presentation import (
-    provider_error_message,
     review_status_label,
     review_status_tone,
     status_label,
     status_tone,
 )
 from coderus.web.routes.auth import build_auth_router
+from coderus.web.routes.issues import build_issue_router
+from coderus.web.routes.repositories import build_repository_router
 from coderus.web.routes.users import build_user_router
-from coderus.web.ui import WebUI, redirect, templates
+from coderus.web.ui import (
+    WebUI,
+    enabled_repository,
+    redirect,
+    templates,
+)
 from coderus.workflow.feedback import upsert_pr_feedback
 from coderus.workflow.limited_runner import LimitedRunner
 from coderus.workflow.notifications import FeishuTaskNotifier
@@ -385,25 +390,6 @@ def create_app(
             }
             for provider in ("github", "gitcode")
         }
-
-    def enabled_repository(
-        session: Session, repository_id: int | None
-    ) -> Repository | None:
-        if repository_id is None:
-            return None
-        return session.scalar(
-            select(Repository).where(
-                Repository.id == repository_id,
-                Repository.is_enabled.is_(True),
-            )
-        )
-
-    def repository_scoped_path(
-        path: str, repository_id: int | None, **params: str
-    ) -> str:
-        if repository_id is not None:
-            params["repository"] = str(repository_id)
-        return f"{path}?{urlencode(params)}" if params else path
 
     issue_commands = IssueCommands(
         session_factory=sessions, providers=app.state.providers
@@ -765,6 +751,25 @@ def create_app(
             ui=ui,
             session_factory=sessions,
             cancel_running_task=lambda task_id: app.state.orchestrator.cancel(task_id),
+        )
+    )
+    app.include_router(
+        build_repository_router(
+            ui=ui,
+            session_factory=sessions,
+            providers=app.state.providers,
+            forges=app.state.forges,
+            issue_poller=issue_poller,
+            forge_status=forge_status,
+        )
+    )
+    app.include_router(
+        build_issue_router(
+            ui=ui,
+            session_factory=sessions,
+            issues=issue_commands,
+            forge_status=forge_status,
+            codex_auth=lambda: app.state.codex_auth,
         )
     )
 
@@ -1187,398 +1192,6 @@ def create_app(
                 return redirect("/system")
         flash(request, "飞书测试消息已发送")
         return redirect("/system")
-
-    @app.get("/repositories", response_class=HTMLResponse)
-    def repositories_page(request: Request):
-        with sessions() as session:
-            current = user_for(request, session)
-            if current is None:
-                return redirect("/login")
-            if current.role != "admin":
-                return HTMLResponse("Forbidden", status_code=403)
-            repositories = session.scalars(select(Repository).order_by(Repository.created_at)).all()
-            return templates.TemplateResponse(
-                request,
-                "repositories.html",
-                context(
-                    request,
-                    current,
-                    repositories=repositories,
-                    forge_status=forge_status(),
-                ),
-            )
-
-    @app.post("/repositories")
-    async def add_repository(
-        request: Request,
-        url: str = Form(),
-        csrf_token: str = Form(),
-    ):
-        with sessions() as session:
-            current = user_for(request, session)
-            if current is None:
-                return redirect("/login")
-            if current.role != "admin":
-                return HTMLResponse("Forbidden", status_code=403)
-            if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
-                return HTMLResponse("Invalid CSRF token", status_code=400)
-            try:
-                parsed = parse_repository_url(url)
-                provider = app.state.providers[parsed.provider]
-                metadata = await asyncio.to_thread(provider.get_repository, parsed.canonical_url)
-                if metadata.is_private or metadata.issues_enabled is False:
-                    raise ValueError("仓库必须公开且启用 Issue")
-                fork = None
-                forge = forge_for_repository(metadata)
-                if app.state.forges.supports(
-                    metadata.provider, ForgeCapability.ENSURE_FORK
-                ):
-                    fork = await forge.ensure_fork(metadata.owner, metadata.name)
-                repository = Repository(
-                    provider=metadata.provider,
-                    owner=metadata.owner,
-                    name=metadata.name,
-                    canonical_url=metadata.canonical_url,
-                    default_branch=metadata.default_branch or "main",
-                    fork_owner=fork.owner if fork else None,
-                    fork_url=fork.url if fork else None,
-                    created_by=current.id,
-                )
-                session.add(repository)
-                session.commit()
-                flash(request, f"仓库 {repository.owner}/{repository.name} 已添加")
-            except Exception as exc:
-                session.rollback()
-                flash(request, provider_error_message(exc), "danger")
-        return redirect("/repositories")
-
-    @app.post("/repositories/{repository_id}/sync")
-    def force_sync(request: Request, repository_id: int, csrf_token: str = Form()):
-        with sessions() as session:
-            current = user_for(request, session)
-            if current is None:
-                return redirect("/login")
-            if current.role != "admin":
-                return HTMLResponse("Forbidden", status_code=403)
-            if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
-                return HTMLResponse("Invalid CSRF token", status_code=400)
-            repository = session.get(Repository, repository_id)
-            if repository is None:
-                return HTMLResponse("Not found", status_code=404)
-            if repository.sync_status == "running":
-                flash(request, "仓库正在同步，请稍后刷新状态", "warning")
-                return redirect("/repositories")
-            try:
-                sync_repository(session, repository, app.state.providers[repository.provider])
-                session.commit()
-                flash(request, f"{repository.owner}/{repository.name} 同步完成")
-            except Exception as exc:
-                repository.sync_status = "failed"
-                repository.last_sync_error = provider_error_message(exc)[:1000]
-                session.commit()
-                flash(request, repository.last_sync_error, "danger")
-        return redirect("/repositories")
-
-    @app.post("/repositories/{repository_id}/toggle")
-    def toggle_repository(request: Request, repository_id: int, csrf_token: str = Form()):
-        with sessions() as session:
-            current = user_for(request, session)
-            if current is None:
-                return redirect("/login")
-            if current.role != "admin":
-                return HTMLResponse("Forbidden", status_code=403)
-            if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
-                return HTMLResponse("Invalid CSRF token", status_code=400)
-            repository = session.get(Repository, repository_id)
-            if repository is None:
-                return HTMLResponse("Not found", status_code=404)
-            if repository.sync_status == "running":
-                flash(request, "仓库正在同步，当前不能修改启用状态", "warning")
-                return redirect("/repositories")
-            repository.is_enabled = not repository.is_enabled
-            session.commit()
-            flash(
-                request,
-                f"{repository.owner}/{repository.name} "
-                f"已{'启用' if repository.is_enabled else '停用'}",
-            )
-        return redirect("/repositories")
-
-    @app.post("/repositories/sync-all")
-    async def force_sync_all(request: Request, csrf_token: str = Form()):
-        with sessions() as session:
-            current = user_for(request, session)
-            if current is None:
-                return redirect("/login")
-            if current.role != "admin":
-                return HTMLResponse("Forbidden", status_code=403)
-            if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
-                return HTMLResponse("Invalid CSRF token", status_code=400)
-            if session.scalar(
-                select(func.count())
-                .select_from(Repository)
-                .where(Repository.sync_status == "running")
-            ):
-                flash(request, "已有仓库正在同步，请稍后再刷新全部", "warning")
-                return redirect("/repositories")
-        await issue_poller.tick()
-        with sessions() as session:
-            failed_count = (
-                session.scalar(
-                    select(func.count())
-                    .select_from(Repository)
-                    .where(
-                        Repository.is_enabled.is_(True),
-                        Repository.sync_status == "failed",
-                    )
-                )
-                or 0
-            )
-        if failed_count:
-            flash(request, f"刷新完成，{failed_count} 个仓库刷新失败", "danger")
-        else:
-            flash(request, "全部仓库刷新完成")
-        return redirect("/repositories")
-
-    @app.get("/issues", response_class=HTMLResponse)
-    def issues_page(
-        request: Request,
-        triage: str = "discovered",
-        page: int = 1,
-        q: str = "",
-        repository: int | None = None,
-    ):
-        with sessions() as session:
-            current = user_for(request, session)
-            if current is None:
-                return redirect("/login")
-            if triage not in {"discovered", "dispatched", "ignored", "all"}:
-                triage = "discovered"
-            repositories = session.scalars(
-                select(Repository)
-                .where(Repository.is_enabled.is_(True))
-                .order_by(Repository.provider, Repository.owner, Repository.name)
-            ).all()
-            selected_repository = enabled_repository(session, repository)
-            if selected_repository is not None:
-                repositories = [selected_repository] + [
-                    item for item in repositories if item.id != selected_repository.id
-                ]
-            q = q.strip()[:200]
-            filters = []
-            if selected_repository is not None:
-                filters.append(Issue.repository_id == selected_repository.id)
-            if triage != "all":
-                filters.append(Issue.triage_state == triage)
-            if triage == "discovered":
-                filters.append(Issue.state == "open")
-            if q:
-                search = f"%{q}%"
-                search_filters = [
-                    Issue.title.ilike(search),
-                    Repository.owner.ilike(search),
-                    Repository.name.ilike(search),
-                ]
-                issue_number = q.removeprefix("#")
-                if issue_number.isdigit():
-                    search_filters.append(Issue.number == int(issue_number))
-                filters.append(or_(*search_filters))
-            total_issues = (
-                session.scalar(
-                    select(func.count())
-                    .select_from(Issue)
-                    .join(Issue.repository)
-                    .where(*filters)
-                )
-                or 0
-            )
-            total_pages = max(1, (total_issues + ISSUES_PAGE_SIZE - 1) // ISSUES_PAGE_SIZE)
-            page = min(max(page, 1), total_pages)
-            statement = (
-                select(Issue)
-                .join(Issue.repository)
-                .options(selectinload(Issue.repository))
-                .where(*filters)
-                .order_by(Issue.source_updated_at.desc(), Issue.id.desc())
-                .offset((page - 1) * ISSUES_PAGE_SIZE)
-                .limit(ISSUES_PAGE_SIZE)
-            )
-            issues = session.scalars(statement).all()
-            return templates.TemplateResponse(
-                request,
-                "issues.html",
-                context(
-                    request,
-                    current,
-                    issues=issues,
-                    selected_triage=triage,
-                    page=page,
-                    total_pages=total_pages,
-                    total_issues=total_issues,
-                    search_query=q,
-                    repositories=repositories,
-                    selected_repository=selected_repository,
-                    selected_repository_id=(
-                        selected_repository.id if selected_repository is not None else None
-                    ),
-                    pagination_query=urlencode(
-                        {
-                            "triage": triage,
-                            **({"q": q} if q else {}),
-                            **(
-                                {"repository": selected_repository.id}
-                                if selected_repository is not None
-                                else {}
-                            ),
-                        }
-                    ),
-                    repository_tab_query=urlencode(
-                        {"triage": triage, **({"q": q} if q else {})}
-                    ),
-                    forge_status=forge_status(),
-                    codex_auth=app.state.codex_auth,
-                ),
-            )
-
-    @app.post("/issues/manual")
-    def add_issue_manually(
-        request: Request,
-        url: str = Form(),
-        csrf_token: str = Form(),
-    ):
-        with sessions() as session:
-            current = user_for(request, session)
-            if current is None:
-                return redirect("/login")
-            if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
-                return HTMLResponse("Invalid CSRF token", status_code=400)
-            try:
-                source_repository, number = parse_issue_url(url)
-                repository = session.scalar(
-                    select(Repository).where(
-                        Repository.provider == source_repository.provider,
-                        Repository.owner == source_repository.owner,
-                        Repository.name == source_repository.name,
-                        Repository.is_enabled.is_(True),
-                    )
-                )
-                if repository is None:
-                    raise ValueError("该 Issue 所属仓库未由管理员授权")
-                provider = app.state.providers[repository.provider]
-                source = provider.get_issue(source_repository, number)
-                upsert_provider_issue(session, repository, source)
-                session.commit()
-                flash(request, f"Issue #{number} 已添加")
-            except Exception as exc:
-                session.rollback()
-                flash(request, provider_error_message(exc), "danger")
-        return redirect("/issues")
-
-    @app.post("/issues/{issue_id}/dispatch")
-    def dispatch(
-        request: Request,
-        issue_id: int,
-        csrf_token: str = Form(),
-        instructions: str = Form(default=""),
-        repository: int | None = Form(default=None),
-    ):
-        with sessions() as session:
-            current = user_for(request, session)
-            if current is None:
-                return redirect("/login")
-            if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
-                return HTMLResponse("Invalid CSRF token", status_code=400)
-            issue = session.get(Issue, issue_id)
-            if issue is None:
-                return HTMLResponse("Not found", status_code=404)
-            repository_id = issue.repository_id if repository == issue.repository_id else None
-            try:
-                task = dispatch_issue(
-                    session, issue, current, instructions, commit=False
-                )
-            except ValueError as exc:
-                flash(request, str(exc), "danger")
-                return redirect(repository_scoped_path("/issues", repository_id))
-            if not app.state.codex_auth.ready:
-                session.rollback()
-                flash(request, app.state.codex_auth.detail, "danger")
-                return redirect(repository_scoped_path("/issues", repository_id))
-            session.commit()
-            flash(request, f"Issue #{issue.number} 已派发为 RE-{task.id}")
-        return redirect(repository_scoped_path("/tasks", repository_id))
-
-    @app.post("/issues/{issue_id}/ignore")
-    def ignore_issue(
-        request: Request,
-        issue_id: int,
-        csrf_token: str = Form(),
-        reason: str = Form(default=""),
-        repository: int | None = Form(default=None),
-    ):
-        with sessions() as session:
-            current = user_for(request, session)
-            if current is None:
-                return redirect("/login")
-            if current.role != "admin":
-                return HTMLResponse("Forbidden", status_code=403)
-            if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
-                return HTMLResponse("Invalid CSRF token", status_code=400)
-            issue = session.get(Issue, issue_id)
-            if issue is None:
-                return HTMLResponse("Not found", status_code=404)
-            repository_id = issue.repository_id if repository == issue.repository_id else None
-            if issue.triage_state != "discovered" or issue.state != "open":
-                flash(request, "只有待处理 Issue 可以忽略", "danger")
-                return redirect(
-                    repository_scoped_path(
-                        "/issues", repository_id, triage="all"
-                    )
-                )
-            issue.triage_state = "ignored"
-            issue.ignored_by = current.id
-            issue.ignored_reason = reason.strip()[:1000] or None
-            issue.ignored_at = datetime.now(UTC)
-            session.commit()
-            flash(request, f"Issue #{issue.number} 已忽略")
-        return redirect(
-            repository_scoped_path(
-                "/issues", repository_id, triage="ignored"
-            )
-        )
-
-    @app.post("/issues/{issue_id}/restore")
-    def restore_issue(
-        request: Request,
-        issue_id: int,
-        csrf_token: str = Form(),
-        repository: int | None = Form(default=None),
-    ):
-        with sessions() as session:
-            current = user_for(request, session)
-            if current is None:
-                return redirect("/login")
-            if current.role != "admin":
-                return HTMLResponse("Forbidden", status_code=403)
-            if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
-                return HTMLResponse("Invalid CSRF token", status_code=400)
-            issue = session.get(Issue, issue_id)
-            if issue is None:
-                return HTMLResponse("Not found", status_code=404)
-            repository_id = issue.repository_id if repository == issue.repository_id else None
-            if issue.triage_state != "ignored":
-                flash(request, "只有已忽略 Issue 可以恢复", "danger")
-                return redirect(
-                    repository_scoped_path(
-                        "/issues", repository_id, triage="all"
-                    )
-                )
-            issue.triage_state = "discovered"
-            issue.ignored_by = None
-            issue.ignored_reason = None
-            issue.ignored_at = None
-            session.commit()
-            flash(request, f"Issue #{issue.number} 已恢复到待处理")
-        return redirect(repository_scoped_path("/issues", repository_id))
 
     @app.get("/tasks", response_class=HTMLResponse)
     def tasks_page(

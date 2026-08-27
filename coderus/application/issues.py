@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from coderus.issues.service import (
     IssueProvider,
     add_and_dispatch_issue,
+    add_provider_issue,
     dispatch_issue,
 )
 from coderus.models import Issue, User
@@ -30,6 +31,14 @@ class IssueCommands:
     ) -> None:
         self._sessions = session_factory
         self._providers = providers
+
+    def add_issue(self, issue_url: str) -> int:
+        """按 URL 添加单个 Issue，返回 Issue 编号。"""
+        with self._sessions() as session:
+            issue = add_provider_issue(session, self._providers, issue_url)
+            number = issue.number
+            session.commit()
+            return number
 
     def dispatch(self, issue_id: int, actor_id: int, instructions: str = "") -> int:
         with self._sessions() as session:

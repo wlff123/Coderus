@@ -14,6 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from sqlalchemy import func, select
+from sqlalchemy.orm import Session
 
 import coderus.web.app as app_module
 from coderus.auth.service import create_user
@@ -248,7 +249,7 @@ def test_explicit_preview_does_not_run_active_recovery(
 ) -> None:
     engine = app_module.create_engine_from_settings(app_settings.database)
     Base.metadata.create_all(engine)
-    with app_module.Session(engine) as session:
+    with Session(engine) as session:
         owner = create_user(session, "preview-owner", "password-123", role="admin")
         session.add(
             DbRepository(
