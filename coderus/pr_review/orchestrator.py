@@ -26,6 +26,7 @@ from coderus.pr_review.result import (
     validate_findings,
 )
 from coderus.runner import AgentRole, JobSpec, JobStatus, Stage
+from coderus.tasks.error_codes import TaskErrorCode, classify_exception
 from coderus.tasks.lease import TaskLease, heartbeat_loop
 from coderus.workflow.limited_runner import retry_agent_operation
 
@@ -44,6 +45,8 @@ class Runner(Protocol):
 
 class PRReviewError(RuntimeError):
     """A controlled error safe to persist and send to the requester."""
+
+    error_code = TaskErrorCode.INVALID_INPUT
 
 
 class _ClaimLost(Exception):
@@ -469,7 +472,7 @@ class PRReviewOrchestrator:
                     status="failed",
                     claim_token=None,
                     claim_expires_at=None,
-                    failure_code=type(exc).__name__,
+                    failure_code=classify_exception(exc),
                     failure_summary=summary,
                     finished_at=datetime.now(UTC),
                 )

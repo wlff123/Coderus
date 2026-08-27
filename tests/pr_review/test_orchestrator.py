@@ -1058,7 +1058,7 @@ async def test_comment_publish_uses_timeout_below_claim_lease(
     session.expire_all()
     persisted = session.get(PRReviewTask, task.id)
     assert persisted.status == "failed"
-    assert persisted.failure_code == "TimeoutError"
+    assert persisted.failure_code == "side_effect_unknown"
 
 
 def test_stale_claim_token_cannot_transition_or_fail_new_owner(

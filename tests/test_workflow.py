@@ -413,7 +413,7 @@ async def test_unconfigured_task_provider_keeps_publishable_workspace_and_commit
     with sessions() as session:
         task = session.get(Task, task_id)
         assert task.status == "failed"
-        assert task.failure_code == "ForgeNotConfigured"
+        assert task.failure_code == "forge_auth_failed"
         assert task.workspace_path == str(workspace)
         assert task.branch_name == "coderus/issue-1-1"
         assert task.commit_sha == "c" * 40

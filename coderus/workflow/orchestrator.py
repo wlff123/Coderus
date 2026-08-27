@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session, selectinload
 from coderus.forge import ForgeRegistry
 from coderus.models import AgentRun, Issue, PRFeedback, Review, Task
 from coderus.runner import AgentRole, JobStatus, Stage
+from coderus.tasks.error_codes import classify_exception
 from coderus.tasks.lease import CLAIM_LEASE_SECONDS, TaskLease, heartbeat_loop
 from coderus.tasks.statuses import TERMINAL_TASK_STATES
 from coderus.workflow.agent_stage import (
@@ -563,7 +564,7 @@ class TaskOrchestrator:
                 updates={
                     "claim_token": None,
                     "claim_expires_at": None,
-                    "failure_code": type(exc).__name__,
+                    "failure_code": classify_exception(exc),
                     "failure_summary": str(exc)[-2000:],
                     "finished_at": datetime.now(UTC),
                 },

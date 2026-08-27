@@ -10,6 +10,7 @@ from urllib.parse import quote
 from pydantic import ValidationError
 
 from coderus.forge import ProviderName
+from coderus.tasks.error_codes import TaskErrorCode
 
 from .models import ChangedRanges, ReviewFinding, ReviewOutput, normalize_repository_path
 
@@ -59,6 +60,8 @@ _PRIORITY_LABELS = {
 
 class ReviewOutputError(ValueError):
     """Raised when a review result cannot be safely published."""
+
+    error_code = TaskErrorCode.AGENT_OUTPUT_INVALID
 
 
 def review_output_schema_path() -> Path:
