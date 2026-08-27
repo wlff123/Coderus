@@ -39,6 +39,18 @@ class PublishRequest:
             raise ValueError("work branch must differ from the default branch")
 
 
+class ForkRegistry(Protocol):
+    """已登记仓库的 Fork 查询与登记，持久化由实现方负责。"""
+
+    def fork_url(self, owner: str, name: str) -> str | None:
+        """返回已登记仓库的 Fork URL；仓库未登记或已停用时抛 ValueError。"""
+        ...
+
+    def record_fork(self, owner: str, name: str, fork: ForkResult) -> None:
+        """登记首次发布时新建的 Fork。"""
+        ...
+
+
 class Forge(Protocol):
     async def ensure_fork(self, owner: str, name: str) -> ForkResult: ...
 

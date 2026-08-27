@@ -1,14 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
-
-from sqlalchemy import select
-from sqlalchemy.orm import Session
 
 from coderus.forge.github.pulls import GitHubPublisher
-from coderus.forge.protocols import PublishRequest
-from coderus.models import Repository
+from coderus.forge.protocols import ForkRegistry, PublishRequest
 
 
 class GitHubForge:
@@ -16,11 +11,11 @@ class GitHubForge:
         self,
         token: str,
         *,
-        session_factory: Callable[[], Session],
+        forks: ForkRegistry,
         publisher_factory: type = GitHubPublisher,
     ) -> None:
         self._token = token
-        self._sessions = session_factory
+        self._forks = forks
         self._publisher_factory = publisher_factory
 
     async def ensure_fork(self, owner: str, name: str):
@@ -69,26 +64,11 @@ class GitHubForge:
     def _registered_publisher(
         self, owner: str, name: str, *, register_fork: bool = False
     ):
-        with self._sessions() as session:
-            repository = session.scalar(
-                select(Repository).where(
-                    Repository.provider == "github",
-                    Repository.owner == owner,
-                    Repository.name == name,
-                    Repository.is_enabled.is_(True),
-                )
-            )
-            if repository is None:
-                raise ValueError("GitHub 仓库尚未登记")
-            if not repository.fork_url and register_fork:
-                bootstrap = self._publisher_factory(self._token, registered_forks={})
-                fork = bootstrap.ensure_fork(owner, name)
-                repository.fork_owner = fork.owner
-                repository.fork_url = fork.url
-                session.commit()
-            registered = (
-                {(owner, name): repository.fork_url}
-                if repository.fork_url
-                else {}
-            )
+        fork_url = self._forks.fork_url(owner, name)
+        if not fork_url and register_fork:
+            bootstrap = self._publisher_factory(self._token, registered_forks={})
+            fork = bootstrap.ensure_fork(owner, name)
+            self._forks.record_fork(owner, name, fork)
+            fork_url = fork.url
+        registered = {(owner, name): fork_url} if fork_url else {}
         return self._publisher_factory(self._token, registered_forks=registered)

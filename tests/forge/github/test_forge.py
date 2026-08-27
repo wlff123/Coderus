@@ -6,6 +6,15 @@ import pytest
 from coderus.db import create_session_factory
 from coderus.forge import GitHubForge, PublishRequest
 from coderus.models import Repository, User
+from coderus.web.forge_runtime import DatabaseForkRegistry
+
+
+def github_forge(sessions) -> GitHubForge:
+    return GitHubForge(
+        "token",
+        forks=DatabaseForkRegistry(sessions, "github"),
+        publisher_factory=FakePublisher,
+    )
 
 
 class FakePublisher:
@@ -64,7 +73,7 @@ async def test_forge_loads_registered_fork_from_database(engine, tmp_path: Path)
             )
         )
         session.commit()
-    forge = GitHubForge("token", session_factory=sessions, publisher_factory=FakePublisher)
+    forge = github_forge(sessions)
 
     result = await forge.publish(
         PublishRequest(
@@ -94,7 +103,7 @@ async def test_forge_registers_fork_on_first_publish(engine, tmp_path: Path) -> 
             )
         )
         session.commit()
-    forge = GitHubForge("token", session_factory=sessions, publisher_factory=FakePublisher)
+    forge = github_forge(sessions)
 
     await forge.publish(
         PublishRequest(
@@ -127,7 +136,7 @@ async def test_forge_allows_pr_metadata_and_comment_without_registered_fork(engi
         )
         session.commit()
     FakePublisher.calls = []
-    forge = GitHubForge("token", session_factory=sessions, publisher_factory=FakePublisher)
+    forge = github_forge(sessions)
 
     details = await forge.get_pull_request("octo", "demo", 7)
     comment = await forge.publish_pr_comment(
@@ -167,7 +176,7 @@ async def test_forge_rejects_disabled_repository_for_pr_metadata(engine) -> None
         )
         session.commit()
     FakePublisher.calls = []
-    forge = GitHubForge("token", session_factory=sessions, publisher_factory=FakePublisher)
+    forge = github_forge(sessions)
 
     with pytest.raises(ValueError, match="GitHub"):
         await forge.get_pull_request("octo", "demo", 7)

@@ -6,6 +6,16 @@ import pytest
 from coderus.db import create_session_factory
 from coderus.forge import GitCodeForge, PublishRequest
 from coderus.models import Repository, User
+from coderus.web.forge_runtime import DatabaseForkRegistry
+
+
+def gitcode_forge(sessions) -> GitCodeForge:
+    return GitCodeForge(
+        "token",
+        "coderus-bot",
+        forks=DatabaseForkRegistry(sessions, "gitcode"),
+        publisher_factory=FakePublisher,
+    )
 
 
 class FakePublisher:
@@ -96,12 +106,8 @@ async def test_forge_loads_only_gitcode_registered_fork(engine, tmp_path: Path) 
         fork_owner="coderus-bot",
         fork_url="https://gitcode.com/coderus-bot/widgets.git",
     )
-    forge = GitCodeForge(
-        "token",
-        "coderus-bot",
-        session_factory=sessions,
-        publisher_factory=FakePublisher,
-    )
+    forge = gitcode_forge(sessions)
+
 
     result = await forge.publish(
         PublishRequest(
@@ -122,12 +128,8 @@ async def test_forge_loads_only_gitcode_registered_fork(engine, tmp_path: Path) 
 async def test_forge_registers_fork_on_first_publish(engine, tmp_path: Path) -> None:
     sessions = create_session_factory(engine)
     add_repository(sessions)
-    forge = GitCodeForge(
-        "token",
-        "coderus-bot",
-        session_factory=sessions,
-        publisher_factory=FakePublisher,
-    )
+    forge = gitcode_forge(sessions)
+
 
     await forge.publish(
         PublishRequest(
@@ -152,12 +154,8 @@ async def test_forge_allows_pr_metadata_without_registered_fork(engine) -> None:
     sessions = create_session_factory(engine)
     add_repository(sessions)
     FakePublisher.calls = []
-    forge = GitCodeForge(
-        "token",
-        "coderus-bot",
-        session_factory=sessions,
-        publisher_factory=FakePublisher,
-    )
+    forge = gitcode_forge(sessions)
+
 
     details = await forge.get_pull_request("open", "widgets", 7)
     comment = await forge.publish_pr_comment(
@@ -181,12 +179,8 @@ async def test_forge_allows_pr_metadata_without_registered_fork(engine) -> None:
 async def test_forge_rejects_wrong_provider_or_disabled_repository(engine) -> None:
     sessions = create_session_factory(engine)
     add_repository(sessions, provider="github")
-    forge = GitCodeForge(
-        "token",
-        "coderus-bot",
-        session_factory=sessions,
-        publisher_factory=FakePublisher,
-    )
+    forge = gitcode_forge(sessions)
+
 
     with pytest.raises(ValueError, match="GitCode"):
         await forge.get_pull_request("open", "widgets", 7)

@@ -1,14 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
-
-from sqlalchemy import select
-from sqlalchemy.orm import Session
 
 from coderus.forge.gitcode.pulls import GitCodePublisher
-from coderus.forge.protocols import PublishRequest
-from coderus.models import Repository
+from coderus.forge.protocols import ForkRegistry, PublishRequest
 
 
 class GitCodeForge:
@@ -17,13 +12,13 @@ class GitCodeForge:
         token: str,
         account_name: str,
         *,
-        session_factory: Callable[[], Session],
+        forks: ForkRegistry,
         publisher_factory: type = GitCodePublisher,
         http_client: object | None = None,
     ) -> None:
         self._token = token
         self._account_name = account_name
-        self._sessions = session_factory
+        self._forks = forks
         self._publisher_factory = publisher_factory
         self._http_client = http_client
 
@@ -73,26 +68,13 @@ class GitCodeForge:
     def _registered_publisher(
         self, owner: str, name: str, *, register_fork: bool = False
     ):
-        with self._sessions() as session:
-            repository = session.scalar(
-                select(Repository).where(
-                    Repository.provider == "gitcode",
-                    Repository.owner == owner,
-                    Repository.name == name,
-                    Repository.is_enabled.is_(True),
-                )
-            )
-            if repository is None:
-                raise ValueError("GitCode 仓库尚未登记")
-            if not repository.fork_url and register_fork:
-                bootstrap = self._new_publisher(registered_forks={})
-                fork = bootstrap.ensure_fork(owner, name)
-                repository.fork_owner = fork.owner
-                repository.fork_url = fork.url
-                session.commit()
-            registered = (
-                {(owner, name): repository.fork_url} if repository.fork_url else {}
-            )
+        fork_url = self._forks.fork_url(owner, name)
+        if not fork_url and register_fork:
+            bootstrap = self._new_publisher(registered_forks={})
+            fork = bootstrap.ensure_fork(owner, name)
+            self._forks.record_fork(owner, name, fork)
+            fork_url = fork.url
+        registered = {(owner, name): fork_url} if fork_url else {}
         return self._new_publisher(registered_forks=registered)
 
     def _new_publisher(self, *, registered_forks: dict[tuple[str, str], str]):

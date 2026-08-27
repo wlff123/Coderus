@@ -30,7 +30,7 @@ from .models import (
     PullRequestDetails,
     Repository,
 )
-from .protocols import Forge, PublishRequest
+from .protocols import Forge, ForkRegistry, PublishRequest
 from .registry import (
     ALL_FORGE_CAPABILITIES,
     ForgeCapability,
@@ -50,6 +50,7 @@ __all__ = [
     "ForgeRegistry",
     "ForgeRemoteError",
     "ForkNotReady",
+    "ForkRegistry",
     "ForkResult",
     "GitCommandResult",
     "GitCodeForge",
