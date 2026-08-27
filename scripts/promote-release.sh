@@ -5,7 +5,9 @@ umask 077
 ROOT="${CODERUS_ROOT:-/opt/coderus}"
 DATABASE="${CODERUS_DATABASE:-$ROOT/data/coderus.db}"
 DRAIN_TIMEOUT="${CODERUS_DRAIN_TIMEOUT:-3600}"
-CUTOVER_TIMEOUT="${CODERUS_CUTOVER_TIMEOUT:-30}"
+# 完整应用启动（含飞书连接与调度器初始化）实测可超过 30 秒，
+# 过紧的默认值会触发切换失败和不必要的回滚。
+CUTOVER_TIMEOUT="${CODERUS_CUTOVER_TIMEOUT:-120}"
 PORT="${CODERUS_PORT:-18082}"
 DRAIN_GATE="$ROOT/data/release-draining"
 LOCK_FILE="$ROOT/data/release.lock"

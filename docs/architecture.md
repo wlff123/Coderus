@@ -39,6 +39,8 @@ Coderus 将自动化编码限制在管理员授权的仓库和人工派发的任
 - `coderus/forge` 是平台适配的唯一入口：`forge/errors.py`（统一错误层级 `ForgeError`/`InvalidForgeInput`/`ForgeRemoteError`）、`forge/http.py`（带退避重试的共享 HTTP 客户端）、`forge/urls.py`（URL 解析）、`forge/models.py`（仓库/Issue/PR 数据模型）、`forge/git_transport.py`（受控 git 推送）；GitHub 与 GitCode 各自在 `forge/github/`、`forge/gitcode/` 子包内实现 `issues.py`（读取）、`pulls.py`（发布）与 `forge.py`（门面）。原 `providers`、`publisher` 包已删除。forge 不依赖 ORM：已登记 Fork 的查询与登记通过 `ForkRegistry` 协议注入，数据库实现（`DatabaseForkRegistry`）在装配层 `web/forge_runtime.py`。
 - Forge 发布使用 typed `PublishRequest`（构造即校验 workspace、owner、分支等），不再接收任意 kwargs。
 - 两个编排器共用的基建原语下沉：任务租约续期与心跳在 `tasks/lease.py`（`TaskLease` + `heartbeat_loop`，续约在独立线程执行，事件循环被重 I/O 阻塞时租约不丢），Agent 短时凭据生命周期在 `model_proxy`（`issued_stage_token`），Agent 启动重试在 `workflow/limited_runner.py`。
+- 任务失败落库使用稳定错误代码：十类代码在 `tasks/error_codes.py`（`TaskErrorCode`），编排器经 `classify_exception` 归类，异常类型可用类属性 `error_code` 自行声明类别；页面文案与恢复动作不依赖异常字符串。
+- 只读评测基线在 `coderus/evaluation`（数据契约、历史任务收集器、原子输出），CLI 入口 `coderus eval candidates` / `coderus eval baseline` 以只读连接打开数据库；模型代理用量按阶段快照写入 `AgentRun.structured_result["model_usage"]`（见 `docs/evaluation.md`）。
 
 ## 可靠性机制
 

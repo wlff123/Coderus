@@ -188,6 +188,8 @@ PR 中的六段中文报告继续使用：问题描述、问题复现、修改�
 
 错误代码保持稳定，页面和飞书可以显示不同文案，但不能依赖异常字符串判断恢复动作。
 
+已实现：十类代码在 `coderus/tasks/error_codes.py`（`TaskErrorCode`），编排器失败落库统一经 `classify_exception` 归类；异常类型可用类属性 `error_code` 自行声明类别。既有特化代码（`developer_report_invalid`、`manager_restarted`、`worker_interrupted`、`publish_existing`、`pr_feedback_revision`）保持不变，视作对应类别的细分。
+
 ### 7.3 恢复规则
 
 | 场景 | 处理方式 |
@@ -275,14 +277,16 @@ coderus upgrade
 
 ## 11. 实施路线
 
-### 阶段 0：建立基线
+### 阶段 0：建立基线（工具已交付）
 
-交付：
+已交付：
 
-- 选择 10 至 20 个历史 Issue 形成固定评测集；
-- 固定模型、提示词、资源限制和运行环境；
-- 记录完成率、测试通过率、人工修改量、耗时和模型使用量；
-- 补充服务重启、模型超时和 PR 创建结果不确定的端到端测试。
+- 只读评测包 `coderus/evaluation`（版本化数据契约、历史任务收集器、原子 JSON 输出）；
+- 只读 CLI：`coderus eval candidates` 列出候选终态任务，`coderus eval baseline` 生成基线报告，全程不改写数据库；
+- 模型代理用量按阶段快照并写入 `AgentRun.structured_result["model_usage"]`，新任务自动带模型请求数与输出字节数；
+- 操作文档 `docs/evaluation.md`。
+
+待运营：管理员在生产数据上选定 10 至 20 个历史任务、逐项填写人工注解并生成首份基线（选择文件与报告存放在 `data/evaluations/`，不入库）。
 
 验收：后续工作流或提示词变更都能与统一基线比较。
 
@@ -304,7 +308,7 @@ coderus upgrade
 
 交付：
 
-- 任务事件和稳定错误代码；
+- 任务事件和稳定错误代码（错误代码已交付：`tasks/error_codes.py` 定义十类稳定代码，两个编排器的失败落库统一走 `classify_exception`，不再持久化异常类名）；
 - 重启恢复、阶段重试、发布对账和通知补偿；
 - 任务时间线、执行证据、系统诊断和脱敏诊断包。
 
