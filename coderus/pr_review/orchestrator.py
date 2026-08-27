@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -85,7 +86,7 @@ class PRReviewOrchestrator:
         claim_token = self._claim(task_id)
         if claim_token is None:
             return
-        heartbeat_stop = asyncio.Event()
+        heartbeat_stop = threading.Event()
         claim_lost = asyncio.Event()
         heartbeat = asyncio.create_task(
             self._heartbeat(task_id, claim_token, heartbeat_stop, claim_lost),
@@ -245,7 +246,7 @@ class PRReviewOrchestrator:
         self,
         task_id: int,
         claim_token: str,
-        stop: asyncio.Event,
+        stop: threading.Event,
         claim_lost: asyncio.Event,
     ) -> None:
         await heartbeat_loop(
@@ -253,6 +254,7 @@ class PRReviewOrchestrator:
             stop,
             claim_lost.set,
             interval=CLAIM_HEARTBEAT_SECONDS,
+            lease_seconds=CLAIM_LEASE_SECONDS,
             log_label=f"pr-review-{task_id}",
         )
 

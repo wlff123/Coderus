@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -990,9 +991,10 @@ async def test_heartbeat_sets_claim_lost_when_renewal_fails(
 ) -> None:
     task = add_review_task(session)
     orchestrator, *_ = build_orchestrator(engine, tmp_path)
-    stop = asyncio.Event()
+    stop = threading.Event()
     claim_lost = asyncio.Event()
     monkeypatch.setattr(orchestrator_module, "CLAIM_HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(orchestrator_module, "CLAIM_LEASE_SECONDS", 0.05)
 
     def fail_renew(*_args) -> bool:
         if failure == "raise":
@@ -1006,7 +1008,7 @@ async def test_heartbeat_sets_claim_lost_when_renewal_fails(
         timeout=1,
     )
 
-    assert claim_lost.is_set()
+    await asyncio.wait_for(claim_lost.wait(), timeout=1)
 
 
 @pytest.mark.asyncio

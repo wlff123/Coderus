@@ -176,10 +176,13 @@ def _validate_options(
 
 async def _monitor_path_size(path: Path, limit: int, exceeded: asyncio.Event) -> None:
     while True:
+        started = time.monotonic()
         if await asyncio.to_thread(path_size_exceeds, path, limit):
             exceeded.set()
             return
-        await asyncio.sleep(0.1)
+        # 按扫描耗时自适应轮询间隔：大目录全量扫描很贵，不能每 0.1 秒重扫。
+        scan_seconds = time.monotonic() - started
+        await asyncio.sleep(min(5.0, max(0.1, scan_seconds * 10)))
 
 
 def path_size_exceeds(path: Path, limit: int) -> bool:

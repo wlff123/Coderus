@@ -47,10 +47,13 @@ class PRWorkspace:
         *,
         staging_root: Path | None = None,
         command_timeout_seconds: float = 120.0,
-        max_workspace_bytes: int = 2 * 1024 * 1024 * 1024,
+        transfer_timeout_seconds: float = 1800.0,
+        max_workspace_bytes: int = 8 * 1024 * 1024 * 1024,
     ) -> None:
         if command_timeout_seconds <= 0:
             raise ValueError("command_timeout_seconds must be positive")
+        if transfer_timeout_seconds <= 0:
+            raise ValueError("transfer_timeout_seconds must be positive")
         if max_workspace_bytes <= 0:
             raise ValueError("max_workspace_bytes must be positive")
         self.workspace_root = workspace_root.expanduser().resolve()
@@ -61,6 +64,7 @@ class PRWorkspace:
             else Path(tempfile.gettempdir()) / f"coderus-pr-review-staging{suffix}"
         )
         self.command_timeout_seconds = command_timeout_seconds
+        self.transfer_timeout_seconds = transfer_timeout_seconds
         self.max_workspace_bytes = max_workspace_bytes
 
     async def prepare(
@@ -90,16 +94,23 @@ class PRWorkspace:
         if workspace.parent != self.workspace_root or workspace.name != workspace_name:
             raise RuntimeError("PR workspace escapes workspace root")
         if workspace.exists():
-            self._remove_stale_workspace(workspace, workspace_name)
+            # 陈旧工作区可能有数 GB，删除必须离开事件循环执行。
+            await asyncio.to_thread(self._remove_stale_workspace, workspace, workspace_name)
 
-        staging_root = self._validated_staging_root()
-        with tempfile.TemporaryDirectory(prefix=f"pr-{task_id}-", dir=staging_root) as staging:
-            checkout = Path(staging) / "checkout"
+        staging_root = await asyncio.to_thread(self._validated_staging_root)
+        staging = Path(
+            await asyncio.to_thread(
+                tempfile.mkdtemp, prefix=f"pr-{task_id}-", dir=staging_root
+            )
+        )
+        try:
+            checkout = staging / "checkout"
             await self._run(
                 "git",
                 "clone",
                 "--no-checkout",
                 "--no-tags",
+                "--single-branch",
                 "--origin",
                 "upstream",
                 "--",
@@ -125,7 +136,10 @@ class PRWorkspace:
             if resolved_head.lower() != head_sha.lower():
                 raise RuntimeError("fetched PR head SHA does not match the requested head SHA")
             await self._run("git", "checkout", "--detach", head_sha, cwd=checkout)
-            shutil.move(str(checkout), str(workspace))
+            # 跨文件系统搬运整个检出可能拷贝数 GB，同样不能阻塞事件循环。
+            await asyncio.to_thread(shutil.move, str(checkout), str(workspace))
+        finally:
+            await asyncio.to_thread(shutil.rmtree, staging, ignore_errors=True)
 
         workspace.chmod(0o700)
         return workspace
@@ -468,6 +482,12 @@ class PRWorkspace:
         environment["GCM_INTERACTIVE"] = "Never"
         return environment
 
+    def _timeout_for(self, command: tuple[str, ...]) -> float:
+        """clone/fetch/checkout 涉及大体量网络传输或落盘，用独立的宽松超时。"""
+        if len(command) > 1 and command[1] in {"clone", "fetch", "checkout"}:
+            return self.transfer_timeout_seconds
+        return self.command_timeout_seconds
+
     async def _run(self, *command: str, cwd: Path) -> str:
         if not command or command[0] != "git":
             raise ValueError("PRWorkspace only permits Git commands")
@@ -495,7 +515,7 @@ class PRWorkspace:
                     hardened,
                     cwd=cwd,
                     env=self._git_environment(isolated_home),
-                    timeout_seconds=self.command_timeout_seconds,
+                    timeout_seconds=self._timeout_for(command),
                     watch_path=watch_path,
                     max_path_bytes=self.max_workspace_bytes,
                 )

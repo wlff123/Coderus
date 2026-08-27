@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import threading
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -130,7 +131,7 @@ class TaskOrchestrator:
         self,
         task_id: int,
         claim_token: str,
-        stop: asyncio.Event,
+        stop: threading.Event,
         claim_lost: asyncio.Event,
         cancel_event: asyncio.Event,
     ) -> None:
@@ -142,6 +143,7 @@ class TaskOrchestrator:
             lambda: self._renew_claim(task_id, claim_token),
             stop,
             on_lost,
+            lease_seconds=CLAIM_LEASE_SECONDS,
             log_label=f"task-{task_id}",
         )
 
@@ -157,7 +159,7 @@ class TaskOrchestrator:
             return
         cancel_event = asyncio.Event()
         self._cancel_events[task_id] = cancel_event
-        heartbeat_stop = asyncio.Event()
+        heartbeat_stop = threading.Event()
         claim_lost = asyncio.Event()
         heartbeat = asyncio.create_task(
             self._heartbeat(

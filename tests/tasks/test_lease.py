@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -85,15 +87,64 @@ async def test_heartbeat_loop_reports_lost_lease(failure: str) -> None:
         return False
 
     await asyncio.wait_for(
-        heartbeat_loop(renew, asyncio.Event(), lost.set, interval=0.01),
-        timeout=1,
+        heartbeat_loop(
+            renew, threading.Event(), lost.set, interval=0.01, lease_seconds=0.05
+        ),
+        timeout=2,
     )
-    assert lost.is_set()
+    await asyncio.wait_for(lost.wait(), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_loop_tolerates_transient_renew_errors() -> None:
+    stop = threading.Event()
+    lost = asyncio.Event()
+    calls = 0
+
+    def renew() -> bool:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("database busy")
+        if calls >= 3:
+            stop.set()
+        return True
+
+    await asyncio.wait_for(
+        heartbeat_loop(renew, stop, lost.set, interval=0.01, lease_seconds=60),
+        timeout=2,
+    )
+    assert not lost.is_set()
+    assert calls >= 3
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_loop_renews_while_event_loop_is_blocked() -> None:
+    """事件循环被同步工作阻塞时，续约必须照常发生。"""
+    stop = threading.Event()
+    lost = asyncio.Event()
+    renewals = 0
+
+    def renew() -> bool:
+        nonlocal renewals
+        renewals += 1
+        return True
+
+    loop_task = asyncio.create_task(
+        heartbeat_loop(renew, stop, lost.set, interval=0.01, lease_seconds=60)
+    )
+    await asyncio.sleep(0.05)  # 让心跳线程先启动
+    time.sleep(0.3)  # 故意在事件循环线程上做同步阻塞
+    blocked_renewals = renewals
+    stop.set()
+    await asyncio.wait_for(loop_task, timeout=2)
+    assert blocked_renewals >= 5
+    assert not lost.is_set()
 
 
 @pytest.mark.asyncio
 async def test_heartbeat_loop_stops_cleanly_when_asked() -> None:
-    stop = asyncio.Event()
+    stop = threading.Event()
     lost = asyncio.Event()
     renewals = 0
 

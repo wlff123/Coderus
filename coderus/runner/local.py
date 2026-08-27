@@ -100,7 +100,7 @@ class RunnerConfig:
         default_factory=lambda: DEFAULT_ENVIRONMENT_ALLOWLIST
     )
     termination_grace_seconds: float = 0.5
-    max_workspace_bytes: int = 2 * 1024 * 1024 * 1024
+    max_workspace_bytes: int = 8 * 1024 * 1024 * 1024
     runtime_root: Path = field(default_factory=lambda: _default_runtime_root())
 
     def __init__(
@@ -114,7 +114,7 @@ class RunnerConfig:
         termination_grace_seconds: float = 0.5,
         sandbox_mode: str = "workspace-write",
         runtime_root: Path | None = None,
-        max_workspace_bytes: int = 2 * 1024 * 1024 * 1024,
+        max_workspace_bytes: int = 8 * 1024 * 1024 * 1024,
     ) -> None:
         if not codex_command:
             raise ValueError("codex_command must not be empty")
@@ -494,12 +494,15 @@ class LocalCodexRunner:
 
     async def _monitor_workspace(self, workspace: Path, exceeded: asyncio.Event) -> None:
         while True:
+            started = time.monotonic()
             if await asyncio.to_thread(
                 path_size_exceeds, workspace, self._config.max_workspace_bytes
             ):
                 exceeded.set()
                 return
-            await asyncio.sleep(0.1)
+            # 按扫描耗时自适应轮询间隔，大工作区不做高频全量重扫。
+            scan_seconds = time.monotonic() - started
+            await asyncio.sleep(min(5.0, max(0.1, scan_seconds * 10)))
 
     def _create_run_directories(self, workspace: Path) -> _RunDirectories:
         runtime_root = self._validated_runtime_root(workspace)

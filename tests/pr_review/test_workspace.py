@@ -48,6 +48,18 @@ async def test_git_size_check_does_not_block_the_event_loop(
     assert event_loop_responsive.is_set()
 
 
+def test_transfer_commands_use_relaxed_timeout(tmp_path: Path) -> None:
+    manager = PRWorkspace(
+        tmp_path / "workspaces",
+        command_timeout_seconds=10,
+        transfer_timeout_seconds=600,
+    )
+    assert manager._timeout_for(("git", "clone", "--", "url", "dst")) == 600
+    assert manager._timeout_for(("git", "fetch", "--", "upstream", "main")) == 600
+    assert manager._timeout_for(("git", "checkout", "--detach", "a" * 40)) == 600
+    assert manager._timeout_for(("git", "rev-parse", "HEAD")) == 10
+
+
 def create_upstream(tmp_path: Path) -> tuple[Path, str, str]:
     source = tmp_path / "source"
     source.mkdir()
