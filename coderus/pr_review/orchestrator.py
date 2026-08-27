@@ -24,6 +24,7 @@ from coderus.pr_review.result import (
     validate_findings,
 )
 from coderus.runner import AgentRole, JobSpec, JobStatus, Stage
+from coderus.tasks.lease import TaskLease, heartbeat_loop
 from coderus.workflow.limited_runner import retry_agent_operation
 
 logger = logging.getLogger(__name__)
@@ -246,40 +247,23 @@ class PRReviewOrchestrator:
         stop: asyncio.Event,
         claim_lost: asyncio.Event,
     ) -> None:
-        while True:
-            try:
-                await asyncio.wait_for(stop.wait(), timeout=CLAIM_HEARTBEAT_SECONDS)
-                return
-            except TimeoutError:
-                try:
-                    renewed = self._renew_claim(task_id, claim_token)
-                except Exception as exc:
-                    logger.error(
-                        "PR review heartbeat failed for %s: %s",
-                        task_id,
-                        type(exc).__name__,
-                    )
-                    claim_lost.set()
-                    return
-                if not renewed:
-                    claim_lost.set()
-                    return
+        await heartbeat_loop(
+            lambda: self._renew_claim(task_id, claim_token),
+            stop,
+            claim_lost.set,
+            interval=CLAIM_HEARTBEAT_SECONDS,
+            log_label=f"pr-review-{task_id}",
+        )
 
     def _renew_claim(self, task_id: int, claim_token: str) -> bool:
-        now = datetime.now(UTC)
-        with self.sessions() as session:
-            result = session.execute(
-                update(PRReviewTask)
-                .where(
-                    PRReviewTask.id == task_id,
-                    PRReviewTask.status.in_(ACTIVE_STATUSES),
-                    PRReviewTask.claim_token == claim_token,
-                    PRReviewTask.claim_expires_at > now,
-                )
-                .values(claim_expires_at=now + timedelta(seconds=CLAIM_LEASE_SECONDS))
-            )
-            session.commit()
-            return result.rowcount == 1
+        # 每次调用重建租约对象，让测试可以在运行期调小 CLAIM_LEASE_SECONDS。
+        lease = TaskLease(
+            session_factory=self.sessions,
+            model=PRReviewTask,
+            active_statuses=ACTIVE_STATUSES,
+            lease_seconds=CLAIM_LEASE_SECONDS,
+        )
+        return lease.renew(task_id, claim_token)
 
     def _assert_claim(self, task_id: int, claim_token: str, claim_lost: asyncio.Event) -> None:
         if claim_lost.is_set() or not self._renew_claim(task_id, claim_token):

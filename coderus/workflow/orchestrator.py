@@ -4,7 +4,7 @@ import asyncio
 import inspect
 import json
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session, selectinload
 from coderus.forge import ForgeRegistry
 from coderus.models import AgentRun, Issue, PRFeedback, Review, Task
 from coderus.runner import AgentRole, JobStatus, Stage
+from coderus.tasks.lease import CLAIM_LEASE_SECONDS, TaskLease, heartbeat_loop
 from coderus.tasks.statuses import TERMINAL_TASK_STATES
 from coderus.workflow.agent_stage import (
     AgentStageExecutor,
@@ -38,9 +39,6 @@ from coderus.workflow.task_state import (
     cas_task_status,
     claim_queued_task,
 )
-
-CLAIM_LEASE_SECONDS = 120.0
-CLAIM_HEARTBEAT_SECONDS = 10.0
 
 _STATUS_EXPECTED = {
     "preparing": {"queued"},
@@ -83,6 +81,11 @@ class TaskOrchestrator:
         self.notifier = notifier
         self.credential_broker = credential_broker
         self._cancel_events: dict[int, asyncio.Event] = {}
+        self.lease = TaskLease(
+            session_factory=session_factory,
+            model=Task,
+            active_statuses=_CLAIMED_STATES,
+        )
         self.stage_executor = AgentStageExecutor(
             session_factory=session_factory,
             runner=runner,
@@ -131,37 +134,19 @@ class TaskOrchestrator:
         claim_lost: asyncio.Event,
         cancel_event: asyncio.Event,
     ) -> None:
-        while True:
-            try:
-                await asyncio.wait_for(stop.wait(), timeout=CLAIM_HEARTBEAT_SECONDS)
-                return
-            except TimeoutError:
-                try:
-                    renewed = self._renew_claim(task_id, claim_token)
-                except Exception:
-                    renewed = False
-                if not renewed:
-                    claim_lost.set()
-                    cancel_event.set()
-                    return
+        def on_lost() -> None:
+            claim_lost.set()
+            cancel_event.set()
+
+        await heartbeat_loop(
+            lambda: self._renew_claim(task_id, claim_token),
+            stop,
+            on_lost,
+            log_label=f"task-{task_id}",
+        )
 
     def _renew_claim(self, task_id: int, claim_token: str) -> bool:
-        now = datetime.now(UTC)
-        with self.sessions() as session:
-            result = session.execute(
-                update(Task)
-                .where(
-                    Task.id == task_id,
-                    Task.status.in_(_CLAIMED_STATES),
-                    Task.claim_token == claim_token,
-                    Task.claim_expires_at > now,
-                )
-                .values(
-                    claim_expires_at=now + timedelta(seconds=CLAIM_LEASE_SECONDS)
-                )
-            )
-            session.commit()
-            return result.rowcount == 1
+        return self.lease.renew(task_id, claim_token)
 
     async def run(self, task_id: int, *, claim_token: str | None = None) -> None:
         if claim_token is None:
