@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import httpx
 
+from coderus.application import IssueCommands, ReviewCommands
 from coderus.forge import (
     ForgeCapability,
     ForgeRegistration,
@@ -9,7 +10,6 @@ from coderus.forge import (
     GitCodeForge,
     GitHubForge,
 )
-from coderus.application import IssueCommands, ReviewCommands
 from coderus.integrations.feishu.commands import IncomingFeishuMessage
 from coderus.integrations.feishu.service import FeishuCommandService
 from coderus.models import PRReviewTask, Repository, User

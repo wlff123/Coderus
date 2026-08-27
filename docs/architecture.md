@@ -28,6 +28,16 @@ Coderus 将自动化编码限制在管理员授权的仓库和人工派发的任
 | Feishu Integration | 长连接收取命令并发送任务和 PR 通知 |
 | Release Runtime | 候选安装、隔离预览、排空、切换和自动回滚 |
 
+## 代码分层
+
+阶段 1 架构收敛后，模块依赖方向固定为：入口层（`web/routes`、`integrations/feishu`）只调用应用服务层（`coderus/application`），应用服务层只调用领域层（`issues`、`pr_review`、`workflow`、`forge`），领域层不反向依赖任何入口。
+
+- `coderus/web/app.py` 只负责应用创建、middleware、health/readiness、静态文件和 Router 注册；运行时对象的构建和生命周期在 `coderus/web/runtime.py`（`build_runtime` + `RuntimeComponents.start/stop/close`，通过 FastAPI lifespan 驱动）。
+- 页面路由按域拆分在 `coderus/web/routes/`（auth、users、repositories、issues、dashboard、tasks、reviews、system），公共 UI 助手在 `coderus/web/ui.py`；依赖全部通过构造参数显式注入。
+- `coderus/application` 提供网页和飞书共用的用例入口：`IssueCommands`（添加与派发）、`ReviewCommands`（PR 检视入队）、`TaskCommands`（取消、关闭、意见同步、再发布），错误统一为 `NotFound`/`Forbidden`/`Conflict`。
+- `TaskOrchestrator` 只保留租约、状态推进、分支选择和顶层异常策略；Agent 阶段执行在 `workflow/agent_stage.py`、双 Reviewer 周期在 `workflow/review_cycle.py`、提交封装与 PR 发布在 `workflow/publication.py`、提示词纯函数在 `workflow/prompts.py`。
+- Forge 发布使用 typed `PublishRequest`（构造即校验 workspace、owner、分支等），不再接收任意 kwargs；Issue provider 接口暂未迁移。
+
 ## 可靠性机制
 
 - 活跃 Manager 使用与 SQLite 同目录的操作系统文件锁，同一数据目录只允许一个调度实例；预览和维护进程不参与任务领取。

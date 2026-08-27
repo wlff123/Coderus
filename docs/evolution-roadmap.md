@@ -284,16 +284,17 @@ coderus upgrade
 
 验收：后续工作流或提示词变更都能与统一基线比较。
 
-### 阶段 1：架构收敛
+### 阶段 1：架构收敛（已完成主体）
 
-交付：
+已交付：
 
-- 拆分 `web/app.py` 为路由模块与装配文件，抽取应用服务层，网页和飞书改调应用服务；
-- 拆分 Issue 阶段处理器，编排器只保留状态读取、处理器调用和状态转移；
-- 收敛 Forge 协议，合并 `providers`、`publisher`、`forge` 的重叠实现和平台错误模型；
-- 保持现有页面、URL、数据库和任务行为兼容。
+- `web/app.py` 拆分为 8 个路由模块（`web/routes/`）与运行时装配（`web/runtime.py`，lifespan 驱动）；
+- 应用服务层 `coderus/application`（IssueCommands、ReviewCommands、TaskCommands）上线，网页和飞书调用同一用例；
+- 编排器只保留租约、状态推进与顶层异常策略；Agent 阶段执行（`agent_stage`）、Reviewer 周期（`review_cycle`）、发布封装（`publication`）、提示词（`prompts`）各自独立且有专属测试；
+- Forge 发布接口收紧为 typed `PublishRequest`；
+- 页面、URL、数据库和任务行为保持兼容（由路由契约快照测试固定）。
 
-验收：现有测试和端到端流程全部通过，各任务阶段可以独立测试，不引入通用框架。
+遗留（顺延后续阶段）：`providers`、`publisher`、`forge` 的重叠实现与平台错误模型合并；Issue provider 接口迁移。
 
 ### 阶段 2：可靠性与诊断
 
