@@ -9,6 +9,7 @@ from coderus.forge import (
     GitCodeForge,
     GitHubForge,
 )
+from coderus.application import IssueCommands, ReviewCommands
 from coderus.integrations.feishu.commands import IncomingFeishuMessage
 from coderus.integrations.feishu.service import FeishuCommandService
 from coderus.models import PRReviewTask, Repository, User
@@ -177,8 +178,8 @@ def test_feishu_review_gate_requires_both_review_methods(engine) -> None:
     )
     service = FeishuCommandService(
         session_factory=sessions,
-        providers={},
-        forges=forges,
+        issues=IssueCommands(session_factory=sessions, providers={}),
+        reviews=ReviewCommands(session_factory=sessions, forges=forges),
     )
 
     unavailable = service.handle(_review_message("incomplete"))

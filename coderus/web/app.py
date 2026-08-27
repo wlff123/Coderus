@@ -4,30 +4,23 @@ import asyncio
 import inspect
 import logging
 import os
-import secrets
-import shutil
 import weakref
 from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Literal
-from urllib.parse import urlencode
+from typing import Literal
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import func, select
-from sqlalchemy.orm import selectinload
+from sqlalchemy import select
 from starlette.middleware.sessions import SessionMiddleware
 
-from coderus.application import IssueCommands, ReviewCommands
+from coderus.application import IssueCommands, ReviewCommands, TaskCommands
 from coderus.assistant import ModelAssistant
-from coderus.auth.security import (
-    verify_csrf_token,
-)
 from coderus.auth.service import ensure_bootstrap_admin
 from coderus.config import Settings, load_settings
 from coderus.db import (
@@ -35,8 +28,8 @@ from coderus.db import (
     create_session_factory,
     ensure_schema_compatibility,
 )
-from coderus.forge import ForgeCapability, ForgeNotConfigured, ForgeRegistry
-from coderus.integrations.feishu import FeishuClient, FeishuConfig, FeishuRequestError
+from coderus.forge import ForgeCapability, ForgeRegistry
+from coderus.integrations.feishu import FeishuClient, FeishuConfig
 from coderus.integrations.feishu.bot import FeishuBot
 from coderus.integrations.feishu.commands import IncomingFeishuMessage
 from coderus.integrations.feishu.gateway import FeishuGateway
@@ -46,14 +39,10 @@ from coderus.integrations.feishu.settings import (
     ensure_feishu_bot_user,
 )
 from coderus.integrations.gitcode_credentials import (
-    GitCodeCredentialEncryptionUnavailable,
     GitCodeCredentialManager,
-    GitCodeCredentialValidationError,
 )
 from coderus.integrations.github_credentials import (
-    GitHubCredentialEncryptionUnavailable,
     GitHubCredentialManager,
-    GitHubCredentialValidationError,
     ResolvedGitHubCredential,
 )
 from coderus.issues.poller import IssuePoller
@@ -61,67 +50,44 @@ from coderus.model_proxy import CredentialBroker, create_proxy_app
 from coderus.models import (
     Base,
     FeishuEvent,
-    Issue,
-    PRFeedback,
-    PRReviewTask,
     Repository,
-    Task,
-    User,
 )
 from coderus.pr_review.orchestrator import PRReviewOrchestrator
 from coderus.pr_review.scheduler import PRReviewScheduler
-from coderus.pr_review.service import enqueue_pr_review
 from coderus.pr_review.workspace import PRWorkspace
 from coderus.providers import GitCodeProvider, GitHubProvider
-from coderus.providers.errors import InvalidProviderUrl
-from coderus.providers.urls import parse_pull_request_url
 from coderus.readiness import readiness_report
 from coderus.release_gate import ReleaseGate
 from coderus.release_status import load_release_status
 from coderus.runner import LocalCodexRunner, RunnerConfig, resolve_codex_command
 from coderus.runtime_lock import ActiveManagerLock
 from coderus.security import CredentialCipher, inspect_codex_auth
-from coderus.tasks.statuses import RUNNING_TASK_STATES
 from coderus.web.forge_runtime import (
     build_gitcode_runtime,
     build_github_runtime,
     install_forge_runtime,
 )
-from coderus.web.presentation import (
-    review_status_label,
-    review_status_tone,
-    status_label,
-    status_tone,
-)
 from coderus.web.routes.auth import build_auth_router
+from coderus.web.routes.dashboard import build_dashboard_router
 from coderus.web.routes.issues import build_issue_router
 from coderus.web.routes.repositories import build_repository_router
+from coderus.web.routes.reviews import build_review_router
+from coderus.web.routes.system import build_system_router
+from coderus.web.routes.tasks import build_task_router
 from coderus.web.routes.users import build_user_router
 from coderus.web.ui import (
     WebUI,
-    enabled_repository,
-    redirect,
     templates,
 )
-from coderus.workflow.feedback import upsert_pr_feedback
 from coderus.workflow.limited_runner import LimitedRunner
 from coderus.workflow.notifications import FeishuTaskNotifier
 from coderus.workflow.orchestrator import TaskOrchestrator
 from coderus.workflow.pr_status import PRStatusPoller
 from coderus.workflow.scheduler import TaskScheduler
-from coderus.workflow.task_state import cas_task_status
 from coderus.workflow.workspace_git import WorkspaceGit
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 logger = logging.getLogger(__name__)
-ISSUES_PAGE_SIZE = 25
-REVIEWS_PAGE_SIZE = 20
-DEFAULT_TASK_HIDDEN_STATUSES = frozenset(
-    {"completed", "closed", "dismissed", "cancelled"}
-)
-CLOSABLE_TASK_STATUSES = frozenset(
-    {"awaiting_human_review", "failed", "manual_intervention", "cancelled"}
-)
 RuntimeMode = Literal["active", "preview", "maintenance"]
 RUNTIME_MODES = frozenset({"active", "preview", "maintenance"})
 
@@ -395,6 +361,7 @@ def create_app(
         session_factory=sessions, providers=app.state.providers
     )
     review_commands = ReviewCommands(session_factory=sessions, forges=app.state.forges)
+    task_commands = TaskCommands(session_factory=sessions, forges=app.state.forges)
 
     assistant = None
     if settings.assistant.enabled and settings.model_api_key is not None:
@@ -698,9 +665,6 @@ def create_app(
     app.mount("/static", StaticFiles(directory=PACKAGE_ROOT / "static"), name="static")
 
     ui = WebUI(templates)
-    user_for = ui.current_user
-    flash = ui.flash
-    context = ui.context
 
     @app.get("/healthz")
     def healthz() -> JSONResponse:
@@ -772,910 +736,42 @@ def create_app(
             codex_auth=lambda: app.state.codex_auth,
         )
     )
-
-    @app.get("/", response_class=HTMLResponse)
-    def dashboard(request: Request, repository: int | None = None):
-        with sessions() as session:
-            current = user_for(request, session)
-            if current is None:
-                return redirect("/login")
-            repositories = session.scalars(
-                select(Repository)
-                .where(Repository.is_enabled.is_(True))
-                .order_by(Repository.provider, Repository.owner, Repository.name)
-            ).all()
-            selected_repository = enabled_repository(session, repository)
-            issue_scope = (
-                [Issue.repository_id == selected_repository.id]
-                if selected_repository is not None
-                else []
-            )
-            review_scope = (
-                [PRReviewTask.repository_id == selected_repository.id]
-                if selected_repository is not None
-                else []
-            )
-            counts = {
-                "issues": session.scalar(
-                    select(func.count())
-                    .select_from(Issue)
-                    .where(
-                        Issue.triage_state == "discovered",
-                        Issue.state == "open",
-                        *issue_scope,
-                    )
-                )
-                or 0,
-                "issue_tasks": session.scalar(
-                    select(func.count())
-                    .select_from(Task)
-                    .join(Task.issue)
-                    .where(Task.status.not_in(DEFAULT_TASK_HIDDEN_STATUSES), *issue_scope)
-                )
-                or 0,
-                "review_tasks": session.scalar(
-                    select(func.count())
-                    .select_from(PRReviewTask)
-                    .where(PRReviewTask.status != "completed", *review_scope)
-                )
-                or 0,
-                "attention": (
-                    session.scalar(
-                        select(func.count())
-                        .select_from(Task)
-                        .join(Task.issue)
-                        .where(
-                            Task.status.in_({"failed", "manual_intervention"}),
-                            *issue_scope,
-                        )
-                    )
-                    or 0
-                )
-                + (
-                    session.scalar(
-                        select(func.count())
-                        .select_from(PRReviewTask)
-                        .where(PRReviewTask.status == "failed", *review_scope)
-                    )
-                    or 0
-                )
-            }
-            recent_issues = session.scalars(
-                select(Issue)
-                .options(selectinload(Issue.repository))
-                .where(
-                    Issue.triage_state == "discovered",
-                    Issue.state == "open",
-                    *issue_scope,
-                )
-                .order_by(Issue.source_updated_at.desc(), Issue.id.desc())
-                .limit(8)
-            ).all()
-            issue_tasks = session.scalars(
-                select(Task)
-                .join(Task.issue)
-                .options(
-                    selectinload(Task.issue).selectinload(Issue.repository),
-                    selectinload(Task.creator),
-                )
-                .where(Task.status.not_in(DEFAULT_TASK_HIDDEN_STATUSES), *issue_scope)
-                .order_by(Task.created_at.desc())
-                .limit(10)
-            ).all()
-            review_tasks = session.scalars(
-                select(PRReviewTask)
-                .options(selectinload(PRReviewTask.repository))
-                .where(PRReviewTask.status != "completed", *review_scope)
-                .order_by(PRReviewTask.created_at.desc())
-                .limit(10)
-            ).all()
-            recent_tasks = [
-                {
-                    "key": f"RE-{task.id}",
-                    "type": "Issue 处理",
-                    "detail_url": f"/tasks/{task.id}",
-                    "repository": task.issue.repository,
-                    "target": f"#{task.issue.number} {task.issue.title}",
-                    "status": task.status,
-                    "status_label": status_label(task.status),
-                    "status_tone": status_tone(task.status),
-                    "created_at": task.created_at,
-                }
-                for task in issue_tasks
-            ] + [
-                {
-                    "key": f"RV-{task.id}",
-                    "type": "代码检视",
-                    "detail_url": f"/reviews/{task.id}",
-                    "repository": task.repository,
-                    "target": f"PR #{task.pr_number}",
-                    "status": task.status,
-                    "status_label": review_status_label(task.status),
-                    "status_tone": review_status_tone(task.status),
-                    "created_at": task.created_at,
-                }
-                for task in review_tasks
-            ]
-            recent_tasks.sort(key=lambda item: item["created_at"], reverse=True)
-            recent_tasks = recent_tasks[:10]
-            return templates.TemplateResponse(
-                request,
-                "dashboard.html",
-                context(
-                    request,
-                    current,
-                    counts=counts,
-                    issues=recent_issues,
-                    tasks=recent_tasks,
-                    repositories=repositories,
-                    selected_repository=selected_repository,
-                    selected_repository_id=(
-                        selected_repository.id if selected_repository is not None else None
-                    ),
-                    forge_status=forge_status(),
-                ),
-            )
-
-    @app.get("/system", response_class=HTMLResponse)
-    def system_page(request: Request):
-        with sessions() as session:
-            current = user_for(request, session)
-            if current is None:
-                return redirect("/login")
-            if current.role != "admin":
-                return HTMLResponse("Forbidden", status_code=403)
-            workspace_path = settings.workspace.root.resolve()
-            disk = shutil.disk_usage(workspace_path)
-            resolved_feishu = app.state.feishu_settings.resolve(session)
-            checks = {
-                "server_mode": settings.server.mode,
-                "codex_binary": settings.codex.binary,
-                "codex_auth": app.state.codex_auth,
-                "feishu": resolved_feishu.enabled,
-                "service_url": settings.server.public_url
-                or f"http://{settings.server.bind}:{settings.server.port}",
-                "database_path": str(settings.database.path.resolve()),
-                "workspace_path": str(workspace_path),
-                "workspace_free_gib": disk.free / (1024**3),
-                "scheduler": start_scheduler,
-                "running_tasks": session.scalar(
-                    select(func.count())
-                    .select_from(Task)
-                    .where(Task.status.in_(RUNNING_TASK_STATES))
-                )
-                or 0,
-                "queued_tasks": session.scalar(
-                    select(func.count()).select_from(Task).where(Task.status == "queued")
-                )
-                or 0,
-            }
-            return templates.TemplateResponse(
-                request,
-                "system.html",
-                context(
-                    request,
-                    current,
-                    checks=checks,
-                    release_status=app.state.release_status,
-                    forge_status=forge_status(),
-                    github_credential={
-                        "source": app.state.github_credential.source,
-                        "account_name": app.state.github_credential.account_name,
-                        "updated_at": app.state.github_credential.updated_at,
-                        "error": app.state.github_credential.error,
-                        "encryption_ready": app.state.github_encryption_ready,
-                        "encryption_error": app.state.github_encryption_error,
-                    },
-                    gitcode_credential={
-                        "source": app.state.gitcode_credential.source,
-                        "account_name": app.state.gitcode_credential.account_name,
-                        "updated_at": app.state.gitcode_credential.updated_at,
-                        "error": app.state.gitcode_credential.error,
-                        "encryption_ready": app.state.gitcode_encryption_ready,
-                        "encryption_error": app.state.gitcode_encryption_error,
-                    },
-                    feishu_settings={
-                        "app_id": resolved_feishu.app_id,
-                        "default_chat_id": resolved_feishu.default_chat_id,
-                        "enabled": resolved_feishu.enabled,
-                        "running": app.state.feishu_running,
-                        "has_secret": resolved_feishu.app_secret is not None,
-                        "updated_at": resolved_feishu.updated_at,
-                        "error": resolved_feishu.error,
-                        "encryption_ready": app.state.feishu_encryption_ready,
-                        "encryption_error": app.state.feishu_encryption_error,
-                        "restart_required": app.state.feishu_restart_required,
-                        "connection_error": app.state.feishu_connection_error,
-                    },
-                ),
-            )
-
-    @app.post("/system/github-credential")
-    def save_github_credential(
-        request: Request,
-        account_name: str = Form(),
-        token: str = Form(),
-        csrf_token: str = Form(),
-    ):
-        with sessions() as session:
-            current = user_for(request, session)
-            if current is None:
-                return redirect("/login")
-            if current.role != "admin":
-                return HTMLResponse("Forbidden", status_code=403)
-            if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
-                return HTMLResponse("Invalid CSRF token", status_code=400)
-            try:
-                prepared = app.state.github_credentials.prepare(account_name, token)
-                candidate = build_github_runtime(
-                    prepared.token.get_secret_value(),
-                    client=app.state.github_http_client,
-                    session_factory=sessions,
-                )
-                stored = app.state.github_credentials.save(
-                    session,
-                    prepared,
-                    updated_by=current,
-                )
-                session.commit()
-                updated_at = stored.updated_at
-            except (
-                GitHubCredentialEncryptionUnavailable,
-                GitHubCredentialValidationError,
-            ) as exc:
-                session.rollback()
-                flash(request, str(exc), "danger")
-                return redirect("/system")
-            except Exception:
-                session.rollback()
-                flash(request, "GitHub 凭据保存失败", "danger")
-                return redirect("/system")
-
-        install_forge_runtime(app, "github", candidate)
-        app.state.github_credential = ResolvedGitHubCredential(
-            provider="github",
-            account_name=prepared.account_name,
-            token=prepared.token,
-            source="database",
-            updated_at=updated_at,
+    app.include_router(
+        build_dashboard_router(
+            ui=ui, session_factory=sessions, forge_status=forge_status
         )
-        flash(request, "GitHub 凭据已保存")
-        return redirect("/system")
-
-    @app.post("/system/gitcode-credential")
-    def save_gitcode_credential(
-        request: Request,
-        account_name: str = Form(),
-        token: str = Form(),
-        csrf_token: str = Form(),
-    ):
-        with sessions() as session:
-            current = user_for(request, session)
-            if current is None:
-                return redirect("/login")
-            if current.role != "admin":
-                return HTMLResponse("Forbidden", status_code=403)
-            if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
-                return HTMLResponse("Invalid CSRF token", status_code=400)
-            try:
-                prepared = app.state.gitcode_credentials.prepare(account_name, token)
-                candidate = build_gitcode_runtime(
-                    prepared.token.get_secret_value(),
-                    account_name=prepared.account_name,
-                    client=app.state.github_http_client,
-                    session_factory=sessions,
-                )
-                stored = app.state.gitcode_credentials.save(
-                    session,
-                    prepared,
-                    updated_by=current,
-                )
-                session.commit()
-                updated_at = stored.updated_at
-            except (
-                GitCodeCredentialEncryptionUnavailable,
-                GitCodeCredentialValidationError,
-            ) as exc:
-                session.rollback()
-                flash(request, str(exc), "danger")
-                return redirect("/system")
-            except Exception:
-                session.rollback()
-                flash(request, "GitCode 凭据保存失败", "danger")
-                return redirect("/system")
-
-        install_forge_runtime(app, "gitcode", candidate)
-        app.state.gitcode_credential = type(app.state.gitcode_credential)(
-            provider="gitcode",
-            account_name=prepared.account_name,
-            token=prepared.token,
-            source="database",
-            updated_at=updated_at,
+    )
+    app.include_router(
+        build_task_router(
+            ui=ui,
+            session_factory=sessions,
+            tasks=task_commands,
+            forges=app.state.forges,
+            forge_status=forge_status,
+            signal_cancel=lambda task_id: app.state.orchestrator.cancel(task_id),
         )
-        flash(request, "GitCode 凭据已保存")
-        return redirect("/system")
-
-    @app.post("/system/feishu-bot")
-    def save_feishu_bot_settings(
-        request: Request,
-        csrf_token: str = Form(),
-        app_id: str = Form(""),
-        app_secret: str = Form(""),
-        default_chat_id: str = Form(""),
-        enabled: bool = Form(False),
-    ):
-        with sessions() as session:
-            current = user_for(request, session)
-            if current is None:
-                return redirect("/login")
-            if current.role != "admin":
-                return HTMLResponse("Forbidden", status_code=403)
-            if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
-                return HTMLResponse("Invalid CSRF token", status_code=400)
-            try:
-                prepared = app.state.feishu_settings.prepare(
-                    app_id,
-                    app_secret,
-                    default_chat_id,
-                    enabled,
-                )
-                resolved = app.state.feishu_settings.resolve(session)
-                candidate_secret = prepared.app_secret or resolved.app_secret
-                if prepared.enabled and (
-                    prepared.app_id is None or candidate_secret is None
-                ):
-                    raise ValueError("启用飞书机器人需要 App ID 和 App Secret")
-                if prepared.app_id is not None and candidate_secret is not None:
-                    FeishuClient(
-                        FeishuConfig(
-                            app_id=prepared.app_id,
-                            app_secret=candidate_secret,
-                        ),
-                        http_client=app.state.feishu_http_client,
-                    ).validate_credentials()
-                app.state.feishu_settings.save(
-                    session,
-                    prepared,
-                    updated_by=current,
-                )
-                if prepared.enabled:
-                    ensure_feishu_bot_user(session)
-                session.commit()
-            except FeishuRequestError:
-                session.rollback()
-                flash(request, "飞书凭据验证失败", "danger")
-                return redirect("/system")
-            except ValueError as exc:
-                session.rollback()
-                flash(request, str(exc), "danger")
-                return redirect("/system")
-            except Exception:
-                session.rollback()
-                flash(request, "飞书配置保存失败", "danger")
-                return redirect("/system")
-        app.state.feishu_restart_required = True
-        flash(request, "飞书配置已保存，重启服务后生效")
-        return redirect("/system")
-
-    @app.post("/system/feishu-bot/test")
-    def test_feishu_bot(request: Request, csrf_token: str = Form()):
-        with sessions() as session:
-            current = user_for(request, session)
-            if current is None:
-                return redirect("/login")
-            if current.role != "admin":
-                return HTMLResponse("Forbidden", status_code=403)
-            if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
-                return HTMLResponse("Invalid CSRF token", status_code=400)
-            resolved = app.state.feishu_settings.resolve(session)
-            if (
-                resolved.app_id is None
-                or resolved.app_secret is None
-                or resolved.default_chat_id is None
-            ):
-                flash(request, "请先配置 App ID、App Secret 和默认通知群", "danger")
-                return redirect("/system")
-            try:
-                FeishuClient(
-                    FeishuConfig(
-                        app_id=resolved.app_id,
-                        app_secret=resolved.app_secret,
-                    ),
-                    http_client=app.state.feishu_http_client,
-                ).send_text(
-                    resolved.default_chat_id,
-                    "chat_id",
-                    "Coderus 飞书机器人测试消息",
-                )
-            except FeishuRequestError:
-                flash(request, "飞书测试消息发送失败", "danger")
-                return redirect("/system")
-        flash(request, "飞书测试消息已发送")
-        return redirect("/system")
-
-    @app.get("/tasks", response_class=HTMLResponse)
-    def tasks_page(
-        request: Request,
-        status: str = "active",
-        owner: str | None = None,
-        repository: int | None = None,
-    ):
-        with sessions() as session:
-            current = user_for(request, session)
-            if current is None:
-                return redirect("/login")
-            selected_repository = enabled_repository(session, repository)
-            statement = (
-                select(Task)
-                .join(Task.creator)
-                .join(Task.issue)
-                .options(
-                    selectinload(Task.issue).selectinload(Issue.repository),
-                    selectinload(Task.creator),
-                )
-                .order_by(Task.created_at.desc())
-            )
-            if status == "active":
-                statement = statement.where(Task.status.not_in(DEFAULT_TASK_HIDDEN_STATUSES))
-            elif status != "all":
-                statement = statement.where(Task.status == status)
-            if owner:
-                statement = statement.where(User.username == owner.strip().lower())
-            if selected_repository is not None:
-                statement = statement.where(
-                    Issue.repository_id == selected_repository.id
-                )
-            tasks = session.scalars(statement).all()
-            users = session.scalars(select(User).order_by(User.username)).all()
-            return templates.TemplateResponse(
-                request,
-                "tasks.html",
-                context(
-                    request,
-                    current,
-                    tasks=tasks,
-                    status_filter=status,
-                    owner_filter=owner or "",
-                    users=users,
-                    selected_repository=selected_repository,
-                    selected_repository_id=(
-                        selected_repository.id if selected_repository is not None else None
-                    ),
-                ),
-            )
-
-    @app.get("/tasks/{task_id}", response_class=HTMLResponse)
-    def task_detail(request: Request, task_id: int):
-        with sessions() as session:
-            current = user_for(request, session)
-            if current is None:
-                return redirect("/login")
-            task = session.scalar(
-                select(Task)
-                .options(
-                    selectinload(Task.creator),
-                    selectinload(Task.issue).selectinload(Issue.repository),
-                    selectinload(Task.agent_runs),
-                    selectinload(Task.reviews),
-                    selectinload(Task.pr_feedback),
-                )
-                .where(Task.id == task_id)
-            )
-            if task is None:
-                return HTMLResponse("Not found", status_code=404)
-            current_runs = [
-                run
-                for run in task.agent_runs
-                if run.role in {"developer", "reviewer_a", "reviewer_b"}
-            ]
-            latest_runs_by_role = {}
-            for run in sorted(current_runs, key=lambda item: item.id):
-                latest_runs_by_role[run.role] = run
-            latest_reviews_by_role = {}
-            for review in sorted(task.reviews, key=lambda item: item.id):
-                latest_reviews_by_role[review.reviewer_role] = review
-            latest_agent_runs = sorted(latest_runs_by_role.values(), key=lambda item: item.id)
-            latest_reviews = sorted(latest_reviews_by_role.values(), key=lambda item: item.id)
-            latest_run_ids = {run.id for run in latest_agent_runs}
-            latest_review_ids = {review.id for review in latest_reviews}
-            can_publish_wip = bool(
-                app.state.forges.supports(
-                    task.issue.repository.provider, ForgeCapability.PUBLISH
-                )
-                and task.status in {"manual_intervention", "failed"}
-                and task.commit_sha
-                and task.workspace_path
-                and task.branch_name
-                and Path(task.workspace_path).is_dir()
-            )
-            return templates.TemplateResponse(
-                request,
-                "task_detail.html",
-                context(
-                    request,
-                    current,
-                    task=task,
-                    latest_agent_runs=latest_agent_runs,
-                    historical_agent_runs=[
-                        run for run in task.agent_runs if run.id not in latest_run_ids
-                    ],
-                    latest_reviews=latest_reviews,
-                    historical_reviews=[
-                        review for review in task.reviews if review.id not in latest_review_ids
-                    ],
-                    can_publish_wip=can_publish_wip,
-                    provider=task.issue.repository.provider,
-                    forge_status=forge_status(),
-                    can_sync_pr_feedback=bool(
-                        task.status == "awaiting_human_review"
-                        and task.pr_number
-                        and app.state.forges.supports(
-                            task.issue.repository.provider,
-                            ForgeCapability.LIST_PR_FEEDBACK,
-                        )
-                    ),
-                ),
-            )
-
-    @app.get("/reviews", response_class=HTMLResponse)
-    def reviews_page(
-        request: Request,
-        status: str = "all",
-        page: int = 1,
-        repository: int | None = None,
-    ):
-        with sessions() as session:
-            current = user_for(request, session)
-            if current is None:
-                return redirect("/login")
-            if status not in {"all", "queued", "running", "completed", "failed"}:
-                status = "all"
-            selected_repository = enabled_repository(session, repository)
-            filters = []
-            if selected_repository is not None:
-                filters.append(PRReviewTask.repository_id == selected_repository.id)
-            if status == "running":
-                filters.append(
-                    PRReviewTask.status.in_({"preparing", "reviewing", "commenting"})
-                )
-            elif status != "all":
-                filters.append(PRReviewTask.status == status)
-            total_reviews = (
-                session.scalar(
-                    select(func.count()).select_from(PRReviewTask).where(*filters)
-                )
-                or 0
-            )
-            total_pages = max(
-                1, (total_reviews + REVIEWS_PAGE_SIZE - 1) // REVIEWS_PAGE_SIZE
-            )
-            page = min(max(page, 1), total_pages)
-            reviews = session.scalars(
-                select(PRReviewTask)
-                .options(selectinload(PRReviewTask.repository))
-                .where(*filters)
-                .order_by(PRReviewTask.created_at.desc(), PRReviewTask.id.desc())
-                .offset((page - 1) * REVIEWS_PAGE_SIZE)
-                .limit(REVIEWS_PAGE_SIZE)
-            ).all()
-            return templates.TemplateResponse(
-                request,
-                "reviews.html",
-                context(
-                    request,
-                    current,
-                    reviews=reviews,
-                    status_filter=status,
-                    page=page,
-                    total_pages=total_pages,
-                    total_reviews=total_reviews,
-                    selected_repository=selected_repository,
-                    selected_repository_id=(
-                        selected_repository.id if selected_repository is not None else None
-                    ),
-                    pagination_query=urlencode(
-                        {
-                            "status": status,
-                            **(
-                                {"repository": selected_repository.id}
-                                if selected_repository is not None
-                                else {}
-                            ),
-                        }
-                    ),
-                    forge_status=forge_status(),
-                    codex_auth=app.state.codex_auth,
-                ),
-            )
-
-    @app.get("/reviews/{review_id}", response_class=HTMLResponse)
-    def review_detail(request: Request, review_id: int):
-        with sessions() as session:
-            current = user_for(request, session)
-            if current is None:
-                return redirect("/login")
-            review = session.scalar(
-                select(PRReviewTask)
-                .options(selectinload(PRReviewTask.repository))
-                .where(PRReviewTask.id == review_id)
-            )
-
-            if review is None:
-                return HTMLResponse("Not found", status_code=404)
-            structured_result = (
-                review.structured_result
-                if isinstance(review.structured_result, dict)
-                else {}
-            )
-            findings = structured_result.get("findings", [])
-            if not isinstance(findings, list):
-                findings = []
-            findings = [finding for finding in findings if isinstance(finding, dict)]
-            return templates.TemplateResponse(
-                request,
-                "review_detail.html",
-                context(
-                    request,
-                    current,
-                    review=review,
-                    findings=findings,
-                    forge_status=forge_status(),
-                ),
-            )
-
-    @app.post("/reviews")
-    def create_review(
-        request: Request,
-        pr_url: Annotated[str, Form()],
-        csrf_token: Annotated[str, Form()],
-    ):
-        with sessions() as session:
-            current = user_for(request, session)
-            if current is None:
-                return redirect("/login")
-            if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
-                return HTMLResponse("Invalid CSRF token", status_code=400)
-            if not app.state.codex_auth.ready:
-                flash(request, app.state.codex_auth.detail, "danger")
-                return redirect("/reviews")
-            try:
-                source_repository, _ = parse_pull_request_url(pr_url)
-                if not app.state.forges.supports(
-                    source_repository.provider,
-                    ForgeCapability.GET_PULL_REQUEST,
-                    ForgeCapability.PUBLISH_PR_COMMENT,
-                ):
-                    raise ForgeNotConfigured(source_repository.provider)
-                task = enqueue_pr_review(
-                    session,
-                    pr_url,
-                    "",
-                    f"web-review:{secrets.token_urlsafe(24)}",
-                    f"web-user:{current.id}",
-                )
-                session.commit()
-            except (InvalidProviderUrl, ValueError) as exc:
-                session.rollback()
-                flash(request, str(exc), "error")
-                return redirect("/reviews")
-            return redirect(f"/reviews/{task.id}")
-
-    @app.post("/tasks/{task_id}/cancel")
-    def cancel_task(request: Request, task_id: int, csrf_token: str = Form()):
-        should_signal = False
-        with sessions() as session:
-            current = user_for(request, session)
-            if current is None:
-                return redirect("/login")
-            if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
-                return HTMLResponse("Invalid CSRF token", status_code=400)
-            task = session.get(Task, task_id)
-            if task is None:
-                return HTMLResponse("Not found", status_code=404)
-            if current.role != "admin" and task.created_by != current.id:
-                return HTMLResponse("Forbidden", status_code=403)
-            if task.status == "queued":
-                new_status = "cancelled"
-                updates = {"finished_at": datetime.now(UTC)}
-            elif task.status in RUNNING_TASK_STATES:
-                new_status = "cancelling"
-                updates = None
-                should_signal = True
-            else:
-                return HTMLResponse("当前状态不能取消", status_code=409)
-            if not cas_task_status(
-                session,
-                task_id,
-                expected=task.status,
-                new_status=new_status,
-                updates=updates,
-            ):
-                session.rollback()
-                return HTMLResponse("任务状态已变化，请刷新后重试", status_code=409)
-            session.commit()
-            flash(request, "任务取消请求已提交")
-        if should_signal:
-            app.state.orchestrator.cancel(task_id)
-        return redirect(f"/tasks/{task_id}")
-
-    @app.post("/tasks/{task_id}/close")
-    def close_task(request: Request, task_id: int, csrf_token: str = Form()):
-        with sessions() as session:
-            current = user_for(request, session)
-            if current is None:
-                return redirect("/login")
-            if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
-                return HTMLResponse("Invalid CSRF token", status_code=400)
-            task = session.get(Task, task_id)
-            if task is None:
-                return HTMLResponse("Not found", status_code=404)
-            if current.role != "admin" and task.created_by != current.id:
-                return HTMLResponse("Forbidden", status_code=403)
-            if task.status not in CLOSABLE_TASK_STATUSES:
-                return HTMLResponse("当前状态不能关闭", status_code=409)
-            if not cas_task_status(
-                session,
-                task_id,
-                expected=task.status,
-                new_status="dismissed",
-                updates={"finished_at": datetime.now(UTC)},
-            ):
-                session.rollback()
-                return HTMLResponse("任务状态已变化，请刷新后重试", status_code=409)
-            session.commit()
-            flash(request, "任务已关闭")
-        return redirect(f"/tasks/{task_id}")
-
-    @app.post("/tasks/{task_id}/feedback/sync")
-    async def sync_task_feedback(request: Request, task_id: int, csrf_token: str = Form()):
-        with sessions() as session:
-            current = user_for(request, session)
-            if current is None:
-                return redirect("/login")
-            if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
-                return HTMLResponse("Invalid CSRF token", status_code=400)
-            task = session.scalar(
-                select(Task)
-                .options(selectinload(Task.issue).selectinload(Issue.repository))
-                .where(Task.id == task_id)
-            )
-            if task is None:
-                return HTMLResponse("Not found", status_code=404)
-            if current.role != "admin" and task.created_by != current.id:
-                return HTMLResponse("Forbidden", status_code=403)
-            if task.status != "awaiting_human_review" or not task.pr_number:
-                return HTMLResponse("当前任务不能同步 PR 意见", status_code=409)
-            owner = task.issue.repository.owner
-            name = task.issue.repository.name
-            pr_number = task.pr_number
-            provider = task.issue.repository.provider
-        forge = forge_for_repository(task.issue.repository)
-        if not app.state.forges.supports(
-            provider, ForgeCapability.LIST_PR_FEEDBACK
-        ):
-            return HTMLResponse("发布器不支持 PR 意见同步", status_code=409)
-        feedback = await forge.list_pr_feedback(owner, name, pr_number)
-        pr_status = None
-        if app.state.forges.supports(provider, ForgeCapability.GET_PR_STATUS):
-            pr_status = await forge.get_pr_status(owner, name, pr_number)
-        with sessions() as session:
-            new_status = "awaiting_human_review"
-            updates: dict[str, object] = {}
-            if pr_status == "merged":
-                new_status = "completed"
-                updates = {"pr_state": "merged", "finished_at": datetime.now(UTC)}
-            elif pr_status == "closed":
-                new_status = "closed"
-                updates = {"pr_state": "closed", "finished_at": datetime.now(UTC)}
-            if not cas_task_status(
-                session,
-                task_id,
-                expected="awaiting_human_review",
-                new_status=new_status,
-                updates=updates,
-            ):
-                session.rollback()
-                return HTMLResponse("任务状态已变化，未写入本次同步", status_code=409)
-            for item in feedback:
-                upsert_pr_feedback(
-                    session,
-                    task_id=task_id,
-                    provider=provider,
-                    item=item,
-                )
-            session.commit()
-            flash(request, f"已同步 {len(feedback)} 条 PR 意见")
-        return redirect(f"/tasks/{task_id}")
-
-    @app.post("/tasks/{task_id}/publish-wip")
-    def publish_existing_wip(request: Request, task_id: int, csrf_token: str = Form()):
-        with sessions() as session:
-            current = user_for(request, session)
-            if current is None:
-                return redirect("/login")
-            if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
-                return HTMLResponse("Invalid CSRF token", status_code=400)
-            task = session.get(Task, task_id)
-            if task is None:
-                return HTMLResponse("Not found", status_code=404)
-            if current.role != "admin" and task.created_by != current.id:
-                return HTMLResponse("Forbidden", status_code=403)
-            if (
-                not app.state.forges.supports(
-                    task.issue.repository.provider, ForgeCapability.PUBLISH
-                )
-                or task.status not in {"manual_intervention", "failed"}
-                or not task.commit_sha
-                or not task.workspace_path
-                or not task.branch_name
-                or not Path(task.workspace_path).is_dir()
-            ):
-                return HTMLResponse("当前任务不能按现状发布", status_code=409)
-            if not cas_task_status(
-                session,
-                task_id,
-                expected=task.status,
-                new_status="queued",
-                updates={
-                    "failure_code": "publish_existing",
-                    "failure_summary": None,
-                    "finished_at": None,
-                },
-            ):
-                session.rollback()
-                return HTMLResponse("任务状态已变化，请刷新后重试", status_code=409)
-            session.commit()
-            flash(request, "任务已重新入队，将复用现有提交发布 PR")
-        return redirect(f"/tasks/{task_id}")
-
-    @app.post("/tasks/{task_id}/feedback/handle")
-    def handle_task_feedback(
-        request: Request,
-        task_id: int,
-        csrf_token: str = Form(),
-        feedback_ids: Annotated[list[int] | None, Form()] = None,
-    ):
-        with sessions() as session:
-            current = user_for(request, session)
-            if current is None:
-                return redirect("/login")
-            if not verify_csrf_token(request.session.get("csrf_token"), csrf_token):
-                return HTMLResponse("Invalid CSRF token", status_code=400)
-            task = session.get(Task, task_id)
-            if task is None:
-                return HTMLResponse("Not found", status_code=404)
-            if current.role != "admin" and task.created_by != current.id:
-                return HTMLResponse("Forbidden", status_code=403)
-            if task.status != "awaiting_human_review" or not feedback_ids:
-                return HTMLResponse("当前任务不能处理 PR 意见", status_code=409)
-            selected_ids = set(feedback_ids)
-            rows = session.scalars(
-                select(PRFeedback).where(
-                    PRFeedback.task_id == task_id,
-                    PRFeedback.id.in_(selected_ids),
-                    PRFeedback.processed_at.is_(None),
-                    PRFeedback.author_association.in_(("OWNER", "MEMBER", "COLLABORATOR")),
-                )
-            ).all()
-            if len(rows) != len(selected_ids):
-                return HTMLResponse("只能处理可信维护者的未处理意见", status_code=409)
-            now = datetime.now(UTC)
-            if not cas_task_status(
-                session,
-                task_id,
-                expected="awaiting_human_review",
-                new_status="queued",
-                updates={
-                    "failure_code": "pr_feedback_revision",
-                    "failure_summary": None,
-                    "finished_at": None,
-                },
-            ):
-                session.rollback()
-                return HTMLResponse("任务状态已变化，请刷新后重试", status_code=409)
-            for row in rows:
-                row.selected_at = now
-            session.commit()
-        return redirect(f"/tasks/{task_id}")
+    )
+    app.include_router(
+        build_review_router(
+            ui=ui,
+            session_factory=sessions,
+            reviews=review_commands,
+            forge_status=forge_status,
+            codex_auth=lambda: app.state.codex_auth,
+        )
+    )
+    app.include_router(
+        build_system_router(
+            ui=ui,
+            session_factory=sessions,
+            settings=settings,
+            state=app.state,
+            scheduler_enabled=start_scheduler,
+            forge_status=forge_status,
+            install_forge=lambda provider, runtime: install_forge_runtime(
+                app, provider, runtime
+            ),
+        )
+    )
 
     return app
