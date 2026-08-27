@@ -103,7 +103,7 @@ class FakeReviewPublisher:
 
 
 class FakePublishForge:
-    async def publish(self, **kwargs):
+    async def publish(self, request):
         raise AssertionError("publish should not run while queueing a legacy task")
 
 
@@ -1616,7 +1616,7 @@ def test_gitcode_repository_fork_and_task_actions_use_its_forge(app_settings: Se
                 url="https://gitcode.com/coderus-bot/demo",
             )
 
-        async def publish(self, **kwargs):
+        async def publish(self, request):
             raise AssertionError("publish should not run while queueing a task")
 
         async def list_pr_feedback(self, owner, name, number):

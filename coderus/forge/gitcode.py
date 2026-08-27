@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from coderus.forge.protocols import PublishRequest
 from coderus.models import Repository
 from coderus.publisher import GitCodePublisher
 
@@ -31,8 +31,8 @@ class GitCodeForge:
         publisher = self._new_publisher(registered_forks={})
         return await asyncio.to_thread(publisher.ensure_fork, owner, name)
 
-    async def publish(self, **kwargs: Any):
-        return await asyncio.to_thread(self._publish, kwargs)
+    async def publish(self, request: PublishRequest):
+        return await asyncio.to_thread(self._publish, request)
 
     async def list_pr_feedback(self, owner: str, name: str, pr_number: int):
         publisher = self._registered_publisher(owner, name)
@@ -56,10 +56,19 @@ class GitCodeForge:
             publisher.publish_pr_comment, owner, name, pr_number, body, marker
         )
 
-    def _publish(self, kwargs: dict[str, Any]):
-        owner = kwargs["upstream_owner"]
-        name = kwargs["repository_name"]
-        return self._registered_publisher(owner, name, register_fork=True).publish(**kwargs)
+    def _publish(self, request: PublishRequest):
+        publisher = self._registered_publisher(
+            request.upstream_owner, request.repository_name, register_fork=True
+        )
+        return publisher.publish(
+            workspace=request.workspace,
+            upstream_owner=request.upstream_owner,
+            repository_name=request.repository_name,
+            default_branch=request.default_branch,
+            branch=request.branch,
+            title=request.title,
+            body=request.body,
+        )
 
     def _registered_publisher(
         self, owner: str, name: str, *, register_fork: bool = False

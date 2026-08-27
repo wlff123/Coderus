@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from coderus.db import create_session_factory
-from coderus.forge import GitHubForge
+from coderus.forge import GitHubForge, PublishRequest
 from coderus.models import Repository, User
 
 
@@ -67,13 +67,15 @@ async def test_forge_loads_registered_fork_from_database(engine, tmp_path: Path)
     forge = GitHubForge("token", session_factory=sessions, publisher_factory=FakePublisher)
 
     result = await forge.publish(
-        workspace=tmp_path,
-        upstream_owner="octo",
-        repository_name="demo",
-        default_branch="main",
-        branch="coderus/issue-1-1",
-        title="Issue",
-        body="Body",
+        PublishRequest(
+            workspace=tmp_path,
+            upstream_owner="octo",
+            repository_name="demo",
+            default_branch="main",
+            branch="coderus/issue-1-1",
+            title="Issue",
+            body="Body",
+        )
     )
 
     assert result.number == 1
@@ -95,9 +97,11 @@ async def test_forge_registers_fork_on_first_publish(engine, tmp_path: Path) -> 
     forge = GitHubForge("token", session_factory=sessions, publisher_factory=FakePublisher)
 
     await forge.publish(
-        workspace=tmp_path, upstream_owner="octo", repository_name="demo",
-        default_branch="main", branch="coderus/issue-1-1",
-        title="Issue", body="Body",
+        PublishRequest(
+            workspace=tmp_path, upstream_owner="octo", repository_name="demo",
+            default_branch="main", branch="coderus/issue-1-1",
+            title="Issue", body="Body",
+        )
     )
 
     with sessions() as session:

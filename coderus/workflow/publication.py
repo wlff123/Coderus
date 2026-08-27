@@ -14,7 +14,7 @@ from pathlib import Path
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
-from coderus.forge import ForgeCapability, ForgeRegistry
+from coderus.forge import ForgeCapability, ForgeRegistry, PublishRequest
 from coderus.models import Task
 from coderus.workflow.developer_report import DeveloperReport
 from coderus.workflow.prompts import pull_request_body
@@ -96,13 +96,15 @@ class TaskPublication:
         body = pull_request_body(task, reports)
         body += f"\n\n<!-- coderus-publication:{publication_key} -->"
         published = await forge.publish(
-            workspace=workspace,
-            upstream_owner=task.issue.repository.owner,
-            repository_name=task.issue.repository.name,
-            default_branch=task.issue.repository.default_branch,
-            branch=branch,
-            title=task.issue.title[:240],
-            body=body,
+            PublishRequest(
+                workspace=workspace,
+                upstream_owner=task.issue.repository.owner,
+                repository_name=task.issue.repository.name,
+                default_branch=task.issue.repository.default_branch,
+                branch=branch,
+                title=task.issue.title[:240],
+                body=body,
+            )
         )
         if inspect.isawaitable(published):
             published = await published

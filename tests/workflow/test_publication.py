@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import re
 from types import SimpleNamespace
 
@@ -51,8 +52,8 @@ class RecordingForge:
     def __init__(self) -> None:
         self.published: list[dict] = []
 
-    async def publish(self, **kwargs):
-        self.published.append(kwargs)
+    async def publish(self, request):
+        self.published.append(dataclasses.asdict(request))
         return SimpleNamespace(url="https://pr", number=1, state="open")
 
 

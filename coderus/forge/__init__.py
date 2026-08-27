@@ -1,6 +1,6 @@
 from .gitcode import GitCodeForge
 from .github import GitHubForge
-from .protocols import Forge
+from .protocols import Forge, PublishRequest
 from .registry import (
     ALL_FORGE_CAPABILITIES,
     ForgeCapability,
@@ -18,4 +18,5 @@ __all__ = [
     "ForgeRegistry",
     "GitCodeForge",
     "GitHubForge",
+    "PublishRequest",
 ]

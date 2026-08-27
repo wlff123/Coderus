@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -175,14 +176,14 @@ class FakePublisher:
     def __init__(self) -> None:
         self.calls = []
 
-    async def publish(self, **kwargs):
-        self.calls.append(kwargs)
+    async def publish(self, request):
+        self.calls.append(dataclasses.asdict(request))
         return SimpleNamespace(url="https://github.com/octo/demo/pull/9", number=9, state="open")
 
 
 class FakeGitCodeForge(FakePublisher):
-    async def publish(self, **kwargs):
-        self.calls.append(kwargs)
+    async def publish(self, request):
+        self.calls.append(dataclasses.asdict(request))
         return SimpleNamespace(
             url="https://gitcode.com/open/demo/pulls/12",
             number=12,
@@ -591,14 +592,14 @@ async def test_publish_completion_does_not_overwrite_concurrent_cancellation(
         task_id = create_task(session).id
 
     class CancellingPublisher(FakePublisher):
-        async def publish(self, **kwargs):
+        async def publish(self, request):
             with sessions() as session:
                 task = session.get(Task, task_id)
                 assert task.publication_key
                 assert task.publication_started_at is not None
                 task.status = "cancelling"
                 session.commit()
-            return await super().publish(**kwargs)
+            return await super().publish(request)
 
     orchestrator = make_orchestrator(
         sessions, tmp_path, FakeRunner(), CancellingPublisher()
