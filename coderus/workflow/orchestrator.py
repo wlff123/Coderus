@@ -31,14 +31,9 @@ from coderus.workflow.prompts import (
     developer_prompt,
     feedback_prompt,
     pull_request_body,
-    review_prompt,
     revision_prompt,
 )
-from coderus.workflow.reviewer_result import (
-    REVIEWER_CONTRACT_VERSION,
-    ReviewerResultError,
-    parse_reviewer_result,
-)
+from coderus.workflow.review_cycle import ReviewCycle, deduplicate_findings
 from coderus.workflow.task_state import cas_task_status, claim_queued_task
 
 CLAIM_LEASE_SECONDS = 120.0
@@ -95,6 +90,10 @@ class TaskOrchestrator:
             credential_broker=credential_broker,
             stage_timeout_seconds=stage_timeout_seconds,
             transition=self._set_status,
+        )
+        self.review_cycle = ReviewCycle(
+            executor=self.stage_executor,
+            session_factory=session_factory,
         )
 
     def cancel(self, task_id: int) -> bool:
@@ -206,11 +205,12 @@ class TaskOrchestrator:
             reports = [parse_developer_report(final_message(developer.stdout))]
             await self.git.assert_has_changes(prepared.workspace)
 
-            findings = await self._run_reviewers(
+            findings = await self.review_cycle.run(
                 task,
                 prepared.workspace,
                 render_developer_report(reports[-1]),
                 claim_token,
+                self._cancel_events[task.id],
             )
             if findings:
                 revision = await self._run_stage(
@@ -423,42 +423,6 @@ class TaskOrchestrator:
                 row.processed_at = now
             session.commit()
 
-    async def _run_reviewers(
-        self,
-        task: Task,
-        workspace: Path,
-        developer_report: str,
-        claim_token: str,
-    ) -> list[dict[str, Any]]:
-        specs = (
-            (Stage.REVIEW_CORRECTNESS, AgentRole.REVIEWER_A, "正确性、回归风险和测试覆盖"),
-            (Stage.REVIEW_SECURITY, AgentRole.REVIEWER_B, "安全性、边界条件和可维护性"),
-        )
-        reviewer_tasks: list[asyncio.Task] = []
-        async with asyncio.TaskGroup() as group:
-            for stage, role, focus in specs:
-                reviewer_tasks.append(
-                    group.create_task(
-                        self._run_stage(
-                            task.id,
-                            "reviewing",
-                            stage,
-                            role,
-                            workspace,
-                            review_prompt(task, focus, developer_report),
-                            claim_token,
-                        )
-                    )
-                )
-        results = [reviewer_task.result() for reviewer_task in reviewer_tasks]
-        findings: list[dict[str, Any]] = []
-        for (_, role, _), result in zip(specs, results, strict=True):
-            decision, role_findings = review_result(result.stdout)
-            self._record_review(task.id, role.value, decision, role_findings)
-            if decision != "approve":
-                findings.extend(role_findings)
-        return deduplicate_findings(findings)
-
     async def _publish(
         self,
         task: Task,
@@ -634,22 +598,6 @@ class TaskOrchestrator:
             claim_token=claim_token,
             cancel_event=self._cancel_events[task_id],
         )
-
-    def _record_review(
-        self, task_id: int, role: str, decision: str, findings: list[dict[str, Any]]
-    ) -> None:
-        with self.sessions() as session:
-            session.add(
-                Review(
-                    task_id=task_id,
-                    reviewer_role=role,
-                    decision=decision,
-                    findings=findings,
-                    blocking_count=len(findings) if decision != "approve" else 0,
-                    contract_version=REVIEWER_CONTRACT_VERSION,
-                )
-            )
-            session.commit()
 
     def _awaiting_review(
         self, task_id: int, claim_token: str, published: object
@@ -828,22 +776,3 @@ class TaskOrchestrator:
                 session.commit()
 
 
-def deduplicate_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    unique: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for finding in findings:
-        key = json.dumps(finding, ensure_ascii=False, sort_keys=True)
-        if key not in seen:
-            seen.add(key)
-            unique.append(finding)
-    return unique
-
-
-def review_result(stdout: str) -> tuple[str, list[dict[str, Any]]]:
-    try:
-        result = parse_reviewer_result(final_message(stdout).strip())
-    except ReviewerResultError:
-        return "changes_requested", [
-            {"severity": "high", "message": "检视结果不符合版本化契约"}
-        ]
-    return result.decision, [finding.model_dump() for finding in result.findings]
