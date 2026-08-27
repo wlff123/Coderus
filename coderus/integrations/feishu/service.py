@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
@@ -8,13 +8,10 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from coderus.forge import ForgeCapability, ForgeNotConfigured, ForgeRegistry
+from coderus.application import IssueCommands, ReviewCommands, ReviewSource
 from coderus.integrations.feishu.settings import ensure_feishu_bot_user
-from coderus.issues.service import IssueProvider, add_and_dispatch_issue
 from coderus.models import FeishuEvent, Task
-from coderus.pr_review.service import enqueue_pr_review
 from coderus.providers.errors import InvalidProviderUrl, ProviderError
-from coderus.providers.urls import parse_pull_request_url
 from coderus.tasks.statuses import RUNNING_TASK_STATES
 
 from .commands import IncomingFeishuMessage, parse_command
@@ -64,15 +61,15 @@ class FeishuCommandService:
         self,
         *,
         session_factory: Callable[[], Session],
-        providers: Mapping[str, IssueProvider],
-        forges: ForgeRegistry,
+        issues: IssueCommands,
+        reviews: ReviewCommands,
         assistant: Assistant | None = None,
         can_mutate: Callable[[], bool] | None = None,
         mutation_block_reason: Callable[[], str] | None = None,
     ) -> None:
         self.sessions = session_factory
-        self.providers = providers
-        self.forges = forges
+        self.issues = issues
+        self.reviews = reviews
         self.assistant = assistant
         self.can_mutate = can_mutate or (lambda: True)
         self.mutation_block_reason = mutation_block_reason or (
@@ -118,31 +115,24 @@ class FeishuCommandService:
                 elif command.kind == "task" and command.argument is not None:
                     reply = self._task(session, command.argument)
                 elif command.kind == "review" and command.argument is not None:
-                    source_repository, _ = parse_pull_request_url(command.argument)
-                    if not self.forges.supports(
-                        source_repository.provider,
-                        ForgeCapability.GET_PULL_REQUEST,
-                        ForgeCapability.PUBLISH_PR_COMMENT,
-                    ):
-                        raise ForgeNotConfigured(source_repository.provider)
-                    task = enqueue_pr_review(
+                    review_id = self.reviews.enqueue_in_session(
                         session,
                         command.argument,
-                        message.chat_id,
-                        message.message_id,
-                        message.sender_open_id or "",
+                        ReviewSource(
+                            chat_id=message.chat_id,
+                            message_id=message.message_id,
+                            sender_id=message.sender_open_id or "",
+                        ),
                     )
-                    reply = f"已创建检视任务 RV-{task.id}，正在排队"
+                    reply = f"已创建检视任务 RV-{review_id}，正在排队"
                 elif command.kind == "dispatch" and command.argument is not None:
                     creator = ensure_feishu_bot_user(session)
-                    task = add_and_dispatch_issue(
-                        session,
-                        self.providers,
-                        command.argument,
-                        creator,
-                        commit=False,
+                    task_id = self.issues.add_and_dispatch_in_session(
+                        session, command.argument, creator.id
                     )
-                    event.task_id = task.id
+                    event.task_id = task_id
+                    task = session.get(Task, task_id)
+                    assert task is not None
                     issue = task.issue
                     repository = issue.repository
                     reply = (

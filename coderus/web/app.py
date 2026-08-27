@@ -24,6 +24,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 from starlette.middleware.sessions import SessionMiddleware
 
+from coderus.application import IssueCommands, ReviewCommands
 from coderus.assistant import ModelAssistant
 from coderus.auth.security import (
     hash_password,
@@ -427,6 +428,11 @@ def create_app(
             params["repository"] = str(repository_id)
         return f"{path}?{urlencode(params)}" if params else path
 
+    issue_commands = IssueCommands(
+        session_factory=sessions, providers=app.state.providers
+    )
+    review_commands = ReviewCommands(session_factory=sessions, forges=app.state.forges)
+
     assistant = None
     if settings.assistant.enabled and settings.model_api_key is not None:
         assistant = ModelAssistant(
@@ -458,8 +464,8 @@ def create_app(
                 )
                 command_service = FeishuCommandService(
                     session_factory=sessions,
-                    providers=app.state.providers,
-                    forges=app.state.forges,
+                    issues=issue_commands,
+                    reviews=review_commands,
                     assistant=assistant,
                     can_mutate=lambda: (
                         release_gate.allows_work() and app.state.codex_auth.ready

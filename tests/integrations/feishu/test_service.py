@@ -5,7 +5,9 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy import select
 
-import coderus.integrations.feishu.service as feishu_service_module
+import coderus.application.issues as application_issues_module
+import coderus.application.reviews as application_reviews_module
+from coderus.application import IssueCommands, ReviewCommands
 from coderus.db import create_session_factory
 from coderus.forge import ForgeRegistry
 from coderus.integrations.feishu.commands import IncomingFeishuMessage
@@ -68,10 +70,14 @@ def service(
     forges: ForgeRegistry | None = None,
     assistant=None,
 ) -> FeishuCommandService:
+    sessions = create_session_factory(engine)
     return FeishuCommandService(
-        session_factory=create_session_factory(engine),
-        providers=providers or {},
-        forges=forges or ForgeRegistry({"github": FakeReviewForge()}),
+        session_factory=sessions,
+        issues=IssueCommands(session_factory=sessions, providers=providers or {}),
+        reviews=ReviewCommands(
+            session_factory=sessions,
+            forges=forges or ForgeRegistry({"github": FakeReviewForge()}),
+        ),
         assistant=assistant,
     )
 
@@ -387,7 +393,7 @@ def test_dispatch_crash_rolls_back_event_and_task_and_allows_retry(
     provider = FakeProvider()
     command_service = service(engine, {"github": provider})
     incoming = message("派发 https://github.com/octo/demo/issues/7")
-    original = feishu_service_module.add_and_dispatch_issue
+    original = application_issues_module.add_and_dispatch_issue
 
     def crash_after_dispatch(*args, **kwargs):
         task = original(*args, **kwargs)
@@ -395,7 +401,7 @@ def test_dispatch_crash_rolls_back_event_and_task_and_allows_retry(
         raise SystemExit("simulated crash")
 
     monkeypatch.setattr(
-        feishu_service_module, "add_and_dispatch_issue", crash_after_dispatch
+        application_issues_module, "add_and_dispatch_issue", crash_after_dispatch
     )
     with pytest.raises(SystemExit, match="simulated crash"):
         command_service.handle(incoming)
@@ -405,7 +411,7 @@ def test_dispatch_crash_rolls_back_event_and_task_and_allows_retry(
         assert session.query(Issue).count() == 0
         assert session.query(Task).count() == 0
 
-    monkeypatch.setattr(feishu_service_module, "add_and_dispatch_issue", original)
+    monkeypatch.setattr(application_issues_module, "add_and_dispatch_issue", original)
     assert command_service.handle(incoming).startswith("已派发为 RE-")
 
 
@@ -506,10 +512,11 @@ def test_review_without_github_forge_returns_platform_configuration_error(engine
 def test_review_registry_is_evaluated_for_each_command(engine) -> None:
     add_authorized_repository(engine)
     forges = ForgeRegistry()
+    sessions = create_session_factory(engine)
     command_service = FeishuCommandService(
-        session_factory=create_session_factory(engine),
-        providers={},
-        forges=forges,
+        session_factory=sessions,
+        issues=IssueCommands(session_factory=sessions, providers={}),
+        reviews=ReviewCommands(session_factory=sessions, forges=forges),
     )
 
     unavailable_reply = command_service.handle(
@@ -557,10 +564,11 @@ def test_missing_review_publisher_does_not_affect_status_or_dispatch(engine) -> 
 
 
 def test_agent_authentication_gate_returns_configured_reason(engine) -> None:
+    sessions = create_session_factory(engine)
     command_service = FeishuCommandService(
-        session_factory=create_session_factory(engine),
-        providers={},
-        forges=ForgeRegistry(),
+        session_factory=sessions,
+        issues=IssueCommands(session_factory=sessions, providers={}),
+        reviews=ReviewCommands(session_factory=sessions, forges=ForgeRegistry()),
         can_mutate=lambda: False,
         mutation_block_reason=lambda: "Codex 认证未就绪，Agent 执行已阻止",
     )
@@ -598,14 +606,16 @@ def test_review_crash_rolls_back_event_and_task_and_allows_retry(
     add_authorized_repository(engine)
     command_service = service(engine)
     incoming = message("检视 https://github.com/octo/demo/pull/7")
-    original = feishu_service_module.enqueue_pr_review
+    original = application_reviews_module.enqueue_pr_review
 
     def crash_after_enqueue(*args, **kwargs):
         task = original(*args, **kwargs)
         assert task.id is not None
         raise SystemExit("simulated crash")
 
-    monkeypatch.setattr(feishu_service_module, "enqueue_pr_review", crash_after_enqueue)
+    monkeypatch.setattr(
+        application_reviews_module, "enqueue_pr_review", crash_after_enqueue
+    )
     with pytest.raises(SystemExit, match="simulated crash"):
         command_service.handle(incoming)
 
@@ -613,7 +623,7 @@ def test_review_crash_rolls_back_event_and_task_and_allows_retry(
         assert session.query(FeishuEvent).count() == 0
         assert session.query(PRReviewTask).count() == 0
 
-    monkeypatch.setattr(feishu_service_module, "enqueue_pr_review", original)
+    monkeypatch.setattr(application_reviews_module, "enqueue_pr_review", original)
     assert command_service.handle(incoming) == "已创建检视任务 RV-1，正在排队"
 
 
