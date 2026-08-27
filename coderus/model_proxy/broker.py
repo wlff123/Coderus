@@ -54,6 +54,14 @@ class _Usage:
     output_bytes: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class UsageSnapshot:
+    """某任务阶段的模型代理用量；随最后一个令牌撤销一并清除，须在撤销前读取。"""
+
+    request_count: int
+    output_bytes: int
+
+
 @dataclass
 class LeasePermit:
     task_id: str
@@ -191,6 +199,13 @@ class CredentialBroker:
             usage.request_count += 1
             lease.in_flight += 1
             return LeasePermit(lease.task_id, lease.stage, self, digest)
+
+    def usage(self, task_id: str, stage: str) -> UsageSnapshot | None:
+        with self._lock:
+            value = self._usage_by_task_stage.get((task_id, stage))
+            if value is None:
+                return None
+            return UsageSnapshot(value.request_count, value.output_bytes)
 
     def revoke(self, token: str) -> bool:
         if not isinstance(token, str) or not token:

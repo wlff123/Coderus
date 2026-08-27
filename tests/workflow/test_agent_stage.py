@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from coderus.model_proxy import UsageSnapshot
 from coderus.models import AgentRun, Issue, Repository, Task, User
 from coderus.runner import AgentRole, JobResult, JobStatus, Stage
 from coderus.workflow.agent_stage import AgentStageExecutor, TaskCancelled
@@ -56,9 +57,11 @@ class FakeRunner:
 
 
 class FakeBroker:
-    def __init__(self) -> None:
+    def __init__(self, usage_snapshot: UsageSnapshot | None = None) -> None:
         self.issued: list[dict] = []
         self.revoked: list[str] = []
+        self.usage_snapshot = usage_snapshot
+        self.usage_queries: list[tuple[str, str]] = []
 
     def issue(self, *, task_id: str, stage: str, ttl_seconds: int) -> str:
         self.issued.append(
@@ -68,6 +71,10 @@ class FakeBroker:
 
     def revoke(self, token: str) -> None:
         self.revoked.append(token)
+
+    def usage(self, task_id: str, stage: str) -> UsageSnapshot | None:
+        self.usage_queries.append((task_id, stage))
+        return self.usage_snapshot
 
 
 def seed_task(engine) -> int:
@@ -145,6 +152,41 @@ def test_success_saves_report_and_revokes_token(engine, tmp_path) -> None:
         assert run.finished_at is not None
         report = run.structured_result["developer_report"]
         assert report["problem_description"] == "启动崩溃"
+
+
+def test_success_persists_model_usage_before_revocation(engine, tmp_path) -> None:
+    task_id = seed_task(engine)
+    runner = FakeRunner(JobStatus.SUCCEEDED, stdout=agent_stdout(DEVELOPER_REPORT))
+    broker = FakeBroker(usage_snapshot=UsageSnapshot(request_count=4, output_bytes=128))
+    stage_executor = executor(engine, runner, broker)
+
+    asyncio.run(run_develop(stage_executor, task_id, tmp_path))
+
+    assert broker.usage_queries == [(f"task-{task_id}", "develop")]
+    with Session(engine) as session:
+        run = session.scalar(select(AgentRun).where(AgentRun.task_id == task_id))
+        assert run.structured_result["model_usage"] == {
+            "request_count": 4,
+            "output_bytes": 128,
+        }
+
+
+def test_failed_run_still_persists_model_usage(engine, tmp_path) -> None:
+    task_id = seed_task(engine)
+    runner = FakeRunner(JobStatus.FAILED, stderr="boom")
+    broker = FakeBroker(usage_snapshot=UsageSnapshot(request_count=2, output_bytes=64))
+    stage_executor = executor(engine, runner, broker)
+
+    with pytest.raises(RuntimeError, match="developer failed"):
+        asyncio.run(run_develop(stage_executor, task_id, tmp_path))
+
+    with Session(engine) as session:
+        run = session.scalar(select(AgentRun).where(AgentRun.task_id == task_id))
+        assert run.status == "failed"
+        assert run.structured_result["model_usage"] == {
+            "request_count": 2,
+            "output_bytes": 64,
+        }
 
 
 def test_attempt_increments_per_role(engine, tmp_path) -> None:

@@ -218,6 +218,9 @@ class FakeBroker:
         self.revoked.append(token)
         return True
 
+    def usage(self, task_id: str, stage: str) -> None:
+        return None
+
 
 def create_task(session, *, provider: str = "github") -> Task:
     host = "github.com" if provider == "github" else "gitcode.com"

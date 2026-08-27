@@ -14,7 +14,7 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from coderus.model_proxy import issued_stage_token
+from coderus.model_proxy import UsageSnapshot, issued_stage_token
 from coderus.models import AgentRun
 from coderus.runner import AgentRole, JobSpec, JobStatus, Stage
 from coderus.workflow.developer_report import (
@@ -81,6 +81,7 @@ class AgentStageExecutor:
     ):
         self.transition(task_id, status, claim_token)
         run_id, attempt = self._begin_agent_run(task_id, role)
+        model_usage: UsageSnapshot | None = None
         try:
             with issued_stage_token(
                 self.credential_broker,
@@ -102,10 +103,14 @@ class AgentStageExecutor:
                         else reviewer_result_schema_path()
                     ),
                 )
-                result = await retry_agent_operation(
-                    lambda: self.runner.run(spec, cancel_event=cancel_event),
-                    _noop_checkpoint_restore,
-                )
+                try:
+                    result = await retry_agent_operation(
+                        lambda: self.runner.run(spec, cancel_event=cancel_event),
+                        _noop_checkpoint_restore,
+                    )
+                finally:
+                    # 用量随最后一个令牌撤销一并清除，必须在离开凭据上下文前读取。
+                    model_usage = self._stage_usage(task_id, stage)
             developer_report = None
             if result.status is JobStatus.SUCCEEDED and role == AgentRole.DEVELOPER:
                 developer_report = parse_developer_report(final_message(result.stdout))
@@ -118,6 +123,7 @@ class AgentStageExecutor:
                     else "failed"
                 ),
                 error_summary=str(exc)[-2000:] or type(exc).__name__,
+                model_usage=model_usage,
             )
             raise
         self._finish_agent_run(
@@ -127,6 +133,7 @@ class AgentStageExecutor:
             stdout=result.stdout,
             error_summary=result.stderr[-2000:] or None,
             developer_report=developer_report,
+            model_usage=model_usage,
         )
         if result.status is JobStatus.CANCELLED:
             raise TaskCancelled
@@ -156,6 +163,11 @@ class AgentStageExecutor:
             session.commit()
             return run.id, attempt
 
+    def _stage_usage(self, task_id: int, stage: Stage) -> UsageSnapshot | None:
+        if self.credential_broker is None:
+            return None
+        return self.credential_broker.usage(f"task-{task_id}", stage.value)
+
     def _finish_agent_run(
         self,
         run_id: int,
@@ -165,6 +177,7 @@ class AgentStageExecutor:
         stdout: str | None = None,
         error_summary: str | None = None,
         developer_report: DeveloperReport | None = None,
+        model_usage: UsageSnapshot | None = None,
     ) -> None:
         with self.sessions() as session:
             run = session.get(AgentRun, run_id)
@@ -173,11 +186,16 @@ class AgentStageExecutor:
             run.status = status
             run.finished_at = datetime.now(UTC)
             run.exit_code = exit_code
+            structured: dict = {}
             if stdout is not None:
-                run.structured_result = {"stdout": stdout[-100_000:]}
+                structured["stdout"] = stdout[-100_000:]
                 if developer_report is not None:
-                    run.structured_result["developer_report"] = (
-                        developer_report.model_dump()
-                    )
+                    structured["developer_report"] = developer_report.model_dump()
+            if model_usage is not None:
+                structured["model_usage"] = {
+                    "request_count": model_usage.request_count,
+                    "output_bytes": model_usage.output_bytes,
+                }
+            run.structured_result = structured or None
             run.error_summary = error_summary
             session.commit()

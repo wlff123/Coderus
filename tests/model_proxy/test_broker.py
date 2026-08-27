@@ -4,7 +4,25 @@ import re
 
 import pytest
 
-from coderus.model_proxy import CredentialBroker, LeaseRejected
+from coderus.model_proxy import CredentialBroker, LeaseRejected, UsageSnapshot
+
+
+def test_usage_returns_request_and_output_snapshot() -> None:
+    broker = CredentialBroker(configured_model="test-model")
+    token = broker.issue(task_id="task-1", stage="develop")
+    permit = broker.acquire(
+        token, endpoint="/v1/responses", requested_model="test-model"
+    )
+    permit.record_output(128)
+    permit.release()
+
+    assert broker.usage("task-1", "develop") == UsageSnapshot(
+        request_count=1, output_bytes=128
+    )
+    assert broker.usage("task-1", "review") is None
+
+    broker.revoke(token)
+    assert broker.usage("task-1", "develop") is None
 
 
 class FakeClock:
