@@ -5,7 +5,7 @@ import logging
 import secrets
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol, cast
@@ -104,6 +104,14 @@ class PRReviewOrchestrator:
                 details = await self.forges.require(task.provider).get_pull_request(
                     task.owner, task.name, task.pr_number
                 )
+                api_head_sha = details.head_sha
+                live_head = await self.workspace.resolve_remote_head(
+                    details.head_repository_url, details.head_ref
+                )
+                if live_head is not None and live_head != details.head_sha:
+                    # 平台 API 的 PR 元数据可能滞后于源分支的实际推送，
+                    # 检视必须以分支当前 tip 为准。
+                    details = replace(details, head_sha=live_head)
                 self._record_revision(
                     task_id,
                     state,
@@ -159,11 +167,20 @@ class PRReviewOrchestrator:
                 self._validate_pr(
                     current,
                     expected_base_sha=details.base_sha,
-                    expected_head_sha=details.head_sha,
                     expected_base_ref=details.base_ref,
                     expected_head_ref=details.head_ref,
                     expected_head_repository_url=details.head_repository_url,
                 )
+                # 头部版本以源分支实际 tip 为准；分支不可达时退回平台元数据，
+                # 并容忍 API 仍返回检视开始前的滞后值。
+                current_head = await self.workspace.resolve_remote_head(
+                    details.head_repository_url, details.head_ref
+                )
+                if current_head is not None:
+                    if current_head != details.head_sha:
+                        raise PRReviewError("检视期间源分支有新提交，请重新发起检视")
+                elif current.head_sha not in {details.head_sha, api_head_sha}:
+                    raise PRReviewError("PR 版本已变化")
                 output = self._redact_output(output, proxy_token, prepared)
                 structured_result = output.model_dump(mode="json")
                 structured_result["review_audit"] = {

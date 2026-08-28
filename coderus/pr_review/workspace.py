@@ -67,6 +67,33 @@ class PRWorkspace:
         self.transfer_timeout_seconds = transfer_timeout_seconds
         self.max_workspace_bytes = max_workspace_bytes
 
+    async def resolve_remote_head(self, repository_url: str, ref: str) -> str | None:
+        """查询远端分支当前 tip；平台 API 的 PR 元数据可能滞后于实际推送。
+
+        网络异常或分支不存在时返回 None，由调用方回退到平台元数据。
+        """
+        PRWorkspace._validate_head_repository_url(repository_url)
+        if not PRWorkspace._is_safe_ref(ref):
+            raise ValueError("ref must be a single safe Git ref")
+        self.workspace_root.mkdir(parents=True, exist_ok=True)
+        try:
+            output = await self._run(
+                "git",
+                "ls-remote",
+                "--",
+                repository_url,
+                f"refs/heads/{ref}",
+                cwd=self.workspace_root,
+            )
+        except RuntimeError:
+            return None
+        for line in output.splitlines():
+            sha, _, name = line.partition("\t")
+            sha = sha.strip().lower()
+            if name.strip() == f"refs/heads/{ref}" and _SHA.fullmatch(sha):
+                return sha
+        return None
+
     async def prepare(
         self,
         task_id: int,

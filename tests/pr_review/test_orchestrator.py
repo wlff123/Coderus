@@ -178,6 +178,8 @@ class FakeWorkspace:
         self.prepare_error: Exception | None = None
         self.pristine_error: Exception | None = None
         self.pristine_calls: list[tuple[Path, str, str]] = []
+        self.remote_heads: list[str | None] = []
+        self.resolve_calls: list[tuple[str, str]] = []
         self.ranges = ChangedRanges(
             {("src/widget.py", "RIGHT"): ((12, 14),)},
             comparison_sha=COMPARISON_SHA,
@@ -194,6 +196,12 @@ class FakeWorkspace:
             ),
             review_base="coderus-review-base",
         )
+
+    async def resolve_remote_head(self, repository_url: str, ref: str) -> str | None:
+        self.resolve_calls.append((repository_url, ref))
+        if self.remote_heads:
+            return self.remote_heads.pop(0)
+        return None
 
     async def prepare(self, **kwargs) -> Path:
         self.prepare_calls.append(kwargs)
@@ -456,7 +464,8 @@ async def test_run_reviews_fixed_pr_revision_once_and_persists_safe_result(
     assert spec.review_base == "coderus-review-base"
     assert workspace.material.unified_diff not in spec.prompt
     for required in (
-        "逐项检查",
+        "逐个检视本次 Pull Request 的全部变更文件",
+        "一次性列全",
         "1 到 5 句",
         "中文",
         "最小行号范围",
@@ -485,6 +494,48 @@ async def test_run_reviews_fixed_pr_revision_once_and_persists_safe_result(
     assert spec.proxy_token not in persisted_text
     assert str((tmp_path / "workspace").resolve()) not in persisted_text
     assert REVIEW_JSON not in persisted_text
+
+
+@pytest.mark.asyncio
+async def test_run_reviews_live_branch_tip_when_api_head_lags(
+    engine, session: Session, tmp_path: Path
+) -> None:
+    """平台 API 返回滞后的 head 时，检视必须以源分支当前 tip 为准。"""
+    task = add_review_task(session)
+    live_tip = "d" * 40
+    orchestrator, publisher, workspace, *_ = build_orchestrator(engine, tmp_path)
+    workspace.remote_heads = [live_tip, live_tip]  # 检视前后两次解析
+
+    await orchestrator.run(task.id)
+
+    session.expire_all()
+    persisted = session.get(PRReviewTask, task.id)
+    assert persisted.status == "completed"
+    assert persisted.head_sha == live_tip
+    assert workspace.resolve_calls == [
+        ("https://github.com/contributor/widgets-1.git", "feature/review")
+    ] * 2
+    assert workspace.prepare_calls[0]["head_sha"] == live_tip
+    assert publisher.comment_calls[0]["marker"] == (
+        f"<!-- coderus-pr-review:{persisted.review_key}:{BASE_SHA}:{live_tip} -->"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_fails_when_branch_moves_during_review(
+    engine, session: Session, tmp_path: Path
+) -> None:
+    task = add_review_task(session)
+    orchestrator, publisher, workspace, *_ = build_orchestrator(engine, tmp_path)
+    workspace.remote_heads = [HEAD_SHA, "e" * 40]  # 检视期间源分支有新提交
+
+    await orchestrator.run(task.id)
+
+    session.expire_all()
+    persisted = session.get(PRReviewTask, task.id)
+    assert persisted.status == "failed"
+    assert "源分支有新提交" in persisted.failure_summary
+    assert publisher.comment_calls == []
 
 
 @pytest.mark.asyncio

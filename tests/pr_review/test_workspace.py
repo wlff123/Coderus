@@ -101,6 +101,34 @@ def allow_local_head_repository(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_resolve_remote_head_returns_current_branch_tip(
+    tmp_path: Path,
+    allow_local_head_repository: None,
+) -> None:
+    upstream, _, head_sha = create_upstream(tmp_path)
+    manager = PRWorkspace(tmp_path / "workspaces", staging_root=tmp_path / "manager-staging")
+
+    assert await manager.resolve_remote_head(upstream.as_uri(), "review-head") == head_sha
+    assert await manager.resolve_remote_head(upstream.as_uri(), "no-such-branch") is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_remote_head_rejects_unsafe_inputs_before_running_git(
+    tmp_path: Path,
+) -> None:
+    manager = PRWorkspace(tmp_path / "workspaces", staging_root=tmp_path / "manager-staging")
+
+    with pytest.raises(ValueError):
+        await manager.resolve_remote_head(
+            "https://token@github.com/contributor/widgets.git", "main"
+        )
+    with pytest.raises(ValueError):
+        await manager.resolve_remote_head(
+            "https://github.com/contributor/widgets.git", "--upload-pack=evil"
+        )
+
+
+@pytest.mark.asyncio
 async def test_prepare_replaces_only_expected_directory_with_full_head_checkout(
     tmp_path: Path,
     allow_local_head_repository: None,
