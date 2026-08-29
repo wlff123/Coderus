@@ -745,6 +745,37 @@ async def test_transient_agent_failure_recovers_on_second_attempt(
 
 
 @pytest.mark.asyncio
+async def test_rate_limited_agent_failure_backs_off_and_reports_upstream(
+    engine, session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = add_review_task(session)
+    runner = FakeRunner(engine)
+    runner.status = JobStatus.FAILED
+    runner.stdout = (
+        '{"type":"error","message":"exceeded retry limit, '
+        'last status: 429 Too Many Requests"}'
+    )
+    delays: list[float] = []
+
+    async def fake_sleep(seconds: float, *args, **kwargs) -> None:
+        delays.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    orchestrator, publisher, *_ = build_orchestrator(engine, tmp_path, runner=runner)
+
+    await orchestrator.run(task.id)
+
+    session.expire_all()
+    persisted = session.get(PRReviewTask, task.id)
+    assert persisted.status == "failed"
+    assert persisted.failure_code == "upstream_unavailable"
+    assert persisted.failure_summary == "模型接口限流（429），请稍后重新发起检视"
+    assert len(runner.specs) == 2
+    assert 60.0 in delays
+    assert publisher.comment_calls == []
+
+
+@pytest.mark.asyncio
 async def test_timed_out_agent_job_is_not_retried(
     engine, session: Session, tmp_path: Path
 ) -> None:

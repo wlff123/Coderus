@@ -38,6 +38,8 @@ COMMENT_TIMEOUT_SECONDS = 90.0
 PR_REVIEW_MAX_OUTPUT_BYTES = 5_000_000
 # 代理进程非零退出多为模型接口瞬时故障，整体作业最多执行两次。
 AGENT_JOB_ATTEMPTS = 2
+# 模型接口限流（429）时，立即重试必然再次撞限，退避后再试。
+RATE_LIMIT_BACKOFF_SECONDS = 60.0
 LGTM_COMMENT = "/lgtm"
 
 
@@ -55,6 +57,12 @@ class ReviewAgentFailure(PRReviewError):
     """检视代理进程异常退出；消息中带脱敏后的诊断尾部。"""
 
     error_code = TaskErrorCode.INTERNAL_ERROR
+
+
+class ReviewRateLimited(PRReviewError):
+    """模型接口限流导致检视失败。"""
+
+    error_code = TaskErrorCode.UPSTREAM_UNAVAILABLE
 
 
 class _ClaimLost(Exception):
@@ -362,9 +370,14 @@ class PRReviewOrchestrator:
                     result.exit_code,
                     self._agent_failure_detail(result, token, workspace),
                 )
+                rate_limited = self._is_rate_limited(result)
                 # 仅对非零退出重试一次；超时重试会翻倍耗时，取消意味着任务权已丢失。
                 if result.status is not JobStatus.FAILED or attempt == AGENT_JOB_ATTEMPTS:
+                    if rate_limited:
+                        raise ReviewRateLimited("模型接口限流（429），请稍后重新发起检视")
                     raise ReviewAgentFailure(f"Codex 检视失败（{result.status.value}）")
+                if rate_limited:
+                    await asyncio.sleep(RATE_LIMIT_BACKOFF_SECONDS)
             try:
                 return (
                     parse_review_output(
@@ -606,6 +619,13 @@ class PRReviewOrchestrator:
             return value
 
         return ReviewOutput.model_validate(redact(output.model_dump(mode="json")))
+
+    @staticmethod
+    def _is_rate_limited(result) -> bool:
+        """识别 codex ``--json`` 输出中的模型限流错误事件。"""
+        return "429 Too Many Requests" in result.stdout or (
+            "429 Too Many Requests" in result.stderr
+        )
 
     @staticmethod
     def _agent_failure_detail(result, proxy_token: str | None, workspace: Path) -> str:
