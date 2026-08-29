@@ -675,6 +675,48 @@ async def test_run_failure_is_sanitized_and_never_retries_codex(
 
 
 @pytest.mark.asyncio
+async def test_agent_job_failure_is_classified_and_logged_with_redacted_detail(
+    engine,
+    session: Session,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    task = add_review_task(session)
+    workspace = FakeWorkspace(engine, tmp_path / "workspace")
+
+    class TokenEchoRunner(FakeRunner):
+        async def run(self, spec, *, cancel_event=None):
+            self.status = JobStatus.FAILED
+            self.stderr = (
+                f"model call failed: 502 Bad Gateway token={spec.proxy_token} "
+                f"in {(tmp_path / 'workspace').resolve()}"
+            )
+            return await super().run(spec, cancel_event=cancel_event)
+
+    runner = TokenEchoRunner(engine)
+    orchestrator, *_ = build_orchestrator(
+        engine, tmp_path, workspace=workspace, runner=runner
+    )
+
+    with caplog.at_level(logging.ERROR, logger="coderus.pr_review.orchestrator"):
+        await orchestrator.run(task.id)
+
+    session.expire_all()
+    persisted = session.get(PRReviewTask, task.id)
+    assert persisted.status == "failed"
+    assert persisted.failure_code == "internal_error"
+    assert persisted.failure_summary == "Codex 检视失败（failed）"
+    log_text = "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if "agent job failed" in record.getMessage()
+    )
+    assert "502 Bad Gateway" in log_text
+    assert runner.specs[0].proxy_token not in log_text
+    assert str((tmp_path / "workspace").resolve()) not in log_text
+
+
+@pytest.mark.asyncio
 async def test_run_drops_unpublishable_locations_and_completes(
     engine, session: Session, tmp_path: Path
 ) -> None:

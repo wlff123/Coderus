@@ -49,6 +49,12 @@ class PRReviewError(RuntimeError):
     error_code = TaskErrorCode.INVALID_INPUT
 
 
+class ReviewAgentFailure(PRReviewError):
+    """检视代理进程异常退出；消息中带脱敏后的诊断尾部。"""
+
+    error_code = TaskErrorCode.INTERNAL_ERROR
+
+
 class _ClaimLost(Exception):
     pass
 
@@ -342,7 +348,15 @@ class PRReviewOrchestrator:
                 max_retries=2,
             )
             if result.status is not JobStatus.SUCCEEDED:
-                raise PRReviewError(f"Codex 检视失败（{result.status.value}）")
+                # 诊断细节只进服务端日志；摘要会同步到飞书，不携带代理原始输出。
+                logger.error(
+                    "pr-review-%s agent job failed (%s, exit_code=%s): %s",
+                    task.id,
+                    result.status.value,
+                    result.exit_code,
+                    self._agent_failure_detail(result, token, workspace),
+                )
+                raise ReviewAgentFailure(f"Codex 检视失败（{result.status.value}）")
             try:
                 return (
                     parse_review_output(
@@ -584,6 +598,26 @@ class PRReviewOrchestrator:
             return value
 
         return ReviewOutput.model_validate(redact(output.model_dump(mode="json")))
+
+    @staticmethod
+    def _agent_failure_detail(result, proxy_token: str | None, workspace: Path) -> str:
+        """提取代理失败输出的脱敏尾部，用于失败摘要与通知。"""
+        stream = result.stderr.strip() or result.stdout.strip()
+        if not stream:
+            return "代理进程未输出诊断信息"
+        absolute = str(Path(workspace).resolve())
+        sensitive = {
+            value
+            for value in (
+                proxy_token,
+                absolute,
+                absolute.replace("\\", "/"),
+                absolute.replace("/", "\\"),
+            )
+            if value
+        }
+        cleaned = PRReviewOrchestrator._redact_text(stream, sensitive)
+        return " ".join(cleaned[-400:].split())
 
     @staticmethod
     def _redact_text(value: str, sensitive: set[str]) -> str:
