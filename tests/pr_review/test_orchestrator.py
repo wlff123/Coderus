@@ -622,7 +622,7 @@ async def test_run_rejects_non_open_pr_before_workspace(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure_kind", ["workspace", "runner", "output", "comment"])
-async def test_run_failure_is_sanitized_and_never_retries_codex(
+async def test_run_failure_is_sanitized(
     engine, session: Session, tmp_path: Path, failure_kind: str
 ) -> None:
     task = add_review_task(session)
@@ -667,7 +667,9 @@ async def test_run_failure_is_sanitized_and_never_retries_codex(
     assert secret not in repr(persisted.structured_result)
     assert absolute_path not in repr(persisted.structured_result)
     assert raw_stdout not in repr(persisted.structured_result)
-    assert len(runner.specs) == (0 if failure_kind == "workspace" else 1)
+    # runner 类失败（非零退出）允许整体重试一次；其余失败不重跑 codex。
+    expected_specs = {"workspace": 0, "runner": 2, "output": 1, "comment": 1}
+    assert len(runner.specs) == expected_specs[failure_kind]
     if runner.specs:
         assert runner.specs[0].proxy_token is not None
         assert not broker.validate(runner.specs[0].proxy_token)
@@ -706,14 +708,58 @@ async def test_agent_job_failure_is_classified_and_logged_with_redacted_detail(
     assert persisted.status == "failed"
     assert persisted.failure_code == "internal_error"
     assert persisted.failure_summary == "Codex 检视失败（failed）"
+    assert len(runner.specs) == 2
     log_text = "\n".join(
         record.getMessage()
         for record in caplog.records
         if "agent job failed" in record.getMessage()
     )
+    assert "attempt 1/2" in log_text and "attempt 2/2" in log_text
     assert "502 Bad Gateway" in log_text
+    assert "stdout:" in log_text
     assert runner.specs[0].proxy_token not in log_text
     assert str((tmp_path / "workspace").resolve()) not in log_text
+
+
+@pytest.mark.asyncio
+async def test_transient_agent_failure_recovers_on_second_attempt(
+    engine, session: Session, tmp_path: Path
+) -> None:
+    task = add_review_task(session)
+
+    class FlakyRunner(FakeRunner):
+        async def run(self, spec, *, cancel_event=None):
+            self.status = JobStatus.FAILED if not self.specs else JobStatus.SUCCEEDED
+            return await super().run(spec, cancel_event=cancel_event)
+
+    runner = FlakyRunner(engine)
+    orchestrator, publisher, *_ = build_orchestrator(engine, tmp_path, runner=runner)
+
+    await orchestrator.run(task.id)
+
+    session.expire_all()
+    persisted = session.get(PRReviewTask, task.id)
+    assert persisted.status == "completed"
+    assert len(runner.specs) == 2
+    assert len(publisher.comment_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_timed_out_agent_job_is_not_retried(
+    engine, session: Session, tmp_path: Path
+) -> None:
+    task = add_review_task(session)
+    runner = FakeRunner(engine)
+    runner.status = JobStatus.TIMED_OUT
+    orchestrator, *_ = build_orchestrator(engine, tmp_path, runner=runner)
+
+    await orchestrator.run(task.id)
+
+    session.expire_all()
+    persisted = session.get(PRReviewTask, task.id)
+    assert persisted.status == "failed"
+    assert persisted.failure_summary == "Codex 检视失败（timed_out）"
+    assert len(runner.specs) == 1
 
 
 @pytest.mark.asyncio

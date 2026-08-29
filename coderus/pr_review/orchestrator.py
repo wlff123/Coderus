@@ -36,6 +36,8 @@ CLAIM_LEASE_SECONDS = 120.0
 CLAIM_HEARTBEAT_SECONDS = 10.0
 COMMENT_TIMEOUT_SECONDS = 90.0
 PR_REVIEW_MAX_OUTPUT_BYTES = 5_000_000
+# 代理进程非零退出多为模型接口瞬时故障，整体作业最多执行两次。
+AGENT_JOB_ATTEMPTS = 2
 LGTM_COMMENT = "/lgtm"
 
 
@@ -342,21 +344,27 @@ class PRReviewOrchestrator:
             async def restore_checkpoint() -> None:
                 return None
 
-            result = await retry_agent_operation(
-                run_agent,
-                restore_checkpoint,
-                max_retries=2,
-            )
-            if result.status is not JobStatus.SUCCEEDED:
+            for attempt in range(1, AGENT_JOB_ATTEMPTS + 1):
+                result = await retry_agent_operation(
+                    run_agent,
+                    restore_checkpoint,
+                    max_retries=2,
+                )
+                if result.status is JobStatus.SUCCEEDED:
+                    break
                 # 诊断细节只进服务端日志；摘要会同步到飞书，不携带代理原始输出。
                 logger.error(
-                    "pr-review-%s agent job failed (%s, exit_code=%s): %s",
+                    "pr-review-%s agent job failed (attempt %s/%s, %s, exit_code=%s): %s",
                     task.id,
+                    attempt,
+                    AGENT_JOB_ATTEMPTS,
                     result.status.value,
                     result.exit_code,
                     self._agent_failure_detail(result, token, workspace),
                 )
-                raise ReviewAgentFailure(f"Codex 检视失败（{result.status.value}）")
+                # 仅对非零退出重试一次；超时重试会翻倍耗时，取消意味着任务权已丢失。
+                if result.status is not JobStatus.FAILED or attempt == AGENT_JOB_ATTEMPTS:
+                    raise ReviewAgentFailure(f"Codex 检视失败（{result.status.value}）")
             try:
                 return (
                     parse_review_output(
@@ -601,10 +609,11 @@ class PRReviewOrchestrator:
 
     @staticmethod
     def _agent_failure_detail(result, proxy_token: str | None, workspace: Path) -> str:
-        """提取代理失败输出的脱敏尾部，用于失败摘要与通知。"""
-        stream = result.stderr.strip() or result.stdout.strip()
-        if not stream:
-            return "代理进程未输出诊断信息"
+        """提取代理失败输出的脱敏尾部，仅写入服务端日志。
+
+        ``--json`` 模式下真实错误事件在 stdout，stderr 往往只有启动提示，
+        因此两路输出都要保留。
+        """
         absolute = str(Path(workspace).resolve())
         sensitive = {
             value
@@ -616,8 +625,14 @@ class PRReviewOrchestrator:
             )
             if value
         }
-        cleaned = PRReviewOrchestrator._redact_text(stream, sensitive)
-        return " ".join(cleaned[-400:].split())
+        parts = []
+        for label, stream in (("stderr", result.stderr), ("stdout", result.stdout)):
+            text = stream.strip()
+            if not text:
+                continue
+            cleaned = PRReviewOrchestrator._redact_text(text, sensitive)
+            parts.append(f"{label}: {' '.join(cleaned[-400:].split())}")
+        return " | ".join(parts) or "代理进程未输出诊断信息"
 
     @staticmethod
     def _redact_text(value: str, sensitive: set[str]) -> str:
