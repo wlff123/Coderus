@@ -40,6 +40,14 @@ def test_assistant_can_be_disabled() -> None:
     assert settings.assistant.enabled is False
 
 
+def test_codex_reasoning_effort_configuration() -> None:
+    settings = Settings.model_validate({**SECRETS, "codex": {"reasoning_effort": "high"}})
+    assert settings.codex.reasoning_effort == "high"
+    assert Settings.model_validate(SECRETS).codex.reasoning_effort is None
+    with pytest.raises(ValidationError):
+        Settings.model_validate({**SECRETS, "codex": {"reasoning_effort": "invalid"}})
+
+
 def test_codex_sandbox_mode_can_be_configured_for_container() -> None:
     settings = Settings.model_validate(
         {**SECRETS, "codex": {"sandbox_mode": "danger-full-access"}}

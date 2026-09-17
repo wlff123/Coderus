@@ -52,6 +52,7 @@ class SchedulerSettings(BaseModel):
 class CodexSettings(BaseModel):
     binary: str = "codex"
     model: str | None = None
+    reasoning_effort: Literal["low", "medium", "high", "xhigh"] | None = None
     stage_timeout_seconds: int = Field(default=3600, ge=60)
     base_url: str | None = None
     proxy_port: int = Field(default=18083, ge=1, le=65535)

@@ -30,7 +30,16 @@ import time
 
 stdin = sys.stdin.read()
 if "review" in sys.argv:
-    print(json.dumps({"argv": sys.argv[1:], "stdin": stdin}))
+    print(json.dumps({"type": "test.command", "argv": sys.argv[1:], "stdin": stdin}))
+    print(json.dumps({"type": "item.completed", "item": {
+        "type": "agent_message", "text": "CODERUS_REVIEW_COMPLETE_NO_FINDINGS"}}))
+    print(json.dumps({"type": "turn.completed"}))
+    raise SystemExit
+if "native_review" in stdin:
+    print(json.dumps({"type": "item.completed", "item": {
+        "type": "agent_message", "text": json.dumps({
+            "change_summary": ["修改了代码。"], "findings": []})}}))
+    print(json.dumps({"type": "turn.completed"}))
     raise SystemExit
 prompt = stdin if sys.argv[-1] == "-" else sys.argv[-1]
 if prompt == "show-env":
@@ -215,7 +224,7 @@ def review_spec(tmp_path: Path) -> JobSpec:
     )
 
 
-def test_build_command_uses_schema_driven_exec_for_pr_review(
+def test_build_command_uses_native_review_without_competing_schema(
     fake_cli: tuple[str, ...], review_spec: JobSpec
 ) -> None:
     root = review_spec.workspace.parent
@@ -227,8 +236,7 @@ def test_build_command_uses_schema_driven_exec_for_pr_review(
 
     assert command[: len(fake_cli)] == list(fake_cli)
     assert "exec" in command
-    assert command[-1] == "请按开发者检视规范完成本次静态检视，并严格输出 Schema 对象。"
-    assert "review" not in command
+    assert command[-2:] == ["review", "请按开发者检视规范完成本次完整静态检视。"]
     assert "--base" not in command
     assert "developer_instructions=" in " ".join(command)
     assert "resume" not in command
@@ -240,7 +248,7 @@ def test_build_command_uses_schema_driven_exec_for_pr_review(
     assert 'model_providers.coderus_proxy.wire_api="responses"' in command
     assert "model_providers.coderus_proxy.supports_websockets=false" in command
     assert command[command.index("--model") + 1] == "test-model"
-    assert command[command.index("--output-schema") + 1] == str(review_spec.output_schema)
+    assert "--output-schema" not in command
     assert "--search" not in command
     expected_sandbox = "danger-full-access" if sys.platform == "linux" else "read-only"
     assert command[command.index("--sandbox") + 1] == expected_sandbox
@@ -279,7 +287,7 @@ def test_linux_pr_review_uses_landlock_instead_of_the_unavailable_inner_sandbox(
 
 
 @pytest.mark.asyncio
-async def test_pr_review_runs_without_stdin_and_with_output_schema(
+async def test_pr_review_runs_native_then_returns_schema_conversion(
     fake_cli: tuple[str, ...], review_spec: JobSpec
 ) -> None:
     runner = LocalCodexRunner(
@@ -293,16 +301,16 @@ async def test_pr_review_runs_without_stdin_and_with_output_schema(
 
     result = await runner.run(review_spec)
 
-    payload = json.loads(result.stdout)
+    events = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    payload = events[0]
     assert result.status is JobStatus.SUCCEEDED
     assert "exec" in payload["argv"]
     assert 'model_provider="coderus_proxy"' in payload["argv"]
-    assert payload["argv"][-1] == "请按开发者检视规范完成本次静态检视，并严格输出 Schema 对象。"
-    assert payload["prompt"] == payload["argv"][-1]
-    assert "stdin" not in payload
-    assert "review" not in payload["argv"]
+    assert payload["argv"][-2] == "review"
+    assert payload["stdin"] == ""
     assert "--base" not in payload["argv"]
-    assert "--output-schema" in payload["argv"]
+    assert "--output-schema" not in payload["argv"]
+    assert json.loads(events[-1]["item"]["text"])["findings"] == []
 
 
 @pytest.mark.asyncio
@@ -329,7 +337,7 @@ async def test_pr_review_passes_no_stdin_text_to_the_process(
 
     result = await runner.run(review_spec)
 
-    assert result.status is JobStatus.SUCCEEDED
+    assert result.status is JobStatus.FAILED  # No native conclusion: do not run conversion.
     assert stdin_texts == [None]
 
 
@@ -352,8 +360,7 @@ def test_pr_review_adds_large_prompt_to_developer_instructions(
     command = runner.build_command(spec, output_schema=spec.output_schema)
 
     assert f"developer_instructions={json.dumps(prompt)}" in command
-    assert command[-1] == "请按开发者检视规范完成本次静态检视，并严格输出 Schema 对象。"
-    assert "review" not in command
+    assert command[-2:] == ["review", "请按开发者检视规范完成本次完整静态检视。"]
     assert "--base" not in command
 
 
@@ -419,6 +426,22 @@ def test_build_command_preserves_codex_login_when_no_proxy_token(
 
     assert not any(argument.startswith("model_provider=") for argument in command)
     assert not any(argument.startswith("model_providers.") for argument in command)
+
+
+@pytest.mark.parametrize("effort", [None, "high"])
+def test_build_command_passes_reasoning_effort(
+    tmp_path: Path, fake_cli: tuple[str, ...], effort: str | None
+) -> None:
+    root, workspace = make_workspace(tmp_path)
+    runner = LocalCodexRunner(
+        RunnerConfig(root, fake_cli, model="gpt-6-astra", reasoning_effort=effort)
+    )
+    command = runner.build_command(make_spec(workspace, "work"))
+    settings = [arg for arg in command if arg.startswith("model_reasoning_effort=")]
+    assert settings == ([] if effort is None else ['model_reasoning_effort="high"'])
+    assert ("model_supports_reasoning_summaries=true" in command) == (effort is not None)
+    assert 'web_search="disabled"' in command
+    assert "features.multi_agent=false" in command
 
 
 def test_build_command_uses_read_only_for_reviewers(
@@ -691,6 +714,10 @@ async def test_linux_landlock_execute_is_limited_by_task_mode(
 
             def _build_exec_command(self, spec: JobSpec, **kwargs) -> list[str]:
                 return [*fake_cli, "probe-execute"]
+
+            async def _adapt_review(self, spec, native, *args, **kwargs):
+                # This probe tests the OS boundary, not a Codex review transcript.
+                return native
 
         runner = ReviewProbeRunner(config)
     else:

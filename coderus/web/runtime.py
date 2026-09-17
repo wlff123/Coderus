@@ -486,6 +486,7 @@ def build_runtime(
             api_base_url=runner_api_base,
             model=settings.codex.model,
             network_access=settings.runner.network_access,
+            reasoning_effort=settings.codex.reasoning_effort,
             sandbox_mode=settings.codex.sandbox_mode,
         )
     )
