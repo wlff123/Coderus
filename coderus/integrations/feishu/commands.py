@@ -10,7 +10,9 @@ ISSUE_URL_PATTERN = re.compile(r"^https://[^\s]+/issues/\d+$")
 PULL_REQUEST_URL_PATTERN = re.compile(
     r"^https://[^\s]+/(?:pulls?|merge_requests)/\d+$"
 )
-MARKDOWN_LINK_PATTERN = re.compile(r"^\[(https://[^\]\s]+)\]\((https://[^\s)]+)\)$")
+MARKDOWN_LINK_PATTERN = re.compile(
+    r"^\[((?:\\.|[^\[\]\\])+)\]\((https://[^\s()<>]+)\)$"
+)
 INTRO_QUESTIONS = frozenset(
     {
         "你会干什么",
@@ -80,4 +82,8 @@ def _command_argument(value: str, command: str) -> str | None:
     if markdown_link is None:
         return argument
     label, target = markdown_link.groups()
-    return target if label == target else argument
+    # Feishu pastes PR titles as link labels. Only the destination is executable
+    # command data; keep rejecting a displayed URL that disguises a different URL.
+    if label.startswith("https://") and label != target:
+        return argument
+    return target

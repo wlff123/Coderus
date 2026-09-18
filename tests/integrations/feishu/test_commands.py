@@ -86,3 +86,33 @@ def test_review_rejects_trailing_instructions() -> None:
     text = "检视 https://github.com/octo/demo/pull/1 顺便重构"
 
     assert parse_command(text) == BotCommand("unknown")
+
+
+@pytest.mark.parametrize("prefix", ["检视", "检视 ", "检视\n"])
+@pytest.mark.parametrize("title", [
+    "feat(onboard): improve local plugin and docker setup-oGMemory-AtomGit",
+    "修复错误处理与发布配置",
+    r"修复 \[P1\] 问题",
+])
+def test_review_accepts_feishu_titled_link(prefix: str, title: str) -> None:
+    target = "https://gitcode.com/opengauss/oGMemory/pull/205"
+    assert parse_command(f"{prefix}[{title}]({target})") == BotCommand("review", target)
+
+
+def test_dispatch_accepts_titled_issue_link() -> None:
+    target = "https://github.com/acme/widgets/issues/17"
+    assert parse_command(f"派发[修复空值问题]({target})") == BotCommand("dispatch", target)
+
+
+@pytest.mark.parametrize("argument", [
+    "[标题](http://gitcode.com/acme/widgets/pull/17)",
+    "[标题](javascript:alert(1))",
+    "[标题](https://gitcode.com/acme/widgets/issues/17)",
+    "[标题](https://gitcode.com/acme/widgets/pull/17) 顺便重构",
+    "[标题](https://gitcode.com/acme/widgets/pull/17) [另一条](https://github.com/a/b/pull/2)",
+    "[标题](https://gitcode.com/acme/widgets/pull/17",
+    "[标题](https://gitcode.com/acme/widgets/pull/17 extra)",
+    "[https://github.com/a/b/pull/1](https://github.com/a/b/pull/2)",
+])
+def test_review_rejects_invalid_or_ambiguous_titled_links(argument: str) -> None:
+    assert parse_command("检视" + argument) == BotCommand("unknown")
