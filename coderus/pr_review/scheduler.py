@@ -30,12 +30,13 @@ class PRReviewScheduler:
         self._running: dict[int, asyncio.Task[None]] = {}
         self._loop_task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
+        self.last_error: str | None = None
+        self.consecutive_failures = 0
 
     def start(self) -> None:
         if self._loop_task is not None:
             return
         self._stop.clear()
-        self.recover_expired()
         self._loop_task = asyncio.create_task(self._loop())
 
     async def stop(self) -> None:
@@ -114,10 +115,28 @@ class PRReviewScheduler:
 
     async def _loop(self) -> None:
         while not self._stop.is_set():
-            await self.tick()
+            delay = self.poll_seconds
+            try:
+                await self.tick()
+            except Exception as exc:
+                self.last_error = type(exc).__name__
+                self.consecutive_failures += 1
+                delay = min(60.0, max(1.0, self.poll_seconds) * (
+                    2 ** min(self.consecutive_failures - 1, 6)
+                ))
+                # Never log exception text/SQL parameters: they may contain credentials.
+                logger.error(
+                    "PR review scheduler tick failed: %s; retry in %.1fs (failures=%s)",
+                    self.last_error, delay, self.consecutive_failures,
+                )
+            else:
+                if self.consecutive_failures:
+                    logger.info("PR review scheduler recovered")
+                self.last_error = None
+                self.consecutive_failures = 0
             try:
                 await asyncio.wait_for(
-                    self._stop.wait(), timeout=self.poll_seconds
+                    self._stop.wait(), timeout=delay
                 )
             except TimeoutError:
                 pass

@@ -302,6 +302,15 @@ def test_active_readyz_checks_background_components(app_settings: Settings) -> N
         ready = active_client.get("/readyz")
         assert ready.status_code == 200
         assert ready.json()["checks"]["components"] == "ok"
+        assert ready.json()["component_checks"]["pr_review_scheduler"] == "ok"
+
+        app.state.pr_review_scheduler.last_error = "OperationalError"
+        try:
+            degraded = active_client.get("/readyz")
+            assert degraded.status_code == 503
+            assert degraded.json()["component_checks"]["pr_review_scheduler"] == "error"
+        finally:
+            app.state.pr_review_scheduler.last_error = None
 
         scheduler_task = app.state.scheduler._loop_task
         app.state.scheduler._loop_task = None
@@ -312,6 +321,7 @@ def test_active_readyz_checks_background_components(app_settings: Settings) -> N
 
     assert unavailable.status_code == 503
     assert unavailable.json()["error_codes"] == ["components_unavailable"]
+    assert unavailable.json()["component_checks"]["task_scheduler"] == "error"
 
 
 def test_second_active_manager_is_rejected(app_settings: Settings) -> None:

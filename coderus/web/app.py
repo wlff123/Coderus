@@ -218,16 +218,21 @@ def create_app(
             template_root=PACKAGE_ROOT / "templates",
         )
         if status_code == 200 and runtime_mode == "active":
-            loop_components = (
-                app.state.scheduler,
-                app.state.issue_poller,
-                app.state.pr_status_poller,
-                app.state.pr_review_scheduler,
-            )
-            loops_ready = all(
-                component._loop_task is not None and not component._loop_task.done()
-                for component in loop_components
-            )
+            loop_components = {
+                "task_scheduler": app.state.scheduler,
+                "issue_poller": app.state.issue_poller,
+                "pr_status_poller": app.state.pr_status_poller,
+                "pr_review_scheduler": app.state.pr_review_scheduler,
+            }
+            component_checks = {
+                name: (
+                    "ok" if component._loop_task is not None
+                    and not component._loop_task.done()
+                    and not getattr(component, "last_error", None) else "error"
+                )
+                for name, component in loop_components.items()
+            }
+            loops_ready = all(value == "ok" for value in component_checks.values())
             proxy_ready = app.state.model_proxy_app is None or (
                 app.state.model_proxy_running
                 and app.state.model_proxy_task is not None
@@ -236,6 +241,9 @@ def create_app(
             feishu_ready = app.state.feishu_bot is None or (
                 app.state.feishu_running and app.state.feishu_bot.is_running()
             )
+            component_checks["model_proxy"] = "ok" if proxy_ready else "error"
+            component_checks["feishu"] = "ok" if feishu_ready else "error"
+            payload["component_checks"] = component_checks
             payload["checks"]["components"] = (
                 "ok" if loops_ready and proxy_ready and feishu_ready else "error"
             )

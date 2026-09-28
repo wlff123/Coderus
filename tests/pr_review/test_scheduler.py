@@ -44,6 +44,55 @@ class ExplodingOrchestrator:
 
 
 @pytest.mark.asyncio
+async def test_loop_recovers_after_database_failure(engine, session, monkeypatch, caplog):
+    task = add_review_task(session)
+    orchestrator = BlockingOrchestrator()
+    scheduler = PRReviewScheduler(
+        session_factory=lambda: Session(engine), orchestrator=orchestrator, poll_seconds=0.01,
+    )
+    original = scheduler.recover_expired
+    attempts = 0
+
+    def transient_failure():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("private-database-credential")
+        return original()
+
+    monkeypatch.setattr(scheduler, "recover_expired", transient_failure)
+    scheduler.start()
+    try:
+        await asyncio.sleep(0.02)
+        assert scheduler.last_error == "RuntimeError"
+        assert not scheduler._loop_task.done()
+        await asyncio.wait_for(orchestrator.started.wait(), timeout=3)
+        assert orchestrator.calls == [task.id]
+        assert scheduler.last_error is None
+        assert scheduler.consecutive_failures == 0
+        assert "private-database-credential" not in caplog.text
+    finally:
+        await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_interrupts_error_backoff(engine, monkeypatch):
+    scheduler = PRReviewScheduler(
+        session_factory=lambda: Session(engine), orchestrator=BlockingOrchestrator(),
+        poll_seconds=60,
+    )
+
+    async def fail():
+        raise RuntimeError("failure")
+
+    monkeypatch.setattr(scheduler, "tick", fail)
+    scheduler.start()
+    await asyncio.sleep(0.01)
+    assert scheduler.last_error == "RuntimeError"
+    await asyncio.wait_for(scheduler.stop(), timeout=0.5)
+
+
+@pytest.mark.asyncio
 async def test_tick_starts_only_one_queued_review_at_a_time(engine, session: Session) -> None:
     first = add_review_task(session, suffix="1")
     second = add_review_task(session, suffix="2")
