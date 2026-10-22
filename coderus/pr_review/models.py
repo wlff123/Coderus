@@ -53,6 +53,25 @@ class ChangedRanges:
         context_lines = clipped_start - start + end - clipped_end
         return overlaps[0] if context_lines <= 1 else None
 
+    def rejection_reason(self, file_path: str, side: str, start: int, end: int) -> str | None:
+        if self.clip(file_path, side, start, end) is not None:
+            return None
+        path = normalize_repository_path(file_path)
+        if path is None or side not in {"LEFT", "RIGHT"} or start < 1 or end < start:
+            return "文件路径、版本侧或行号范围无效"
+        intervals = self.ranges.get((path, side), ())
+        if not intervals:
+            return "该文件在指定版本侧没有可定位的修改行"
+        overlaps = {
+            (max(start, left), min(end, right))
+            for left, right in intervals if max(start, left) <= min(end, right)
+        }
+        if not overlaps:
+            return "意见行号未覆盖本次修改行"
+        if len(overlaps) > 1:
+            return "意见范围跨越多个不连续的修改区间"
+        return "意见范围包含超过一行未修改的上下文，无法安全缩小定位范围"
+
 
 @dataclass(frozen=True, slots=True)
 class ReviewInput:

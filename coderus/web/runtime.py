@@ -535,6 +535,9 @@ def build_runtime(
         notifier=feishu_client,
         credential_broker=credential_broker,
         stage_timeout_seconds=settings.codex.stage_timeout_seconds,
+        model_secrets=(
+            (settings.model_api_key.get_secret_value(),) if settings.model_api_key else ()
+        ),
     )
     pr_review_scheduler = PRReviewScheduler(
         session_factory=sessions,

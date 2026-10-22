@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 import shutil
@@ -38,6 +39,36 @@ _SYSTEM_ENVIRONMENT_KEYS = {
     "USERPROFILE",
     "WINDIR",
 }
+
+logger = logging.getLogger(__name__)
+
+
+class PRWorkspaceError(RuntimeError):
+    """Fixed, credential-free diagnostics safe to send to the review requester."""
+
+
+class RevisionChanged(PRWorkspaceError):
+    """A remote branch moved while preparing an isolated review checkout."""
+
+
+class BaseRevisionChanged(RevisionChanged):
+    """Target moved between resolution and fetch; preparation may be retried."""
+
+
+def _git_failure_reason(stderr: bytes) -> str:
+    text = stderr.decode("utf-8", errors="replace").lower()
+    for markers, message in (
+        (("could not resolve host", "name resolution"), "代码仓库域名解析失败"),
+        (("connection reset", "early eof", "rpc failed", "ssl", "tls", "failed to connect",
+          "connection refused", "timed out"), "代码仓库网络连接失败或传输中断"),
+        (("authentication failed", "could not read username", "403", "401"),
+         "代码仓库认证或访问权限不足"),
+        (("no space left",), "磁盘空间不足"),
+        (("couldn't find remote ref", "not our ref"), "目标分支或提交已不存在"),
+    ):
+        if any(marker in text for marker in markers):
+            return message
+    return "Git 命令执行失败"
 
 
 class PRWorkspace:
@@ -145,23 +176,28 @@ class PRWorkspace:
                 str(checkout),
                 cwd=staging_root,
             )
-            await self._run("git", "fetch", "--", "upstream", base_ref, cwd=checkout)
+            await self._run(
+                "git", "fetch", "--force", "--no-tags", "--", "upstream",
+                f"refs/heads/{base_ref}", cwd=checkout,
+            )
             resolved_base = await self._run("git", "rev-parse", "FETCH_HEAD^{commit}", cwd=checkout)
             if resolved_base.strip().lower() != base_sha.lower():
-                raise RuntimeError("fetched base SHA does not match the requested base SHA")
+                raise BaseRevisionChanged("目标分支 base SHA 在准备期间变化，请稍后重新触发检视")
             await self._run(
                 "git",
                 "fetch",
+                "--force",
+                "--no-tags",
                 "--",
                 head_repository_url,
-                head_ref,
+                f"refs/heads/{head_ref}",
                 cwd=checkout,
             )
             resolved_head = (
                 await self._run("git", "rev-parse", "FETCH_HEAD^{commit}", cwd=checkout)
             ).strip()
             if resolved_head.lower() != head_sha.lower():
-                raise RuntimeError("fetched PR head SHA does not match the requested head SHA")
+                raise RevisionChanged("PR 源分支 head SHA 在准备期间变化，请稍后重新触发检视")
             await self._run("git", "checkout", "--detach", head_sha, cwd=checkout)
             # 跨文件系统搬运整个检出可能拷贝数 GB，同样不能阻塞事件循环。
             await asyncio.to_thread(shutil.move, str(checkout), str(workspace))
@@ -551,9 +587,16 @@ class PRWorkspace:
                 ):
                     raise CommandResourceLimitExceeded("command path size limit exceeded")
             except CommandTimedOut:
-                raise RuntimeError("Git command timed out") from None
+                raise PRWorkspaceError(
+                    f"Git {command[1]} 超时，请稍后重新触发检视"
+                ) from None
             except CommandResourceLimitExceeded:
-                raise RuntimeError("PR workspace size limit exceeded") from None
+                raise PRWorkspaceError("PR workspace size limit exceeded") from None
         if result.returncode != 0:
-            raise RuntimeError("git command failed")
+            reason = _git_failure_reason(result.stderr)
+            logger.warning("PR workspace Git %s failed (exit=%s): %s",
+                           command[1], result.returncode, reason)
+            raise PRWorkspaceError(
+                f"Git {command[1]} 失败：{reason}，请稍后重新触发检视"
+            )
         return result.stdout.decode("utf-8", errors="replace")

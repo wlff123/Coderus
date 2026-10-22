@@ -44,6 +44,7 @@ class _Lease:
     model: str
     max_concurrency: int
     in_flight: int = 0
+    upstream_error: str | None = None
 
 
 @dataclass
@@ -157,6 +158,21 @@ class CredentialBroker:
                 max_concurrency=max_concurrency,
             )
         return token
+
+    def set_upstream_error(self, token: str, message: str | None) -> None:
+        """Store only sanitized diagnostics, scoped to this lease's lifetime."""
+        with self._lock:
+            lease = self._leases_by_digest.get(self._digest(token))
+            if lease is not None:
+                lease.upstream_error = message
+
+    def take_upstream_error(self, token: str) -> str | None:
+        with self._lock:
+            lease = self._leases_by_digest.get(self._digest(token))
+            if lease is None:
+                return None
+            message, lease.upstream_error = lease.upstream_error, None
+            return message
 
     def validate(self, token: str) -> bool:
         if not isinstance(token, str) or not token:

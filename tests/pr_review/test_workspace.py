@@ -162,6 +162,30 @@ async def test_prepare_replaces_only_expected_directory_with_full_head_checkout(
 
 
 @pytest.mark.asyncio
+async def test_prepare_force_syncs_rewritten_branch_despite_same_named_tag(
+    tmp_path: Path, allow_local_head_repository: None
+) -> None:
+    upstream, base_sha, old_head = create_upstream(tmp_path)
+    source = tmp_path / "source"
+    git(source, "tag", "review-head", old_head)
+    git(source, "push", "upstream", "refs/tags/review-head")
+    git(source, "checkout", "--detach", base_sha)
+    (source / "fresh.txt").write_text("rewritten branch", encoding="utf-8")
+    git(source, "add", "fresh.txt")
+    git(source, "commit", "-m", "replacement head")
+    new_head = git(source, "rev-parse", "HEAD")
+    git(source, "push", "--force", "upstream", "HEAD:refs/heads/review-head")
+    manager = PRWorkspace(tmp_path / "workspaces", staging_root=tmp_path / "staging")
+    workspace = await manager.prepare(
+        42, upstream.as_uri(), 7, "main", base_sha, new_head,
+        "review-head", upstream.as_uri(),
+    )
+    assert git(workspace, "rev-parse", "HEAD") == new_head
+    assert (workspace / "fresh.txt").is_file()
+    assert not (workspace / "src" / "new.py").exists()
+
+
+@pytest.mark.asyncio
 async def test_prepare_rejects_a_fetched_pr_head_that_does_not_match_requested_sha(
     tmp_path: Path,
     allow_local_head_repository: None,
@@ -210,13 +234,17 @@ async def test_prepare_fetches_base_then_cross_repository_head_without_tokens(
     clone = next(command for command in calls if "clone" in command)
     assert "--no-checkout" in clone
     assert "https://github.com/acme/widgets" in clone
-    assert ("git", "fetch", "--", "upstream", "main") in calls
+    assert (
+        "git", "fetch", "--force", "--no-tags", "--", "upstream", "refs/heads/main"
+    ) in calls
     assert (
         "git",
         "fetch",
+        "--force",
+        "--no-tags",
         "--",
         "https://github.com/contributor/widgets.git",
-        "feature/review",
+        "refs/heads/feature/review",
     ) in calls
     assert ("git", "checkout", "--detach", head_sha) in calls
     assert not any(command[1:2] == ("diff",) for command in calls)

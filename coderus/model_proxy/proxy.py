@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 
@@ -8,6 +9,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from coderus.model_proxy.broker import CredentialBroker, LeaseRejected
+from coderus.pr_review.upstream_errors import redact_upstream_message
 
 _HOP_BY_HOP_HEADERS = {
     "connection",
@@ -123,12 +125,35 @@ def create_proxy_app(
 
         if upstream_response.is_error:
             status_code = upstream_response.status_code
-            await _cleanup(
-                permit,
-                response=upstream_response,
-                client=proxy_client if owned_client else None,
+            message = f"Upstream HTTP {status_code}"
+            try:
+                async with asyncio.timeout(5):
+                    content = bytearray()
+                    async for chunk in upstream_response.aiter_bytes():
+                        if len(content) + len(chunk) > 16_384:
+                            break
+                        content.extend(chunk)
+                    payload = json.loads(content)
+                    error = payload.get("error") if isinstance(payload, dict) else None
+                    detail = error.get("message") if isinstance(error, dict) else None
+                    if isinstance(detail, str):
+                        message += ": " + redact_upstream_message(
+                            detail, {upstream_api_key, token},
+                        )
+            except Exception:
+                pass  # Keep status only for malformed, oversized or stalled error bodies.
+            finally:
+                await _cleanup(
+                    permit, response=upstream_response,
+                    client=proxy_client if owned_client else None,
+                )
+            broker.set_upstream_error(token, message)
+            return JSONResponse(
+                {"error": {"message": message, "type": "upstream_error"}},
+                status_code=status_code,
             )
-            return JSONResponse({"detail": "Upstream request failed"}, status_code=status_code)
+
+        broker.set_upstream_error(token, None)
 
         response_headers = _forward_headers(upstream_response.headers)
         content_type = upstream_response.headers.get("content-type", "")

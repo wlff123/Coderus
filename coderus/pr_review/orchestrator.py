@@ -23,8 +23,11 @@ from coderus.pr_review.result import (
     parse_review_output,
     render_pr_comment,
     review_output_schema_path,
+    unlocated_findings,
     validate_findings,
 )
+from coderus.pr_review.upstream_errors import upstream_error_message
+from coderus.pr_review.workspace import PRWorkspaceError, RevisionChanged
 from coderus.runner import AgentRole, JobSpec, JobStatus, Stage
 from coderus.tasks.error_codes import TaskErrorCode, classify_exception
 from coderus.tasks.lease import TaskLease, heartbeat_loop
@@ -38,8 +41,8 @@ COMMENT_TIMEOUT_SECONDS = 90.0
 PR_REVIEW_MAX_OUTPUT_BYTES = 5_000_000
 # 代理进程非零退出多为模型接口瞬时故障，整体作业最多执行两次。
 AGENT_JOB_ATTEMPTS = 2
-# 模型接口限流（429）时，立即重试必然再次撞限，退避后再试。
-RATE_LIMIT_BACKOFF_SECONDS = 60.0
+UPSTREAM_MAX_RETRIES = 3
+UPSTREAM_RETRY_SECONDS = 300.0
 LGTM_COMMENT = "/lgtm"
 
 
@@ -59,8 +62,8 @@ class ReviewAgentFailure(PRReviewError):
     error_code = TaskErrorCode.INTERNAL_ERROR
 
 
-class ReviewRateLimited(PRReviewError):
-    """模型接口限流导致检视失败。"""
+class ReviewUpstreamFailure(PRReviewError):
+    """模型上游请求失败；仅向用户发送已脱敏的信息。"""
 
     error_code = TaskErrorCode.UPSTREAM_UNAVAILABLE
 
@@ -92,6 +95,7 @@ class PRReviewOrchestrator:
         notifier: object | None = None,
         credential_broker: object | None = None,
         stage_timeout_seconds: float = 3600,
+        model_secrets: tuple[str, ...] = (),
     ) -> None:
         self.sessions = session_factory
         self.forges = forges
@@ -100,6 +104,7 @@ class PRReviewOrchestrator:
         self.notifier = notifier
         self.credential_broker = credential_broker
         self.stage_timeout_seconds = stage_timeout_seconds
+        self._model_secrets = model_secrets
 
     async def run(self, task_id: int) -> None:
         claim_token = self._claim(task_id)
@@ -128,6 +133,11 @@ class PRReviewOrchestrator:
                     # 平台 API 的 PR 元数据可能滞后于源分支的实际推送，
                     # 检视必须以分支当前 tip 为准。
                     details = replace(details, head_sha=live_head)
+                live_base = await self.workspace.resolve_remote_head(
+                    task.repository_url, details.base_ref
+                )
+                if live_base is not None:
+                    details = replace(details, base_sha=live_base)
                 self._record_revision(
                     task_id,
                     state,
@@ -138,16 +148,35 @@ class PRReviewOrchestrator:
                 self._validate_pr(details)
 
                 self._assert_claim(task_id, claim_token, claim_lost)
-                prepared = await self.workspace.prepare(
-                    task_id=task.id,
-                    repository_url=task.repository_url,
-                    pr_number=task.pr_number,
-                    base_ref=details.base_ref,
-                    base_sha=details.base_sha,
-                    head_sha=details.head_sha,
-                    head_ref=details.head_ref,
-                    head_repository_url=details.head_repository_url,
-                )
+                for attempt in range(3):
+                    try:
+                        prepared = await self.workspace.prepare(
+                            task_id=task.id,
+                            repository_url=task.repository_url,
+                            pr_number=task.pr_number,
+                            base_ref=details.base_ref,
+                            base_sha=details.base_sha,
+                            head_sha=details.head_sha,
+                            head_ref=details.head_ref,
+                            head_repository_url=details.head_repository_url,
+                        )
+                        break
+                    except RevisionChanged:
+                        if attempt == 2:
+                            raise
+                        self._assert_claim(task_id, claim_token, claim_lost)
+                        live_base = await self.workspace.resolve_remote_head(
+                            task.repository_url, details.base_ref
+                        )
+                        live_head = await self.workspace.resolve_remote_head(
+                            details.head_repository_url, details.head_ref
+                        )
+                        if live_base is None or live_head is None:
+                            raise
+                        details = replace(details, base_sha=live_base, head_sha=live_head)
+                        self._record_revision(
+                            task_id, state, claim_token, details.base_sha, details.head_sha
+                        )
                 self._transition(task_id, state, "reviewing", claim_token)
                 state = "reviewing"
                 self._assert_claim(task_id, claim_token, claim_lost)
@@ -173,6 +202,7 @@ class PRReviewOrchestrator:
                     ranges.comparison_sha,
                 )
                 self._assert_claim(task_id, claim_token, claim_lost)
+                pending_findings = unlocated_findings(generated_output, ranges)
                 output = validate_findings(generated_output, ranges)
                 filtered_finding_count = len(generated_output.findings) - len(output.findings)
 
@@ -182,7 +212,6 @@ class PRReviewOrchestrator:
                 )
                 self._validate_pr(
                     current,
-                    expected_base_sha=details.base_sha,
                     expected_base_ref=details.base_ref,
                     expected_head_ref=details.head_ref,
                     expected_head_repository_url=details.head_repository_url,
@@ -197,8 +226,24 @@ class PRReviewOrchestrator:
                         raise PRReviewError("检视期间源分支有新提交，请重新发起检视")
                 elif current.head_sha not in {details.head_sha, api_head_sha}:
                     raise PRReviewError("PR 版本已变化")
-                output = self._redact_output(output, proxy_token, prepared)
+                current_base = await self.workspace.resolve_remote_head(
+                    task.repository_url, details.base_ref
+                )
+                if current_base is not None:
+                    if current_base != details.base_sha:
+                        raise PRReviewError("检视期间目标分支有新提交，请重新发起检视")
+                elif current.base_sha != details.base_sha:
+                    raise PRReviewError("PR 版本已变化")
+                output = self._redact_output(output, proxy_token, prepared, self._model_secrets)
+                for item in pending_findings:
+                    safe = self._redact_output(
+                        ReviewOutput(change_summary=generated_output.change_summary,
+                                     findings=[item["finding"]]),
+                        proxy_token, prepared, self._model_secrets,
+                    )
+                    item["finding"] = safe.findings[0].model_dump(mode="json")
                 structured_result = output.model_dump(mode="json")
+                structured_result["unlocated_findings"] = pending_findings
                 structured_result["review_audit"] = {
                     "comparison_sha": ranges.comparison_sha,
                     "changed_files": ranges.changed_file_count,
@@ -229,6 +274,7 @@ class PRReviewOrchestrator:
                     deletions=ranges.deletions,
                     filtered_finding_count=filtered_finding_count,
                     comparison_sha=ranges.comparison_sha,
+                    pending_findings=pending_findings,
                 )
                 self._assert_claim(task_id, claim_token, claim_lost)
                 comment = await asyncio.wait_for(
@@ -331,7 +377,10 @@ class PRReviewOrchestrator:
             self.credential_broker,
             task_id=f"task-{task.id}",
             stage=Stage.PR_REVIEW.value,
-            ttl_seconds=self.stage_timeout_seconds + 300,
+            ttl_seconds=(
+                self.stage_timeout_seconds * (UPSTREAM_MAX_RETRIES + 1)
+                + UPSTREAM_RETRY_SECONDS * UPSTREAM_MAX_RETRIES + 300
+            ),
         ) as token:
             spec = JobSpec(
                 job_id=f"pr-review-{task.id}",
@@ -347,12 +396,16 @@ class PRReviewOrchestrator:
             )
 
             async def run_agent():
+                if token and self.credential_broker:
+                    self.credential_broker.take_upstream_error(token)
                 return await self.runner.run(spec, cancel_event=claim_lost)
 
             async def restore_checkpoint() -> None:
                 return None
 
-            for attempt in range(1, AGENT_JOB_ATTEMPTS + 1):
+            for attempt in range(1, UPSTREAM_MAX_RETRIES + 2):
+                if claim_lost.is_set():
+                    raise _ClaimLost
                 result = await retry_agent_operation(
                     run_agent,
                     restore_checkpoint,
@@ -365,19 +418,36 @@ class PRReviewOrchestrator:
                     "pr-review-%s agent job failed (attempt %s/%s, %s, exit_code=%s): %s",
                     task.id,
                     attempt,
-                    AGENT_JOB_ATTEMPTS,
+                    UPSTREAM_MAX_RETRIES + 1,
                     result.status.value,
                     result.exit_code,
                     self._agent_failure_detail(result, token, workspace),
                 )
-                rate_limited = self._is_rate_limited(result)
+                upstream = upstream_error_message(
+                    result, proxy_token=token, workspace=workspace,
+                    known_secrets=self._model_secrets,
+                )
+                if token and self.credential_broker:
+                    upstream = self.credential_broker.take_upstream_error(token) or upstream
+                if result.status is JobStatus.FAILED and upstream is not None:
+                    if attempt == UPSTREAM_MAX_RETRIES + 1:
+                        raise ReviewUpstreamFailure(
+                            f"上游模型错误：{upstream}；已重试 {UPSTREAM_MAX_RETRIES} 次仍失败，"
+                            "本任务已结束，请重新发送“检视 <PR URL>”触发任务。"
+                        )
+                    if claim_lost.is_set():
+                        raise _ClaimLost
+                    await self._notify(
+                        task.id, task.source_chat_id,
+                        f"RV-{task.id} 上游模型错误：{upstream}。"
+                        f"将在 5 分钟后进行第 {attempt}/{UPSTREAM_MAX_RETRIES} 次重试。",
+                        expected_status="reviewing",
+                    )
+                    await self._wait_upstream_retry(claim_lost)
+                    continue
                 # 仅对非零退出重试一次；超时重试会翻倍耗时，取消意味着任务权已丢失。
-                if result.status is not JobStatus.FAILED or attempt == AGENT_JOB_ATTEMPTS:
-                    if rate_limited:
-                        raise ReviewRateLimited("模型接口限流（429），请稍后重新发起检视")
+                if result.status is not JobStatus.FAILED or attempt >= AGENT_JOB_ATTEMPTS:
                     raise ReviewAgentFailure(f"Codex 检视失败（{result.status.value}）")
-                if rate_limited:
-                    await asyncio.sleep(RATE_LIMIT_BACKOFF_SECONDS)
             try:
                 return (
                     parse_review_output(
@@ -595,13 +665,15 @@ class PRReviewOrchestrator:
 
     @staticmethod
     def _redact_output(
-        output: ReviewOutput, proxy_token: str | None, workspace: Path
+        output: ReviewOutput, proxy_token: str | None, workspace: Path,
+        extra_secrets: tuple[str, ...] = (),
     ) -> ReviewOutput:
         absolute = str(Path(workspace).resolve())
         sensitive = {
             value
             for value in (
                 proxy_token,
+                *extra_secrets,
                 absolute,
                 absolute.replace("\\", "/"),
                 absolute.replace("/", "\\"),
@@ -621,11 +693,13 @@ class PRReviewOrchestrator:
         return ReviewOutput.model_validate(redact(output.model_dump(mode="json")))
 
     @staticmethod
-    def _is_rate_limited(result) -> bool:
-        """识别 codex ``--json`` 输出中的模型限流错误事件。"""
-        return "429 Too Many Requests" in result.stdout or (
-            "429 Too Many Requests" in result.stderr
-        )
+    async def _wait_upstream_retry(claim_lost: asyncio.Event) -> None:
+        """Wait without blocking the lease heartbeat; stop immediately on claim loss."""
+        try:
+            await asyncio.wait_for(claim_lost.wait(), timeout=UPSTREAM_RETRY_SECONDS)
+        except TimeoutError:
+            return
+        raise _ClaimLost
 
     @staticmethod
     def _agent_failure_detail(result, proxy_token: str | None, workspace: Path) -> str:
@@ -662,6 +736,6 @@ class PRReviewOrchestrator:
 
     @staticmethod
     def _safe_summary(exc: Exception) -> str:
-        if isinstance(exc, (PRReviewError, ReviewOutputError)):
+        if isinstance(exc, (PRReviewError, ReviewOutputError, PRWorkspaceError)):
             return str(exc)[:500]
         return type(exc).__name__

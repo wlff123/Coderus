@@ -289,7 +289,7 @@ async def test_upstream_failures_return_only_generic_details(caplog) -> None:
 
     exposed = response.text + caplog.text
     assert response.status_code == 403
-    assert response.json() == {"detail": "Upstream request failed"}
+    assert response.json()["error"]["message"] == "Upstream HTTP 403"
     assert real_key not in exposed
     assert token not in exposed
     assert upstream_detail not in exposed

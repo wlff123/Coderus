@@ -549,6 +549,37 @@ def test_validate_drops_location_outside_diff(changed_ranges: ChangedRanges) -> 
     assert validated.findings == []
 
 
+@pytest.mark.parametrize(
+    "intervals,start,end,reason",
+    [((), 12, 12, "没有可定位"), (((10, 15),), 99, 99, "未覆盖"),
+     (((10, 12), (15, 17)), 10, 17, "不连续"),
+     (((10, 12),), 8, 12, "超过一行")],
+)
+def test_unlocated_findings_keep_content_and_reason(intervals, start, end, reason):
+    from coderus.pr_review.result import unlocated_findings
+
+    output = output_at_line(start, line_end=end)
+    finding = output.findings[0]
+    ranges = ChangedRanges({(finding.file_path, finding.line_side): intervals})
+    pending = unlocated_findings(output, ranges)
+    assert pending[0]["finding"] == finding.model_dump(mode="json")
+    assert reason in pending[0]["reason"]
+    body, marker = render_pr_comment(
+        "gitcode", validate_findings(output, ranges), "acme", "widgets", BASE, HEAD,
+        REVIEW_KEY, pending_findings=pending, filtered_finding_count=1,
+    )
+    assert "待人工确认（位置未验证）" in body
+    assert reason in body
+    assert "#L" not in body
+    assert body.endswith(marker)
+
+
+def test_located_finding_is_not_marked_pending(changed_ranges):
+    from coderus.pr_review.result import unlocated_findings
+
+    assert unlocated_findings(output_at_line(10), changed_ranges) == []
+
+
 def test_validate_clips_location_to_single_overlapping_diff(
     changed_ranges: ChangedRanges,
 ) -> None:

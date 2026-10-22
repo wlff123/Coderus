@@ -391,6 +391,17 @@ def validate_findings(output: ReviewOutput, ranges: ChangedRanges) -> ReviewOutp
     return output
 
 
+def unlocated_findings(output: ReviewOutput, ranges: ChangedRanges) -> list[dict]:
+    pending = []
+    for finding in output.findings:
+        reason = ranges.rejection_reason(
+            finding.file_path, finding.line_side, finding.line_start, finding.line_end
+        )
+        if reason is not None:
+            pending.append({"finding": finding.model_dump(mode="json"), "reason": reason})
+    return pending
+
+
 def render_pr_comment(
     provider: ProviderName,
     output: ReviewOutput,
@@ -405,6 +416,7 @@ def render_pr_comment(
     deletions: int | None = None,
     filtered_finding_count: int = 0,
     comparison_sha: str | None = None,
+    pending_findings: list[dict] | None = None,
 ) -> tuple[str, str]:
     hosts = {"github": "github.com", "gitcode": "gitcode.com"}
     if provider not in hosts:
@@ -434,6 +446,11 @@ def render_pr_comment(
         for index, sentence in enumerate(output.change_summary, start=1)
     )
     sections.append(f"- 结论：{summary}")
+    if pending_findings:
+        sections[-1] = (
+            f"- 结论：{len(findings)} 条已定位意见；"
+            f"{len(pending_findings)} 条意见待人工确认（位置未验证）"
+        )
 
     for index, finding in enumerate(findings, start=1):
         sha = (
@@ -466,6 +483,23 @@ def render_pr_comment(
             ]
         )
 
+    if pending_findings:
+        sections.extend(["", "## 待人工确认（位置未验证）", "",
+                         "以下为模型提出的疑似问题，尚未确认其位置及有效性，不作为已确认缺陷。"])
+        for index, item in enumerate(pending_findings, 1):
+            finding = item["finding"]
+            side = "原版本" if finding["line_side"] == "LEFT" else "新版本"
+            sections.extend([
+                "", f"### 待确认 {index}. {_escape_markdown(finding['title'])}", "",
+                f"- 模型建议优先级：{_PRIORITY_LABELS[finding['priority']]}",
+                f"- 模型所指文件：{_code_span(finding['file_path'])}",
+                (f"- 模型所指范围（未验证）：{side}第 "
+                 f"{finding['line_start']}-{finding['line_end']} 行"),
+                f"- 无法定位原因：{_escape_markdown(item['reason'])}",
+                f"- 问题说明：{_escape_markdown(finding['problem'])}",
+                f"- 影响分析：{_escape_markdown(finding['impact'])}",
+                f"- 修改建议：{_escape_markdown(finding['suggestion'])}",
+            ])
     sections.extend(["", "> 本次为静态代码检视，未执行项目测试。", marker])
     return "\n".join(sections), marker
 

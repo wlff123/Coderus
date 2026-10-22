@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import threading
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -179,6 +180,7 @@ class FakeWorkspace:
         self.pristine_error: Exception | None = None
         self.pristine_calls: list[tuple[Path, str, str]] = []
         self.remote_heads: list[str | None] = []
+        self.remote_bases: list[str | None] = []
         self.resolve_calls: list[tuple[str, str]] = []
         self.ranges = ChangedRanges(
             {("src/widget.py", "RIGHT"): ((12, 14),)},
@@ -199,6 +201,8 @@ class FakeWorkspace:
 
     async def resolve_remote_head(self, repository_url: str, ref: str) -> str | None:
         self.resolve_calls.append((repository_url, ref))
+        if ref == "main":
+            return self.remote_bases.pop(0) if self.remote_bases else None
         if self.remote_heads:
             return self.remote_heads.pop(0)
         return None
@@ -513,12 +517,64 @@ async def test_run_reviews_live_branch_tip_when_api_head_lags(
     assert persisted.status == "completed"
     assert persisted.head_sha == live_tip
     assert workspace.resolve_calls == [
-        ("https://github.com/contributor/widgets-1.git", "feature/review")
+        ("https://github.com/contributor/widgets-1.git", "feature/review"),
+        ("https://github.com/acme/widgets-1", "main"),
     ] * 2
     assert workspace.prepare_calls[0]["head_sha"] == live_tip
     assert publisher.comment_calls[0]["marker"] == (
         f"<!-- coderus-pr-review:{persisted.review_key}:{BASE_SHA}:{live_tip} -->"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "final_base, succeeds", [("d" * 40, True), ("e" * 40, False), (None, False)]
+)
+async def test_live_base_overrides_stale_api_and_is_rechecked(
+    engine, session: Session, tmp_path: Path, final_base, succeeds
+) -> None:
+    task = add_review_task(session)
+    orchestrator, publisher, workspace, *_ = build_orchestrator(engine, tmp_path)
+    workspace.remote_bases = ["d" * 40, final_base]
+    await orchestrator.run(task.id)
+    session.expire_all()
+    persisted = session.get(PRReviewTask, task.id)
+    assert persisted.base_sha == "d" * 40
+    assert workspace.prepare_calls[0]["base_sha"] == "d" * 40
+    assert persisted.status == ("completed" if succeeds else "failed")
+    assert bool(publisher.comment_calls) == succeeds
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("keeps_moving", [False, True])
+@pytest.mark.parametrize("moving_branch", ["base", "head"])
+async def test_prepare_retries_target_movement_with_a_bound(
+    engine, session: Session, tmp_path: Path, monkeypatch, keeps_moving, moving_branch
+) -> None:
+    from coderus.pr_review.workspace import BaseRevisionChanged, RevisionChanged
+
+    task = add_review_task(session)
+    orchestrator, publisher, workspace, *_ = build_orchestrator(engine, tmp_path)
+    workspace.remote_bases = [BASE_SHA, "d" * 40, "d" * 40, "d" * 40]
+    workspace.remote_heads = [HEAD_SHA] * 4
+    attempts = []
+    original = workspace.prepare
+
+    async def moving_prepare(**kwargs):
+        attempts.append(kwargs["base_sha"])
+        if keeps_moving or len(attempts) == 1:
+            error = BaseRevisionChanged if moving_branch == "base" else RevisionChanged
+            raise error("远端分支持续更新")
+        return await original(**kwargs)
+
+    monkeypatch.setattr(workspace, "prepare", moving_prepare)
+    await orchestrator.run(task.id)
+    session.expire_all()
+    persisted = session.get(PRReviewTask, task.id)
+    assert len(attempts) == (3 if keeps_moving else 2)
+    assert persisted.status == ("failed" if keeps_moving else "completed")
+    assert persisted.base_sha == "d" * 40
+    assert bool(publisher.comment_calls) == (not keeps_moving)
 
 
 @pytest.mark.asyncio
@@ -685,6 +741,7 @@ async def test_agent_job_failure_is_classified_and_logged_with_redacted_detail(
     session: Session,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     task = add_review_task(session)
     workspace = FakeWorkspace(engine, tmp_path / "workspace")
@@ -702,6 +759,9 @@ async def test_agent_job_failure_is_classified_and_logged_with_redacted_detail(
     orchestrator, *_ = build_orchestrator(
         engine, tmp_path, workspace=workspace, runner=runner
     )
+    async def skip_wait(event):
+        assert not event.is_set()
+    monkeypatch.setattr(orchestrator, "_wait_upstream_retry", skip_wait)
 
     with caplog.at_level(logging.ERROR, logger="coderus.pr_review.orchestrator"):
         await orchestrator.run(task.id)
@@ -709,15 +769,17 @@ async def test_agent_job_failure_is_classified_and_logged_with_redacted_detail(
     session.expire_all()
     persisted = session.get(PRReviewTask, task.id)
     assert persisted.status == "failed"
-    assert persisted.failure_code == "internal_error"
-    assert persisted.failure_summary == "Codex 检视失败（failed）"
-    assert len(runner.specs) == 2
+    assert persisted.failure_code == "upstream_unavailable"
+    assert "502 Bad Gateway" in persisted.failure_summary
+    assert "已重试 3 次仍失败" in persisted.failure_summary
+    assert runner.specs[0].proxy_token not in persisted.failure_summary
+    assert len(runner.specs) == 4
     log_text = "\n".join(
         record.getMessage()
         for record in caplog.records
         if "agent job failed" in record.getMessage()
     )
-    assert "attempt 1/2" in log_text and "attempt 2/2" in log_text
+    assert "attempt 1/4" in log_text and "attempt 4/4" in log_text
     assert "502 Bad Gateway" in log_text
     assert "stdout:" in log_text
     assert runner.specs[0].proxy_token not in log_text
@@ -752,19 +814,22 @@ async def test_rate_limited_agent_failure_backs_off_and_reports_upstream(
     engine, session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     task = add_review_task(session)
-    runner = FakeRunner(engine)
-    runner.status = JobStatus.FAILED
-    runner.stdout = (
+    raw_error = (
         '{"type":"error","message":"exceeded retry limit, '
         'last status: 429 Too Many Requests"}'
     )
+    class UpstreamRunner(FakeRunner):
+        async def run(self, spec, *, cancel_event=None):
+            result = await super().run(spec, cancel_event=cancel_event)
+            return replace(result, status=JobStatus.FAILED, exit_code=1, stdout=raw_error)
+    runner = UpstreamRunner(engine)
     delays: list[float] = []
 
-    async def fake_sleep(seconds: float, *args, **kwargs) -> None:
-        delays.append(seconds)
-
-    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    async def skip_wait(event) -> None:
+        assert not event.is_set()
+        delays.append(orchestrator_module.UPSTREAM_RETRY_SECONDS)
     orchestrator, publisher, *_ = build_orchestrator(engine, tmp_path, runner=runner)
+    monkeypatch.setattr(orchestrator, "_wait_upstream_retry", skip_wait)
 
     await orchestrator.run(task.id)
 
@@ -772,10 +837,73 @@ async def test_rate_limited_agent_failure_backs_off_and_reports_upstream(
     persisted = session.get(PRReviewTask, task.id)
     assert persisted.status == "failed"
     assert persisted.failure_code == "upstream_unavailable"
-    assert persisted.failure_summary == "模型接口限流（429），请稍后重新发起检视"
-    assert len(runner.specs) == 2
-    assert 60.0 in delays
+    assert "429 Too Many Requests" in persisted.failure_summary
+    assert "请重新发送" in persisted.failure_summary
+    assert len(runner.specs) == 4
+    assert delays == [300.0, 300.0, 300.0]
     assert publisher.comment_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recover", [False, True])
+async def test_high_demand_retries_notify_and_can_recover(
+    engine, session: Session, tmp_path: Path, monkeypatch, recover
+) -> None:
+    task = add_review_task(session)
+    message = "We're currently experiencing high demand, which may cause temporary errors."
+
+    class DemandRunner(FakeRunner):
+        async def run(self, spec, *, cancel_event=None):
+            result = await super().run(spec, cancel_event=cancel_event)
+            if recover and len(self.specs) == 3:
+                return result
+            return replace(
+                result, status=JobStatus.FAILED, exit_code=1,
+                stdout=json.dumps({"type": "turn.failed", "error": {"message": message}}),
+            )
+
+    runner = DemandRunner(engine)
+    orchestrator, publisher, _, _, notifier, _ = build_orchestrator(
+        engine, tmp_path, runner=runner,
+    )
+    delays = []
+
+    async def skip_wait(event):
+        assert not event.is_set()
+        delays.append(orchestrator_module.UPSTREAM_RETRY_SECONDS)
+
+    monkeypatch.setattr(orchestrator, "_wait_upstream_retry", skip_wait)
+    await orchestrator.run(task.id)
+    session.expire_all()
+    assert len(runner.specs) == (3 if recover else 4)
+    assert delays == [300.0] * (2 if recover else 3)
+    retries = [text for _, _, text in notifier.messages if "5 分钟" in text]
+    assert len(retries) == len(delays)
+    assert all(message in text for text in retries)
+    if not recover:
+        assert session.get(PRReviewTask, task.id).status == "failed"
+        assert "请重新发送" in notifier.messages[-1][2]
+        assert not publisher.comment_calls
+    else:
+        assert session.get(PRReviewTask, task.id).status != "failed"
+        assert publisher.comment_calls
+
+
+@pytest.mark.asyncio
+async def test_upstream_wait_honors_claim_loss_and_cancellation(monkeypatch):
+    event = asyncio.Event()
+    waiter = asyncio.create_task(PRReviewOrchestrator._wait_upstream_retry(event))
+    await asyncio.sleep(0)
+    event.set()
+    with pytest.raises(_ClaimLost):
+        await waiter
+    waiter = asyncio.create_task(PRReviewOrchestrator._wait_upstream_retry(asyncio.Event()))
+    await asyncio.sleep(0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    monkeypatch.setattr(orchestrator_module, "UPSTREAM_RETRY_SECONDS", 0.001)
+    await PRReviewOrchestrator._wait_upstream_retry(asyncio.Event())
 
 
 @pytest.mark.asyncio
@@ -828,9 +956,46 @@ async def test_run_drops_unpublishable_locations_and_completes(
         "filtered_findings": 1,
     }
     assert len(publisher.comment_calls) == 1
-    assert "1 条意见因无法安全定位未发布" in publisher.comment_calls[0]["body"]
+    assert "1 条意见待人工确认" in publisher.comment_calls[0]["body"]
+    pending = persisted.structured_result["unlocated_findings"]
+    assert len(pending) == 1
+    assert pending[0]["finding"]["title"] == "空值处理缺失"
+    assert "没有可定位的修改行" in pending[0]["reason"]
+    assert "#L" not in publisher.comment_calls[0]["body"]
     assert "未发现需要反馈的具体问题" not in publisher.comment_calls[0]["body"]
     assert all(call["body"] != "/lgtm" for call in publisher.comment_calls)
+
+
+@pytest.mark.asyncio
+async def test_pending_findings_are_redacted_before_storage_and_publication(
+    engine, session: Session, tmp_path: Path, monkeypatch
+) -> None:
+    from coderus.pr_review.models import ReviewOutput
+
+    task = add_review_task(session)
+    orchestrator, publisher, workspace, *_ = build_orchestrator(engine, tmp_path)
+    secret = "unit-test-secret-never-publish"
+    proxy_token = "unit-test-proxy-never-publish"
+    orchestrator._model_secrets = (secret,)
+    raw = json.loads(REVIEW_JSON)
+    raw["findings"][0]["line_start"] = 999
+    raw["findings"][0]["line_end"] = 999
+    raw["findings"][0]["problem"] = f"敏感内容 {secret} {proxy_token} {workspace.path}"
+
+    async def fake_review(*args):
+        return ReviewOutput.model_validate(raw), proxy_token
+
+    monkeypatch.setattr(orchestrator, "_run_review", fake_review)
+    await orchestrator.run(task.id)
+    session.expire_all()
+    persisted = session.get(PRReviewTask, task.id)
+    assert persisted.status == "completed"
+    assert len(publisher.comment_calls) == 1
+    text = repr(persisted.structured_result) + repr(publisher.comment_calls)
+    assert secret not in text
+    assert proxy_token not in text
+    assert str(workspace.path) not in text
+    assert "[REDACTED]" in text
 
 
 @pytest.mark.asyncio
