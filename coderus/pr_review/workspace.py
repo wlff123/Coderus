@@ -7,8 +7,10 @@ import re
 import shutil
 import stat
 import tempfile
+import time
 from collections import defaultdict
 from collections.abc import Mapping
+from contextvars import ContextVar
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -41,10 +43,37 @@ _SYSTEM_ENVIRONMENT_KEYS = {
 }
 
 logger = logging.getLogger(__name__)
+_TASK_ID: ContextVar[int | None] = ContextVar("pr_git_task_id", default=None)
+
+# Only emit fixed diagnostic signatures, never raw stderr, URLs or command arguments.
+_NETWORK_SIGNATURES = (
+    "could not resolve host", "name resolution", "connection reset", "early eof",
+    "rpc failed", "ssl", "tls", "failed to connect", "connection refused",
+    "timed out", "remote end hung up", "http/2 stream", "transfer closed",
+    "502", "503", "504",
+)
+
+
+def _git_diagnostics(stderr: bytes) -> tuple[str, bool]:
+    text = stderr.decode("utf-8", errors="replace").lower()
+    # Permanent errors take precedence over incidental network words.
+    for markers, label in (
+        (("authentication failed", "could not read username", "401", "403"), "authentication"),
+        (("no space left",), "disk_full"),
+        (("couldn't find remote ref", "not our ref", "repository not found"), "missing_ref"),
+    ):
+        if any(marker in text for marker in markers):
+            return label, False
+    signatures = [marker for marker in _NETWORK_SIGNATURES if marker in text]
+    return (", ".join(signatures), True) if signatures else ("unclassified", False)
 
 
 class PRWorkspaceError(RuntimeError):
     """Fixed, credential-free diagnostics safe to send to the review requester."""
+
+
+class GitNetworkError(PRWorkspaceError):
+    """Transient Git transport failure eligible for isolated preparation retry."""
 
 
 class RevisionChanged(PRWorkspaceError):
@@ -125,7 +154,28 @@ class PRWorkspace:
                 return sha
         return None
 
-    async def prepare(
+    async def prepare(self, *args, **kwargs) -> Path:
+        task_id = kwargs.get("task_id", args[0] if args else None)
+        token = _TASK_ID.set(task_id)
+        try:
+            for attempt in range(3):
+                try:
+                    return await self._prepare_once(*args, **kwargs)
+                except GitNetworkError:
+                    if attempt == 2:
+                        raise GitNetworkError(
+                            "Git 网络连接或传输失败，自动重试 2 次后仍失败，请稍后重新触发检视"
+                        ) from None
+                    delay = (5, 15)[attempt]
+                    logger.warning(
+                        "PR Git preparation retry task=RV-%s attempt=%s/3 delay=%ss",
+                        task_id, attempt + 2, delay,
+                    )
+                    await asyncio.sleep(delay)
+        finally:
+            _TASK_ID.reset(token)
+
+    async def _prepare_once(
         self,
         task_id: int,
         repository_url: str,
@@ -554,6 +604,7 @@ class PRWorkspace:
     async def _run(self, *command: str, cwd: Path) -> str:
         if not command or command[0] != "git":
             raise ValueError("PRWorkspace only permits Git commands")
+        started = time.monotonic()
         with tempfile.TemporaryDirectory(prefix="coderus-pr-git-") as isolated:
             isolated_home = Path(isolated)
             hooks_path = isolated_home / "hooks"
@@ -587,16 +638,29 @@ class PRWorkspace:
                 ):
                     raise CommandResourceLimitExceeded("command path size limit exceeded")
             except CommandTimedOut:
-                raise PRWorkspaceError(
+                logger.warning(
+                    "PR Git task=RV-%s operation=%s elapsed=%.1fs diagnostic=command_timeout",
+                    _TASK_ID.get(), command[1], time.monotonic() - started,
+                )
+                error = GitNetworkError if command[1] in {"clone", "fetch"} else PRWorkspaceError
+                raise error(
                     f"Git {command[1]} 超时，请稍后重新触发检视"
                 ) from None
             except CommandResourceLimitExceeded:
                 raise PRWorkspaceError("PR workspace size limit exceeded") from None
         if result.returncode != 0:
             reason = _git_failure_reason(result.stderr)
-            logger.warning("PR workspace Git %s failed (exit=%s): %s",
-                           command[1], result.returncode, reason)
-            raise PRWorkspaceError(
+            diagnostic, retryable = _git_diagnostics(result.stderr)
+            logger.warning(
+                "PR Git task=RV-%s operation=%s exit=%s elapsed=%.1fs diagnostic=%s",
+                _TASK_ID.get(), command[1], result.returncode,
+                time.monotonic() - started, diagnostic,
+            )
+            error = (
+                GitNetworkError if retryable and command[1] in {"clone", "fetch"}
+                else PRWorkspaceError
+            )
+            raise error(
                 f"Git {command[1]} 失败：{reason}，请稍后重新触发检视"
             )
         return result.stdout.decode("utf-8", errors="replace")
