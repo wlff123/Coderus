@@ -52,6 +52,7 @@ class SchedulerSettings(BaseModel):
 class CodexSettings(BaseModel):
     binary: str = "codex"
     model: str | None = None
+    review_model: str | None = Field(default=None, min_length=1)
     reasoning_effort: Literal["low", "medium", "high", "xhigh"] | None = None
     stage_timeout_seconds: int = Field(default=3600, ge=60)
     base_url: str | None = None

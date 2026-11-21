@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -62,436 +61,74 @@ def valid_output() -> ReviewOutput:
     return output_at_line(12, line_end=14)
 
 
-def test_parse_review_output_accepts_json_block() -> None:
-    output = parse_review_output(
-        "review complete\n```json\n"
-        + json.dumps(review_data([finding_data()]), ensure_ascii=False)
-        + "\n```"
-    )
+def _review_stdout(message: str, *, command: str | None = None,
+                   exit_code: int = 0, terminal: str = "turn.completed") -> str:
+    if command is None:
+        command = f"git diff {BASE}...HEAD"
+    return "\n".join(json.dumps(event) for event in (
+        {"type": "item.completed", "item": {
+            "type": "command_execution", "command": command,
+            "status": "completed", "exit_code": exit_code,
+        }},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": message}},
+        {"type": terminal},
+    ))
 
-    assert output.findings[0].line_end == 14
+
+def _parse_message(message: str) -> ReviewOutput:
+    try:
+        payload = json.loads(message)
+    except ValueError:
+        pass
+    else:
+        if isinstance(payload, dict):
+            payload.setdefault("review_completed", True)
+            message = json.dumps(payload, ensure_ascii=False)
+    return parse_review_output(_review_stdout(message), comparison_sha=BASE)
 
 
 def test_review_output_schema_is_packaged_with_the_parser() -> None:
     schema = review_output_schema_path()
-
-    assert schema.is_file()
     assert json.loads(schema.read_text(encoding="utf-8"))["required"] == [
-        "change_summary",
-        "findings",
+        "review_completed", "change_summary", "findings",
     ]
 
 
-@pytest.mark.parametrize(
-    "suffix",
-    [
-        "review complete",
-        "```json\n{}\n```",
-    ],
-)
-def test_parse_review_output_rejects_non_whitespace_after_json_block(suffix: str) -> None:
-    payload = "review complete\n```json\n" + json.dumps({"findings": []}) + f"\n```\n{suffix}"
+def test_accepts_skill_json_after_successful_full_diff() -> None:
+    data = {**review_data([finding_data()]), "review_completed": True}
+    message = json.dumps(data, ensure_ascii=False)
+    command = f"/bin/bash -lc 'git --no-pager diff --no-color {BASE}...HEAD --'"
+    output = parse_review_output(_review_stdout(message, command=command), comparison_sha=BASE)
+    assert output.model_dump() == review_data([finding_data()])
 
+
+@pytest.mark.parametrize("flag", [None, False, 1, "true"])
+def test_rejects_an_empty_result_without_confirmation(flag) -> None:
+    data = review_data([])
+    if flag is not None:
+        data["review_completed"] = flag
     with pytest.raises(ReviewOutputError):
-        parse_review_output(payload)
-
-
-def test_parse_review_output_accepts_complete_json() -> None:
-    output = parse_review_output(json.dumps(review_data([]), ensure_ascii=False))
-
-    assert output.change_summary == CHANGE_SUMMARY
-    assert output.findings == []
-
-
-def test_parse_review_output_accepts_codex_jsonl_final_message() -> None:
-    message = json.dumps(review_data([finding_data()]), ensure_ascii=False)
-    stdout = "\n".join(
-        [
-            json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
-            json.dumps(
-                {
-                    "type": "item.completed",
-                    "item": {"type": "agent_message", "text": message},
-                },
-                ensure_ascii=False,
-            ),
-            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 10}}),
-        ]
-    )
-
-    output = parse_review_output(stdout)
-
-    assert output.findings[0].title == "空值未处理"
-
-
-def native_review_stdout(
-    message: str,
-    *,
-    command_exit_code: int = 0,
-    command: str | None = None,
-) -> str:
-    command_status = "completed" if command_exit_code == 0 else "failed"
-    command = command or f"git diff {BASE}...HEAD"
-    return "\n".join(
-        [
-            json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
-            json.dumps(
-                {
-                    "type": "item.completed",
-                    "item": {
-                        "type": "command_execution",
-                        "command": command,
-                        "aggregated_output": "",
-                        "exit_code": command_exit_code,
-                        "status": command_status,
-                    },
-                }
-            ),
-            json.dumps(
-                {
-                    "type": "item.completed",
-                    "item": {"type": "agent_message", "text": message},
-                },
-                ensure_ascii=False,
-            ),
-            json.dumps({"type": "turn.completed", "usage": {}}),
-        ]
-    )
-
-
-def test_parse_review_output_accepts_native_review_message() -> None:
-    message = """本次变更增加了配置校验并调整了请求处理流程。
-
-Review comment:
-
-- [P1] 空值会导致请求失败 — RIGHT /srv/work/pr-review-1/src/app.py:12-14
-  问题：当输入为空时会直接解引用。
-  影响：请求会抛出异常并中断。
-  建议：在读取属性前处理空值。"""
-    ranges = ChangedRanges({("src/app.py", "RIGHT"): ((12, 14),)})
-
-    output = parse_review_output(
-        native_review_stdout(message),
-        workspace=Path("/srv/work/pr-review-1"),
-        ranges=ranges,
-        fallback_summary="本次 PR 涉及 1 个变更文件，新增 3 行并删除 0 行。",
-        comparison_sha=BASE,
-    )
-
-    assert output.change_summary == ["本次变更增加了配置校验并调整了请求处理流程。"]
-    finding = output.findings[0]
-    assert finding.priority == "P1"
-    assert finding.title == "空值会导致请求失败"
-    assert finding.file_path == "src/app.py"
-    assert finding.line_side == "RIGHT"
-    assert (finding.line_start, finding.line_end) == (12, 14)
-    assert "直接解引用" in finding.problem
-    assert "请求会抛出异常" in finding.impact
-    assert finding.suggestion == "在读取属性前处理空值。"
-
-
-def test_parse_native_review_accepts_common_markdown_finding_layouts() -> None:
-    message = """本次变更增加了配置校验并调整了请求处理流程。
-
-Review comment:
-
-### 1. [P1 严重] 空值会导致请求失败 — RIGHT /srv/work/pr-review-1/src/app.py:12-14
-  - **问题**：当输入为空时会直接解引用。
-  - 影响: 请求会抛出异常并中断。
-  - **建议**：在读取属性前处理空值。"""
-    output = parse_review_output(
-        native_review_stdout(message),
-        workspace=Path("/srv/work/pr-review-1"),
-        ranges=ChangedRanges({("src/app.py", "RIGHT"): ((12, 14),)}),
-        fallback_summary="本次 PR 涉及 1 个变更文件，新增 3 行并删除 0 行。",
-        comparison_sha=BASE,
-    )
-
-    assert output.findings[0].priority == "P1"
-    assert output.findings[0].problem == "当输入为空时会直接解引用。"
-    assert output.findings[0].impact == "请求会抛出异常并中断。"
-    assert output.findings[0].suggestion == "在读取属性前处理空值。"
-
-
-def test_parse_native_review_accepts_wrapped_fields_and_markdown_location() -> None:
-    message = """本次变更增加了配置校验。
-
-Review comment:
-
-* **[P2 一般]** 缺少空值保护 — RIGHT `src/app.py`:12-14**
-  - 问题：
-    输入为空时会直接解引用。
-  - 影响：
-    请求会抛出异常。
-  - 建议：
-    在读取属性前处理空值。"""
-    output = parse_review_output(
-        native_review_stdout(message),
-        workspace=Path("/srv/work/pr-review-1"),
-        ranges=ChangedRanges({("src/app.py", "RIGHT"): ((12, 14),)}),
-        fallback_summary="本次 PR 涉及 1 个变更文件，新增 3 行并删除 0 行。",
-        comparison_sha=BASE,
-    )
-
-    finding = output.findings[0]
-    assert finding.priority == "P2"
-    assert finding.file_path == "src/app.py"
-    assert finding.problem == "输入为空时会直接解引用。"
-
-
-def test_native_review_ignores_priority_reference_in_finding_body() -> None:
-    message = """本次变更增加了配置校验。
-
-Review comment:
-
-- [P1] 空值会导致请求失败 — RIGHT src/app.py:L12-L14
-  问题：正文引用了 [P2] 作为对比级别。
-  影响：请求会抛出异常。
-  建议：在读取属性前处理空值。"""
-    output = parse_review_output(
-        native_review_stdout(message),
-        workspace=Path("/srv/work/pr-review-1"),
-        ranges=ChangedRanges({("src/app.py", "RIGHT"): ((12, 14),)}),
-        fallback_summary="本次 PR 涉及 1 个变更文件，新增 3 行并删除 0 行。",
-        comparison_sha=BASE,
-    )
-
-    assert len(output.findings) == 1
-    assert output.findings[0].line_start == 12
-
-
-def test_parse_review_output_uses_stats_summary_when_native_review_has_no_findings() -> None:
-    output = parse_review_output(
-        native_review_stdout(
-            "本次变更调整了配置校验和错误处理。\n\n未发现需要反馈的具体问题。"
-        ),
-        workspace=Path("/srv/work/pr-review-1"),
-        ranges=ChangedRanges({}),
-        fallback_summary="本次 PR 涉及 2 个变更文件，新增 8 行并删除 1 行。",
-        comparison_sha=BASE,
-    )
-
-    assert output.change_summary == ["本次变更调整了配置校验和错误处理。"]
-    assert output.findings == []
-
-
-def test_parse_review_output_accepts_native_no_findings_wording() -> None:
-    message = (
-        "本次修改迁移了会话释放流程，并增加了身份保存和释放重试。"
-        "静态检视未发现本次变更引入的明确、可执行问题。"
-    )
-
-    output = parse_review_output(
-        native_review_stdout(message),
-        workspace=Path("/srv/work/pr-review-1"),
-        ranges=ChangedRanges({}),
-        fallback_summary="本次 PR 涉及 2 个变更文件，新增 8 行并删除 1 行。",
-        comparison_sha=BASE,
-    )
-
-    assert output.change_summary == [
-        "本次修改迁移了会话释放流程，并增加了身份保存和释放重试。"
-    ]
-    assert output.findings == []
-
-
-def test_parse_review_output_accepts_no_findings_review_comment_prefix() -> None:
-    output = parse_review_output(
-        native_review_stdout(
-            "Review comment:\n\n"
-            "本次变更完成了检视流程调整。\n"
-            "未发现需要修改的问题。"
-        ),
-        workspace=Path("/srv/work/pr-review-1"),
-        ranges=ChangedRanges({}, comparison_sha=BASE),
-        fallback_summary="本次 PR 涉及 1 个变更文件，新增 1 行并删除 0 行。",
-        comparison_sha=BASE,
-    )
-
-    assert output.change_summary == ["本次变更完成了检视流程调整。"]
-    assert output.findings == []
-
-
-def test_parse_review_output_rejects_native_result_when_git_inspection_failed() -> None:
-    with pytest.raises(ReviewOutputError, match="Git"):
-        parse_review_output(
-            native_review_stdout(
-                "未发现可明确归因于本次变更且需要修复的问题。",
-                command_exit_code=1,
-            ),
-            workspace=Path("/srv/work/pr-review-1"),
-            ranges=ChangedRanges({}),
-            fallback_summary="本次 PR 涉及 1 个变更文件，新增 1 行并删除 0 行。",
-            comparison_sha=BASE,
-        )
-
-
-def test_native_json_output_still_requires_successful_git_inspection() -> None:
-    message = json.dumps(review_data([]), ensure_ascii=False)
-
-    with pytest.raises(ReviewOutputError, match="Git"):
-        parse_review_output(
-            native_review_stdout(message, command_exit_code=1),
-            workspace=Path("/srv/work/pr-review-1"),
-            ranges=ChangedRanges({}),
-            fallback_summary="本次 PR 涉及 1 个变更文件，新增 1 行并删除 0 行。",
-            comparison_sha=BASE,
-        )
-
-
-def test_native_context_rejects_raw_json_without_agent_event() -> None:
-    with pytest.raises(ReviewOutputError, match="Agent"):
-        parse_review_output(
-            json.dumps(review_data([]), ensure_ascii=False),
-            workspace=Path("/srv/work/pr-review-1"),
-            ranges=ChangedRanges({}),
-            fallback_summary="本次 PR 涉及 1 个变更文件，新增 1 行并删除 0 行。",
-            comparison_sha=BASE,
-        )
-
-
-@pytest.mark.parametrize(
-    "message",
-    [
-        "Review comment:\n- [P1] 损坏的格式: src/app.py:12\n  问题说明。",
-        "Review comment:\n- [P1] 缺少结构化正文 — RIGHT src/app.py:12\n  普通正文。",
-        "Review comment:\n- [P4] 未知优先级 — RIGHT src/app.py:12\n"
-        "  普通正文。\n\n未发现需要反馈的具体问题。",
-    ],
-)
-def test_native_review_rejects_unrecognized_finding_format(message: str) -> None:
-    with pytest.raises(ReviewOutputError, match="格式"):
-        parse_review_output(
-            native_review_stdout(message),
-            workspace=Path("/srv/work/pr-review-1"),
-            ranges=ChangedRanges({("src/app.py", "RIGHT"): ((12, 12),)}),
-            fallback_summary="本次 PR 涉及 1 个变更文件，新增 1 行并删除 0 行。",
-            comparison_sha=BASE,
-        )
-
-
-@pytest.mark.parametrize(
-    "command",
-    [
-        "printf 'git diff aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'",
-        "git diff unrelated-branch...HEAD",
-        f"git diff {BASE}...HEAD || true",
-        f"git diff unrelated-branch...HEAD -- fixtures/{BASE}.txt",
-        f"echo -c 'git diff {BASE}...HEAD'",
-        f"git -C /tmp diff {BASE}...HEAD",
-        f"git diff --no-index {BASE}...HEAD",
-        f"git diff {BASE} {BASE}",
-        f"git diff {BASE}...HEAD &",
-        f"git diff --src-prefix {BASE}...HEAD",
-        f"git diff -S {BASE}",
-    ],
-)
-def test_native_review_rejects_untrusted_git_evidence(command: str) -> None:
-    with pytest.raises(ReviewOutputError, match="Git"):
-        parse_review_output(
-            native_review_stdout("未发现需要反馈的具体问题。", command=command),
-            workspace=Path("/srv/work/pr-review-1"),
-            ranges=ChangedRanges({}),
-            fallback_summary="本次 PR 涉及 1 个变更文件，新增 1 行并删除 0 行。",
-            comparison_sha=BASE,
-        )
-
-
-def test_native_review_accepts_safe_git_global_options_for_the_fixed_base() -> None:
-    output = parse_review_output(
-        native_review_stdout(
-            "未发现需要反馈的具体问题。",
-            command=f"git --no-pager diff {BASE}...HEAD",
-        ),
-        workspace=Path("/srv/work/pr-review-1"),
-        ranges=ChangedRanges({}),
-        fallback_summary="本次 PR 涉及 1 个变更文件，新增 1 行并删除 0 行。",
-        comparison_sha=BASE,
-    )
-
-    assert output.findings == []
-
-
-@pytest.mark.parametrize(
-    "message",
-    [
-        "本次变更调整了配置。\n- [PX] 疑似问题\n未发现需要反馈的具体问题。",
-        "本次变更调整了配置。\n- P1 疑似问题\n未发现需要反馈的具体问题。",
-        "本次变更调整了配置。\n+ P1 疑似问题\n未发现需要反馈的具体问题。",
-        "本次变更调整了配置。\n未发现需要反馈的具体问题。\n额外结论。",
-    ],
-)
-def test_native_review_rejects_finding_like_text_in_no_findings_result(message: str) -> None:
-    with pytest.raises(ReviewOutputError, match="格式"):
-        parse_review_output(
-            native_review_stdout(message),
-            workspace=Path("/srv/work/pr-review-1"),
-            ranges=ChangedRanges({}),
-            fallback_summary="本次 PR 涉及 1 个变更文件，新增 1 行并删除 0 行。",
-            comparison_sha=BASE,
-        )
-
-
-def test_native_review_rejects_overlong_finding_instead_of_truncating() -> None:
-    message = f"""修改摘要：本次变更调整了空值处理。
-
-Review comment:
-
-- [P1] {"长" * 201} — RIGHT src/app.py:12
-  问题：输入为空时会直接解引用。
-  影响：请求会抛出异常。
-  建议：在读取属性前处理空值。"""
-
-    with pytest.raises(ReviewOutputError, match="格式"):
-        parse_review_output(
-            native_review_stdout(message),
-            workspace=Path("/srv/work/pr-review-1"),
-            ranges=ChangedRanges({("src/app.py", "RIGHT"): ((12, 12),)}),
-            fallback_summary="本次 PR 涉及 1 个变更文件，新增 1 行并删除 0 行。",
-            comparison_sha=BASE,
-        )
-
-
-def test_native_review_uses_explicit_line_side_when_line_numbers_overlap() -> None:
-    message = """本次变更替换了鉴权检查。
-
-Review comment:
-
-- [P1] 删除了必要的鉴权检查 — LEFT src/app.py:12
-  问题：旧版本中的鉴权调用被删除。
-  影响：请求可能绕过访问控制。
-  建议：保留鉴权调用或增加等价校验。"""
-    ranges = ChangedRanges(
-        {
-            ("src/app.py", "LEFT"): ((12, 12),),
-            ("src/app.py", "RIGHT"): ((12, 12),),
-        }
-    )
-
-    output = parse_review_output(
-        native_review_stdout(message),
-        workspace=Path("/srv/work/pr-review-1"),
-        ranges=ranges,
-        fallback_summary="本次 PR 涉及 1 个变更文件，新增 1 行并删除 1 行。",
-        comparison_sha=BASE,
-    )
-
-    assert output.findings[0].line_side == "LEFT"
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        "review complete",
-        "```json\n{}\n```\n```json\n{}\n```",
-        "```JSON\n{}\n```",
-    ],
-)
-def test_parse_review_output_rejects_anything_but_complete_json_or_one_json_block(
-    payload: str,
-) -> None:
+        parse_review_output(_review_stdout(json.dumps(data)), comparison_sha=BASE)
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"command": f"git diff --stat {BASE}...HEAD"},
+    {"command": f"git diff {BASE}...HEAD -- src/app.py"},
+    {"command": f"git diff {HEAD}...HEAD"},
+    {"command": f"git diff {BASE}...HEAD | cat"},
+    {"exit_code": 1},
+    {"terminal": "turn.failed"},
+    {"terminal": "thread.started"},
+])
+def test_rejects_unverified_or_interrupted_review(kwargs) -> None:
+    message = json.dumps({**review_data([]), "review_completed": True})
     with pytest.raises(ReviewOutputError):
-        parse_review_output(payload)
+        parse_review_output(_review_stdout(message, **kwargs), comparison_sha=BASE)
+
+
+def test_rejects_native_review_text() -> None:
+    with pytest.raises(ReviewOutputError):
+        _parse_message("Review comment: no findings")
 
 
 @pytest.mark.parametrize(
@@ -510,7 +147,7 @@ def test_parse_review_output_rejects_anything_but_complete_json_or_one_json_bloc
 )
 def test_parse_review_output_rejects_invalid_finding(field: str, value: object) -> None:
     with pytest.raises(ReviewOutputError):
-        parse_review_output(
+        _parse_message(
             json.dumps(review_data([finding_data(**{field: value})]), ensure_ascii=False)
         )
 
@@ -528,7 +165,7 @@ def test_parse_review_output_requires_one_to_five_chinese_summary_sentences(
     payload: dict[str, object],
 ) -> None:
     with pytest.raises(ReviewOutputError):
-        parse_review_output(json.dumps(payload, ensure_ascii=False))
+        _parse_message(json.dumps(payload, ensure_ascii=False))
 
 
 def test_review_finding_forbids_extra_fields_and_requires_chinese_text() -> None:
@@ -540,7 +177,7 @@ def test_review_finding_forbids_extra_fields_and_requires_chinese_text() -> None
 
 def test_parse_review_output_rejects_overlong_stdout() -> None:
     with pytest.raises(ReviewOutputError, match="过长"):
-        parse_review_output(" " * 65_537)
+        _parse_message(" " * 65_537)
 
 
 def test_validate_drops_location_outside_diff(changed_ranges: ChangedRanges) -> None:

@@ -759,6 +759,7 @@ class GitCodePublisher:
             base_ref=base_ref,
             head_ref=head_ref,
             head_repository_url=head_repository_url,
+            body=payload["body"] if isinstance(payload.get("body"), str) else "",
         )
 
     @staticmethod

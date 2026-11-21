@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -29,16 +30,11 @@ import sys
 import time
 
 stdin = sys.stdin.read()
-if "review" in sys.argv:
+if "--output-schema" in sys.argv:
     print(json.dumps({"type": "test.command", "argv": sys.argv[1:], "stdin": stdin}))
     print(json.dumps({"type": "item.completed", "item": {
-        "type": "agent_message", "text": "CODERUS_REVIEW_COMPLETE_NO_FINDINGS"}}))
-    print(json.dumps({"type": "turn.completed"}))
-    raise SystemExit
-if "native_review" in stdin:
-    print(json.dumps({"type": "item.completed", "item": {
         "type": "agent_message", "text": json.dumps({
-            "change_summary": ["修改了代码。"], "findings": []})}}))
+            "review_completed": True, "change_summary": ["修改了代码。"], "findings": []})}}))
     print(json.dumps({"type": "turn.completed"}))
     raise SystemExit
 prompt = stdin if sys.argv[-1] == "-" else sys.argv[-1]
@@ -130,8 +126,6 @@ elif prompt == "large-workspace":
         output.write(b"x" * 4096)
         output.flush()
     time.sleep(30)
-elif prompt == "large-native-review":
-    sys.stderr.write("native-review-" + "n" * 500_000)
 else:
     print(json.dumps({"argv": sys.argv[1:], "prompt": prompt}))
     print("diagnostic", file=sys.stderr)
@@ -224,19 +218,22 @@ def review_spec(tmp_path: Path) -> JobSpec:
     )
 
 
-def test_build_command_uses_native_review_without_competing_schema(
+def test_build_command_uses_skill_prompt_and_schema_with_review_model(
     fake_cli: tuple[str, ...], review_spec: JobSpec
 ) -> None:
     root = review_spec.workspace.parent
     runner = LocalCodexRunner(
-        RunnerConfig(root, fake_cli, "http://127.0.0.1:9999/v1", model="test-model")
+        RunnerConfig(
+            root, fake_cli, "http://127.0.0.1:9999/v1",
+            model="shared-model", review_model="gpt-6.2-sol",
+        )
     )
 
     command = runner.build_command(review_spec, output_schema=review_spec.output_schema)
 
     assert command[: len(fake_cli)] == list(fake_cli)
     assert "exec" in command
-    assert command[-2:] == ["review", "请按开发者检视规范完成本次完整静态检视。"]
+    assert "review" not in command
     assert "--base" not in command
     assert "developer_instructions=" in " ".join(command)
     assert "resume" not in command
@@ -247,8 +244,8 @@ def test_build_command_uses_native_review_without_competing_schema(
     assert 'model_providers.coderus_proxy.env_key="OPENAI_API_KEY"' in command
     assert 'model_providers.coderus_proxy.wire_api="responses"' in command
     assert "model_providers.coderus_proxy.supports_websockets=false" in command
-    assert command[command.index("--model") + 1] == "test-model"
-    assert "--output-schema" not in command
+    assert command[command.index("--model") + 1] == "gpt-6.2-sol"
+    assert command[command.index("--output-schema") + 1] == str(review_spec.output_schema)
     assert "--search" not in command
     expected_sandbox = "danger-full-access" if sys.platform == "linux" else "read-only"
     assert command[command.index("--sandbox") + 1] == expected_sandbox
@@ -287,7 +284,7 @@ def test_linux_pr_review_uses_landlock_instead_of_the_unavailable_inner_sandbox(
 
 
 @pytest.mark.asyncio
-async def test_pr_review_runs_native_then_returns_schema_conversion(
+async def test_pr_review_returns_structured_report_from_one_process(
     fake_cli: tuple[str, ...], review_spec: JobSpec
 ) -> None:
     runner = LocalCodexRunner(
@@ -306,16 +303,20 @@ async def test_pr_review_runs_native_then_returns_schema_conversion(
     assert result.status is JobStatus.SUCCEEDED
     assert "exec" in payload["argv"]
     assert 'model_provider="coderus_proxy"' in payload["argv"]
-    assert payload["argv"][-2] == "review"
+    assert "review" not in payload["argv"]
     assert payload["stdin"] == ""
     assert "--base" not in payload["argv"]
-    assert "--output-schema" not in payload["argv"]
-    assert json.loads(events[-1]["item"]["text"])["findings"] == []
+    assert "--output-schema" in payload["argv"]
+    assert len(events) == 3
+    message = json.loads(events[1]["item"]["text"])
+    assert message["review_completed"] is True
+    assert message["findings"] == []
 
 
 @pytest.mark.asyncio
-async def test_pr_review_passes_no_stdin_text_to_the_process(
-    fake_cli: tuple[str, ...], review_spec: JobSpec, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("context", [None, "Issue text used as review evidence"])
+async def test_pr_review_passes_optional_context_through_stdin(
+    fake_cli: tuple[str, ...], review_spec: JobSpec, monkeypatch: pytest.MonkeyPatch, context
 ) -> None:
     runner = LocalCodexRunner(RunnerConfig(review_spec.workspace.parent, fake_cli))
     stdin_texts: list[str | None] = []
@@ -335,10 +336,15 @@ async def test_pr_review_passes_no_stdin_text_to_the_process(
 
     monkeypatch.setattr(runner, "_run_process", capture_process)
 
-    result = await runner.run(review_spec)
+    spec = replace(review_spec, review_context=context)
+    result = await runner.run(spec)
 
-    assert result.status is JobStatus.FAILED  # No native conclusion: do not run conversion.
-    assert stdin_texts == [None]
+    assert result.status is JobStatus.SUCCEEDED
+    assert stdin_texts == [context]
+    command = runner.build_command(spec)
+    if context is not None:
+        assert command[-1] == "-"
+        assert context not in command
 
 
 def test_pr_review_adds_large_prompt_to_developer_instructions(
@@ -360,7 +366,7 @@ def test_pr_review_adds_large_prompt_to_developer_instructions(
     command = runner.build_command(spec, output_schema=spec.output_schema)
 
     assert f"developer_instructions={json.dumps(prompt)}" in command
-    assert command[-2:] == ["review", "请按开发者检视规范完成本次完整静态检视。"]
+    assert command[-1] == "请执行开发者指令中的本次代码检视。"
     assert "--base" not in command
 
 
@@ -711,13 +717,6 @@ async def test_linux_landlock_execute_is_limited_by_task_mode(
         class ReviewProbeRunner(LocalCodexRunner):
             def build_command(self, spec: JobSpec, *, output_schema=None) -> list[str]:
                 return [*fake_cli, "probe-execute"]
-
-            def _build_exec_command(self, spec: JobSpec, **kwargs) -> list[str]:
-                return [*fake_cli, "probe-execute"]
-
-            async def _adapt_review(self, spec, native, *args, **kwargs):
-                # This probe tests the OS boundary, not a Codex review transcript.
-                return native
 
         runner = ReviewProbeRunner(config)
     else:

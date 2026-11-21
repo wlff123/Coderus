@@ -4,7 +4,7 @@ import asyncio
 import logging
 import secrets
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -13,10 +13,10 @@ from typing import Protocol, cast
 from sqlalchemy import case, update
 from sqlalchemy.orm import Session
 
-from coderus.forge import ForgeRegistry, ProviderName
+from coderus.forge import ForgeRegistry, ProviderName, Repository
 from coderus.model_proxy import issued_stage_token
 from coderus.models import PRReviewTask
-from coderus.pr_review.instructions import build_review_instructions
+from coderus.pr_review.instructions import ReviewAxis, build_review_instructions
 from coderus.pr_review.models import ReviewInput, ReviewOutput
 from coderus.pr_review.result import (
     ReviewOutputError,
@@ -26,6 +26,7 @@ from coderus.pr_review.result import (
     unlocated_findings,
     validate_findings,
 )
+from coderus.pr_review.spec_source import SpecSource, resolve_spec_source
 from coderus.pr_review.upstream_errors import upstream_error_message
 from coderus.pr_review.workspace import PRWorkspaceError, RevisionChanged
 from coderus.runner import AgentRole, JobSpec, JobStatus, Stage
@@ -96,6 +97,7 @@ class PRReviewOrchestrator:
         credential_broker: object | None = None,
         stage_timeout_seconds: float = 3600,
         model_secrets: tuple[str, ...] = (),
+        providers: Mapping[str, object] | None = None,
     ) -> None:
         self.sessions = session_factory
         self.forges = forges
@@ -105,6 +107,7 @@ class PRReviewOrchestrator:
         self.credential_broker = credential_broker
         self.stage_timeout_seconds = stage_timeout_seconds
         self._model_secrets = model_secrets
+        self.providers = providers if providers is not None else {}
 
     async def run(self, task_id: int) -> None:
         claim_token = self._claim(task_id)
@@ -187,13 +190,24 @@ class PRReviewOrchestrator:
                 if ranges.comparison_sha is None:
                     raise PRReviewError("无法确认 PR 的实际比较基准")
                 self._assert_claim(task_id, claim_token, claim_lost)
-                generated_output, proxy_token = await self._run_review(
+                spec_source = await resolve_spec_source(
+                    material,
+                    repository=Repository(
+                        task.provider, task.owner, task.name, task.repository_url
+                    ),
+                    provider=self.providers.get(task.provider),
+                    head_ref=details.head_ref,
+                    pr_body=details.body,
+                )
+                self._assert_claim(task_id, claim_token, claim_lost)
+                reports = await self._run_review_axes(
                     task,
                     prepared,
                     ranges.comparison_sha,
                     details.head_sha,
                     material,
                     claim_lost,
+                    spec_source,
                 )
                 self._assert_claim(task_id, claim_token, claim_lost)
                 await self.workspace.assert_pristine(
@@ -202,9 +216,18 @@ class PRReviewOrchestrator:
                     ranges.comparison_sha,
                 )
                 self._assert_claim(task_id, claim_token, claim_lost)
-                pending_findings = unlocated_findings(generated_output, ranges)
-                output = validate_findings(generated_output, ranges)
-                filtered_finding_count = len(generated_output.findings) - len(output.findings)
+                validated = [validate_findings(report, ranges) for report, _ in reports]
+                generated_count = sum(len(report.findings) for report, _ in reports)
+                output = validated[0].model_copy(update={
+                    "findings": [finding for report in validated for finding in report.findings],
+                })
+                standards_count = len(validated[0].findings)
+                pending_findings = []
+                for axis, (report, _) in zip(("standards", "spec"), reports, strict=False):
+                    pending_findings.extend(
+                        {**item, "review_axis": axis} for item in unlocated_findings(report, ranges)
+                    )
+                filtered_finding_count = len(pending_findings)
 
                 self._assert_claim(task_id, claim_token, claim_lost)
                 current = await self.forges.require(task.provider).get_pull_request(
@@ -234,23 +257,32 @@ class PRReviewOrchestrator:
                         raise PRReviewError("检视期间目标分支有新提交，请重新发起检视")
                 elif current.base_sha != details.base_sha:
                     raise PRReviewError("PR 版本已变化")
-                output = self._redact_output(output, proxy_token, prepared, self._model_secrets)
+                review_secrets = self._model_secrets + tuple(token for _, token in reports if token)
+                output = self._redact_output(output, None, prepared, review_secrets)
                 for item in pending_findings:
+                    pending_output = ReviewOutput(
+                        change_summary=output.change_summary, findings=[item["finding"]],
+                    )
                     safe = self._redact_output(
-                        ReviewOutput(change_summary=generated_output.change_summary,
-                                     findings=[item["finding"]]),
-                        proxy_token, prepared, self._model_secrets,
+                        pending_output, None, prepared, review_secrets,
                     )
                     item["finding"] = safe.findings[0].model_dump(mode="json")
                 structured_result = output.model_dump(mode="json")
                 structured_result["unlocated_findings"] = pending_findings
+                structured_result["review_axes"] = {
+                    "standards": {"status": "completed", "validated_findings": standards_count},
+                    "spec": {
+                        "status": "completed" if spec_source else "skipped_no_spec",
+                        "validated_findings": len(output.findings) - standards_count,
+                    },
+                }
                 structured_result["review_audit"] = {
                     "comparison_sha": ranges.comparison_sha,
                     "changed_files": ranges.changed_file_count,
                     "additions": ranges.additions,
                     "deletions": ranges.deletions,
-                    "review_mode": "native_review_with_schema_adapter",
-                    "generated_findings": len(generated_output.findings),
+                    "review_mode": "matt_pocock_code_review",
+                    "generated_findings": generated_count,
                     "validated_findings": len(output.findings),
                     "filtered_findings": filtered_finding_count,
                 }
@@ -275,6 +307,8 @@ class PRReviewOrchestrator:
                     filtered_finding_count=filtered_finding_count,
                     comparison_sha=ranges.comparison_sha,
                     pending_findings=pending_findings,
+                    standards_count=standards_count,
+                    spec_reviewed=spec_source is not None,
                 )
                 self._assert_claim(task_id, claim_token, claim_lost)
                 comment = await asyncio.wait_for(
@@ -283,7 +317,7 @@ class PRReviewOrchestrator:
                     ),
                     timeout=COMMENT_TIMEOUT_SECONDS,
                 )
-                if not generated_output.findings:
+                if not generated_count:
                     lgtm_marker = (
                         f"<!-- coderus-pr-review-lgtm:{details.head_sha} -->"
                     )
@@ -355,6 +389,35 @@ class PRReviewOrchestrator:
             claim_lost.set()
             raise _ClaimLost
 
+    async def _run_review_axes(
+        self,
+        task: _TaskContext,
+        workspace: Path,
+        base_sha: str,
+        head_sha: str,
+        material: ReviewInput,
+        claim_lost: asyncio.Event,
+        spec_source: SpecSource | None,
+    ) -> list[tuple[ReviewOutput, str | None]]:
+        async def review(axis: ReviewAxis, source: SpecSource | None = None):
+            return await self._run_review(
+                task, workspace, base_sha, head_sha, material, claim_lost, axis, source
+            )
+
+        if spec_source is None:
+            return [await review("standards")]
+        jobs = [
+            asyncio.create_task(review("standards")),
+            asyncio.create_task(review("spec", spec_source)),
+        ]
+        try:
+            return await asyncio.gather(*jobs)
+        finally:
+            for job in jobs:
+                if not job.done():
+                    job.cancel()
+            await asyncio.gather(*jobs, return_exceptions=True)
+
     async def _run_review(
         self,
         task: _TaskContext,
@@ -363,7 +426,9 @@ class PRReviewOrchestrator:
         head_sha: str,
         material: ReviewInput,
         claim_lost: asyncio.Event,
-    ):
+        axis: ReviewAxis,
+        spec_source: SpecSource | None,
+    ) -> tuple[ReviewOutput, str | None]:
         prompt = build_review_instructions(
             provider=task.provider,
             owner=task.owner,
@@ -372,6 +437,7 @@ class PRReviewOrchestrator:
             base_sha=base_sha,
             head_sha=head_sha,
             material=material,
+            axis=axis,
         )
         with issued_stage_token(
             self.credential_broker,
@@ -383,7 +449,7 @@ class PRReviewOrchestrator:
             ),
         ) as token:
             spec = JobSpec(
-                job_id=f"pr-review-{task.id}",
+                job_id=f"pr-review-{task.id}-{axis}",
                 stage=Stage.PR_REVIEW,
                 role=AgentRole.PR_REVIEWER,
                 workspace=workspace,
@@ -393,6 +459,7 @@ class PRReviewOrchestrator:
                 output_schema=review_output_schema_path(),
                 proxy_token=token,
                 review_base=material.review_base,
+                review_context=spec_source.prompt() if spec_source else None,
             )
 
             async def run_agent():
@@ -449,18 +516,10 @@ class PRReviewOrchestrator:
                 if result.status is not JobStatus.FAILED or attempt >= AGENT_JOB_ATTEMPTS:
                     raise ReviewAgentFailure(f"Codex 检视失败（{result.status.value}）")
             try:
+                if result.output_truncated:
+                    raise ReviewOutputError("检视输出被截断")
                 return (
-                    parse_review_output(
-                        result.stdout,
-                        workspace=workspace,
-                        ranges=material.ranges,
-                        fallback_summary=(
-                            f"本次 PR 涉及 {material.ranges.changed_file_count} 个变更文件，"
-                            f"新增 {material.ranges.additions} 行并删除 "
-                            f"{material.ranges.deletions} 行。"
-                        ),
-                        comparison_sha=base_sha,
-                    ),
+                    parse_review_output(result.stdout, comparison_sha=base_sha),
                     token,
                 )
             except ReviewOutputError as exc:

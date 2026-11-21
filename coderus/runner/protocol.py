@@ -57,6 +57,7 @@ class JobSpec:
     session_id: str | None = None
     review_base: str | None = None
     proxy_token: str | None = field(default=None, repr=False)
+    review_context: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not self.job_id:
@@ -70,6 +71,8 @@ class JobSpec:
                 raise ValueError("session_id is not supported for PR review jobs")
         elif self.review_base is not None:
             raise ValueError("review_base is only supported for PR review jobs")
+        if self.stage is not Stage.PR_REVIEW and self.review_context is not None:
+            raise ValueError("review_context is only supported for PR review jobs")
         if self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
         if self.max_output_bytes <= 0:

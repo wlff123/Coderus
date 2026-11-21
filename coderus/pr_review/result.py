@@ -12,42 +12,20 @@ from pydantic import ValidationError
 from coderus.forge import ProviderName
 from coderus.tasks.error_codes import TaskErrorCode
 
-from .models import ChangedRanges, ReviewFinding, ReviewOutput, normalize_repository_path
+from .models import ChangedRanges, ReviewFinding, ReviewOutput
 
 MAX_REVIEW_OUTPUT_CHARS = 65_536
-_FENCED_JSON_BLOCK = re.compile(r"```json[ \t]*\r?\n(?P<payload>.*?)\r?\n```", re.DOTALL)
-_NATIVE_FINDING_HEADER = re.compile(
-    r"(?m)^\s*(?:(?:#{1,6}\s*)?\d+[.)、]\s*)?(?:[-*+]\s*)?"
-    r"(?:\*\*)?\[(P[0-3])(?:[^\]\r\n]*)\](?:\*\*)?\s+(.+?)\s+"
-    r"(?:(?:—|–|-)\s+|:\s*|\(\s*)(LEFT|RIGHT)\s+"
-    r"(.+?)(?::L?|#L)(\d+)(?:[-–]L?(\d+))?\s*\**\s*\)?\s*$"
-)
-_NATIVE_PRIORITY_MARKER_LINE = re.compile(
-    r"(?m)^\s*(?:(?:#{1,6}\s*)?\d+[.)、]\s*)?(?:[-*+]\s*)?"
-    r"(?:\*\*)?\[P[^\]\r\n]*\]"
-)
-_NO_FINDINGS_CONCLUSION = re.compile(
-    r"(?:静态检视)?(?:未发现|没有发现)(?:需要反馈的具体问题|"
-    r"本次变更引入的明确[、，]?可执行问题|"
-    r"可明确归因于本次变更且需要修复的问题|"
-    r"需要(?:修改|修复)的问题|"
-    r"可执行问题|明显问题|问题)"
-)
 _SAFE_DIFF_OPTIONS = {
-    "--check",
     "--find-copies",
     "--find-renames",
     "--histogram",
     "--minimal",
-    "--name-only",
-    "--name-status",
     "--no-color",
     "--no-ext-diff",
     "--patience",
-    "--stat",
 }
 _SAFE_DIFF_OPTION_VALUE = re.compile(
-    r"(?:-U\d+|--unified=\d+|--find-(?:copies|renames)=\d+%?|--diff-filter=[A-Z*]+)"
+    r"(?:-U\d+|--unified=\d+|--find-(?:copies|renames)=\d+%?)"
 )
 _MARKDOWN_SPECIAL = re.compile(r"([\\`*_{}\[\]()#+\-.!|])")
 _PRIORITY_LABELS = {
@@ -68,105 +46,10 @@ def review_output_schema_path() -> Path:
     return Path(__file__).with_name("review_output.schema.json")
 
 
-def parse_review_output(
-    stdout: str,
-    *,
-    workspace: Path | None = None,
-    ranges: ChangedRanges | None = None,
-    fallback_summary: str | None = None,
-    comparison_sha: str | None = None,
-) -> ReviewOutput:
-    message = _final_agent_message(stdout)
-    raw_payload = message if message is not None else stdout
-    if len(raw_payload) > MAX_REVIEW_OUTPUT_CHARS:
-        raise ReviewOutputError("检视输出过长")
-    payload = raw_payload.strip()
-    native_context = all(
-        value is not None for value in (workspace, ranges, fallback_summary, comparison_sha)
-    )
-    if native_context:
-        if message is None:
-            raise ReviewOutputError("Codex 未返回有效的 Agent 消息事件")
-        if not _has_successful_git_inspection(stdout, comparison_sha or ""):
-            raise ReviewOutputError("Codex 未成功完成 Git 变更检查")
-
-    try:
-        decoded = json.loads(payload)
-    except json.JSONDecodeError:
-        try:
-            decoded = _extract_fenced_json(payload)
-        except ReviewOutputError:
-            if not native_context or message is None:
-                raise
-            assert workspace is not None
-            assert ranges is not None
-            return _parse_native_review_output(
-                message,
-                workspace=workspace,
-                ranges=ranges,
-                fallback_summary=fallback_summary or "",
-            )
-
-    try:
-        return ReviewOutput.model_validate(decoded)
-    except ValidationError as error:
-        raise ReviewOutputError("检视结果格式无效") from error
-
-
-def _parse_native_review_output(
-    message: str,
-    *,
-    workspace: Path,
-    ranges: ChangedRanges,
-    fallback_summary: str,
-) -> ReviewOutput:
-    matches = list(_NATIVE_FINDING_HEADER.finditer(message))
-    priority_markers = list(_NATIVE_PRIORITY_MARKER_LINE.finditer(message))
-    if len(priority_markers) != len(matches):
-        raise ReviewOutputError(
-            "原生检视意见格式无效：优先级标记数量与意见标题数量不一致"
-        )
-    if not matches:
-        _validate_no_findings_message(message)
-    summaries = _native_change_summary(message, matches, fallback_summary)
-    findings = []
-    for index, match in enumerate(matches):
-        body_end = matches[index + 1].start() if index + 1 < len(matches) else len(message)
-        body = "\n".join(
-            line.strip()
-            for line in message[match.end() : body_end].splitlines()
-            if line.strip()
-        )
-        if not body:
-            raise ReviewOutputError("原生检视意见缺少问题说明")
-        side = match.group(3)
-        path = _repository_relative_location(match.group(4), workspace)
-        start = int(match.group(5))
-        end = int(match.group(6) or match.group(5))
-        problem, impact, suggestion = _structured_finding_details(body)
-        try:
-            findings.append(
-                ReviewFinding(
-                    priority=match.group(1),
-                    title=match.group(2).strip(),
-                    file_path=path,
-                    line_side=side,
-                    line_start=start,
-                    line_end=end,
-                    problem=problem,
-                    impact=impact,
-                    suggestion=suggestion,
-                )
-            )
-        except ValidationError as error:
-            raise ReviewOutputError("原生检视结果格式无效") from error
-    try:
-        return ReviewOutput(change_summary=summaries, findings=findings)
-    except ValidationError as error:
-        raise ReviewOutputError("原生检视结果格式无效") from error
-
-
-def _has_successful_git_inspection(stdout: str, comparison_sha: str) -> bool:
+def parse_review_output(stdout: str, *, comparison_sha: str) -> ReviewOutput:
+    message = None
+    inspected = False
+    completed = False
     for line in stdout.splitlines():
         try:
             event = json.loads(line)
@@ -174,196 +57,70 @@ def _has_successful_git_inspection(stdout: str, comparison_sha: str) -> bool:
             continue
         if not isinstance(event, dict):
             continue
+        kind = event.get("type")
+        if kind == "turn.failed":
+            raise ReviewOutputError("Codex 检视失败")
+        if kind == "turn.completed":
+            completed = True
         item = event.get("item")
+        if kind != "item.completed" or not isinstance(item, dict):
+            continue
+        if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
+            message = item["text"]
         if (
-            event.get("type") == "item.completed"
-            and isinstance(item, dict)
-            and item.get("type") == "command_execution"
+            item.get("type") == "command_execution"
             and item.get("status") == "completed"
             and item.get("exit_code") == 0
             and isinstance(item.get("command"), str)
             and _is_fixed_base_git_diff(item["command"], comparison_sha)
         ):
-            return True
-    return False
+            inspected = True
+
+    if not completed or message is None:
+        raise ReviewOutputError("Codex 未返回完整检视事件")
+    if not inspected:
+        raise ReviewOutputError("Codex 未成功检查完整 Git diff")
+    if len(message) > MAX_REVIEW_OUTPUT_CHARS:
+        raise ReviewOutputError("检视输出过长")
+    try:
+        decoded = json.loads(message)
+        if not isinstance(decoded, dict):
+            raise ValueError
+    except ValueError as error:
+        raise ReviewOutputError("检视结果不是有效 JSON") from error
+    if decoded.pop("review_completed", None) is not True:
+        raise ReviewOutputError("Codex 未确认检视完成")
+    try:
+        return ReviewOutput.model_validate(decoded)
+    except ValidationError as error:
+        raise ReviewOutputError("检视结果格式无效") from error
 
 
 def _is_fixed_base_git_diff(command: str, comparison_sha: str) -> bool:
     try:
-        outer = shlex.split(command)
+        tokens = shlex.split(command)
+        if tokens and Path(tokens[0]).name in {"bash", "dash", "sh", "zsh"}:
+            if len(tokens) != 3 or tokens[1] not in {"-c", "-lc"}:
+                return False
+            tokens = shlex.split(tokens[2])
     except ValueError:
         return False
-    if not outer:
+    if not tokens or Path(tokens.pop(0)).name != "git":
         return False
-    executable = Path(outer[0]).name
-    if executable in {"bash", "dash", "sh", "zsh"}:
-        if len(outer) != 3 or outer[1] not in {"-c", "-lc"}:
-            return False
-        script = outer[2]
-    elif executable == "git":
-        script = command
-    else:
+    if tokens and tokens[0] == "--no-pager":
+        tokens.pop(0)
+    if not tokens or tokens.pop(0) != "diff":
         return False
-    if (
-        "|" in script
-        or ";" in script
-        or "\n" in script
-        or re.search(r"(?<!&)&(?!&)", script)
-    ):
-        return False
-    try:
-        segments = [shlex.split(segment.strip()) for segment in script.split("&&")]
-    except ValueError:
-        return False
-    if not segments or not all(_is_safe_git_segment(tokens) for tokens in segments):
-        return False
-    return any(_is_target_git_diff(tokens, comparison_sha) for tokens in segments)
-
-
-def _is_safe_git_segment(tokens: list[str]) -> bool:
-    if not tokens or Path(tokens[0]).name != "git":
-        return False
-    index = 1
-    while index < len(tokens) and tokens[index] == "--no-pager":
-        index += 1
-    return index < len(tokens) and tokens[index] in {"diff", "status"}
-
-
-def _is_target_git_diff(tokens: list[str], comparison_sha: str) -> bool:
-    index = 1
-    while index < len(tokens) and tokens[index] == "--no-pager":
-        index += 1
-    if index >= len(tokens) or tokens[index] != "diff":
-        return False
-    arguments = tokens[index + 1 :]
-    if "--no-index" in arguments:
-        return False
-    revision_arguments = arguments
-    if "--" in revision_arguments:
-        revision_arguments = revision_arguments[: revision_arguments.index("--")]
-    if any(
-        token.startswith("-")
-        and token not in _SAFE_DIFF_OPTIONS
-        and _SAFE_DIFF_OPTION_VALUE.fullmatch(token) is None
-        for token in revision_arguments
-    ):
-        return False
-    revision_arguments = [token for token in revision_arguments if not token.startswith("-")]
-    return len(revision_arguments) == 1 and any(
-        _references_comparison(revision_arguments[0], comparison)
-        for comparison in (comparison_sha, "coderus-review-base")
-    )
-
-
-def _references_comparison(token: str, comparison: str) -> bool:
-    return token in {
-        comparison,
-        f"{comparison}..HEAD",
-        f"{comparison}...HEAD",
-    }
-
-
-def _native_change_summary(
-    message: str, matches: list[re.Match[str]], fallback_summary: str
-) -> list[str]:
-    prefix = message[: matches[0].start()] if matches else message
-    prefix = prefix.replace("Review comment:", "").strip()
-    conclusion = _NO_FINDINGS_CONCLUSION.search(prefix)
-    if conclusion is not None:
-        prefix = prefix[: conclusion.start()].strip()
-    prefix = prefix.replace("修改摘要：", "").strip()
-    summaries = []
-    for block in re.split(r"\n\s*\n|\n", prefix):
-        summary = re.sub(r"^\s*\d+[.、]\s*", "", block).strip()
-        summary = " ".join(summary.split())
-        if summary and any("\u4e00" <= character <= "\u9fff" for character in summary):
-            summaries.append(summary)
-    summaries = [summary for summary in summaries if summary][:5]
-    return summaries or [fallback_summary]
-
-
-def _validate_no_findings_message(message: str) -> None:
-    normalized = message.strip()
-    if normalized.startswith("Review comment:"):
-        normalized = normalized[len("Review comment:") :].lstrip()
-    match = re.fullmatch(
-        rf"(?s)(?P<summary>.*?)\n*(?:{_NO_FINDINGS_CONCLUSION.pattern})。?\s*",
-        normalized,
-    )
-    if match is None:
-        raise ReviewOutputError("原生检视结论格式无效")
-    summary = match.group("summary")
-    if "Review comment:" in summary or re.search(
-        r"(?m)^\s*(?:[+*-]\s+|(?:问题|影响|建议)[：:])", summary
-    ):
-        raise ReviewOutputError("原生检视结论格式无效")
-
-
-def _repository_relative_location(value: str, workspace: Path) -> str:
-    location = value.strip().strip("`*_[]() ").replace("\\", "/")
-    workspace_prefix = str(workspace).replace("\\", "/").rstrip("/") + "/"
-    if location.casefold().startswith(workspace_prefix.casefold()):
-        location = location[len(workspace_prefix) :]
-    normalized = normalize_repository_path(location)
-    if normalized is None:
-        raise ReviewOutputError("原生检视意见包含无效文件路径")
-    return normalized
-
-
-def _structured_finding_details(body: str) -> tuple[str, str, str]:
-    normalized_lines: list[str] = []
-    for line in body.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        line = re.sub(
-            r"^(?:[-*+]\s+)?(?:\*\*)?(问题|影响|建议)(?:\*\*)?\s*[:：]\s*",
-            r"\1：",
-            line,
-        )
-        normalized_lines.append(line)
-    fields: dict[str, str] = {}
-    current: str | None = None
-    for line in normalized_lines:
-        match = re.fullmatch(r"(?P<label>问题|影响|建议)：?\s*(?P<value>.*)", line)
-        if match is not None:
-            label = match.group("label")
-            if label in fields:
-                raise ReviewOutputError("原生检视意见包含重复正文标签")
-            current = label
-            value = match.group("value").strip()
-            if value:
-                fields[label] = value
-            continue
-        if current is None or current in fields:
-            raise ReviewOutputError("原生检视意见格式无效")
-        fields[current] = line
-    if set(fields) != {"问题", "影响", "建议"}:
-        raise ReviewOutputError("原生检视意见格式无效")
-    return (
-        fields["问题"],
-        fields["影响"],
-        fields["建议"],
-    )
-
-
-def _final_agent_message(stdout: str) -> str | None:
-    message = None
-    for line in stdout.splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(event, dict) or event.get("type") != "item.completed":
-            continue
-        item = event.get("item")
-        if (
-            isinstance(item, dict)
-            and item.get("type") == "agent_message"
-            and isinstance(item.get("text"), str)
-        ):
-            message = item["text"]
-    return message
+    if tokens and tokens[-1] == "--":
+        tokens.pop()
+    revisions = []
+    for token in tokens:
+        if token.startswith("-"):
+            if token not in _SAFE_DIFF_OPTIONS and not _SAFE_DIFF_OPTION_VALUE.fullmatch(token):
+                return False
+        else:
+            revisions.append(token)
+    return revisions in [[f"{comparison_sha}...HEAD"], ["coderus-review-base...HEAD"]]
 
 
 def validate_findings(output: ReviewOutput, ranges: ChangedRanges) -> ReviewOutput:
@@ -417,14 +174,24 @@ def render_pr_comment(
     filtered_finding_count: int = 0,
     comparison_sha: str | None = None,
     pending_findings: list[dict] | None = None,
+    standards_count: int | None = None,
+    spec_reviewed: bool = False,
 ) -> tuple[str, str]:
     hosts = {"github": "github.com", "gitcode": "gitcode.com"}
     if provider not in hosts:
         raise ValueError("unsupported PR review provider")
     marker = f"<!-- coderus-pr-review:{review_key}:{base_sha}:{head_sha} -->"
-    findings = _unique_findings(output)
-    if findings:
-        summary = f"发现 {len(findings)} 项需要处理的问题"
+    groups = (
+        [("", _unique_findings(output.findings))]
+        if standards_count is None
+        else [
+            ("Standards（代码规范）", _unique_findings(output.findings[:standards_count])),
+            ("Spec（需求规格）", _unique_findings(output.findings[standards_count:])),
+        ]
+    )
+    count = sum(len(findings) for _, findings in groups)
+    if count:
+        summary = f"发现 {count} 项需要处理的问题"
         if filtered_finding_count:
             summary += f"；另有 {filtered_finding_count} 条意见因无法安全定位未发布"
     elif filtered_finding_count:
@@ -448,40 +215,31 @@ def render_pr_comment(
     sections.append(f"- 结论：{summary}")
     if pending_findings:
         sections[-1] = (
-            f"- 结论：{len(findings)} 条已定位意见；"
+            f"- 结论：{count} 条已定位意见；"
             f"{len(pending_findings)} 条意见待人工确认（位置未验证）"
         )
 
-    for index, finding in enumerate(findings, start=1):
-        sha = (
-            (comparison_sha or output._comparison_sha or base_sha)
-            if finding.line_side == "LEFT"
-            else head_sha
-        )
-        version_label = "原版本" if finding.line_side == "LEFT" else "新版本"
-        path = quote(finding.file_path, safe="/")
-        url = (
-            f"https://{hosts[provider]}/{quote(owner, safe='')}/{quote(name, safe='')}/blob/"
-            f"{quote(sha, safe='')}/{path}#L{finding.line_start}-L{finding.line_end}"
-        )
-        sections.extend(
-            [
-                "",
-                (
-                    f"### {index}. [{_PRIORITY_LABELS[finding.priority]}] "
-                    f"{_escape_markdown(finding.title)}"
-                ),
-                "",
-                f"- 文件：{_code_span(finding.file_path)}",
-                (
-                    f"- 代码范围：[{version_label}第 {finding.line_start}-{finding.line_end} 行]"
-                    f"({url})"
-                ),
-                f"- 问题说明：{_escape_markdown(finding.problem)}",
-                f"- 影响分析：{_escape_markdown(finding.impact)}",
-                f"- 修改建议：{_escape_markdown(finding.suggestion)}",
-            ]
-        )
+    index = 0
+    for label, findings in groups:
+        if label:
+            sections.extend(["", f"## {label}"])
+            if label.startswith("Spec") and not spec_reviewed:
+                sections.append("未找到可核实的需求来源，已跳过规格检视。")
+                continue
+            axis = "standards" if label.startswith("Standards") else "spec"
+            pending_count = sum(
+                item.get("review_axis") == axis for item in pending_findings or ()
+            )
+            sections.append(f"已定位 {len(findings)} 条，待人工确认 {pending_count} 条。")
+            if findings:
+                highest = min(findings, key=lambda finding: finding.priority)
+                sections.append(f"本项优先处理：{_escape_markdown(highest.title)}")
+        for finding in findings:
+            index += 1
+            sections.extend(_render_finding(
+                finding, index, hosts[provider], owner, name,
+                comparison_sha or output._comparison_sha or base_sha, head_sha,
+            ))
 
     if pending_findings:
         sections.extend(["", "## 待人工确认（位置未验证）", "",
@@ -489,8 +247,10 @@ def render_pr_comment(
         for index, item in enumerate(pending_findings, 1):
             finding = item["finding"]
             side = "原版本" if finding["line_side"] == "LEFT" else "新版本"
+            label = {"standards": "代码规范", "spec": "需求规格"}.get(item.get("review_axis"))
+            source = f"（{label}）" if label else ""
             sections.extend([
-                "", f"### 待确认 {index}. {_escape_markdown(finding['title'])}", "",
+                "", f"### 待确认 {index}{source}. {_escape_markdown(finding['title'])}", "",
                 f"- 模型建议优先级：{_PRIORITY_LABELS[finding['priority']]}",
                 f"- 模型所指文件：{_code_span(finding['file_path'])}",
                 (f"- 模型所指范围（未验证）：{side}第 "
@@ -504,26 +264,39 @@ def render_pr_comment(
     return "\n".join(sections), marker
 
 
-def _extract_fenced_json(stdout: str) -> object:
-    matches = list(_FENCED_JSON_BLOCK.finditer(stdout))
-    if len(matches) != 1:
-        raise ReviewOutputError("检视输出必须是完整 JSON 或单一 JSON 代码块")
+def _render_finding(
+    finding: ReviewFinding,
+    index: int,
+    host: str,
+    owner: str,
+    name: str,
+    comparison_sha: str,
+    head_sha: str,
+) -> list[str]:
+    is_left = finding.line_side == "LEFT"
+    sha = comparison_sha if is_left else head_sha
+    version_label = "原版本" if is_left else "新版本"
+    path = quote(finding.file_path, safe="/")
+    url = (
+        f"https://{host}/{quote(owner, safe='')}/{quote(name, safe='')}/blob/"
+        f"{quote(sha, safe='')}/{path}#L{finding.line_start}-L{finding.line_end}"
+    )
+    return [
+        "",
+        f"### {index}. [{_PRIORITY_LABELS[finding.priority]}] {_escape_markdown(finding.title)}",
+        "",
+        f"- 文件：{_code_span(finding.file_path)}",
+        f"- 代码范围：[{version_label}第 {finding.line_start}-{finding.line_end} 行]({url})",
+        f"- 问题说明：{_escape_markdown(finding.problem)}",
+        f"- 影响分析：{_escape_markdown(finding.impact)}",
+        f"- 修改建议：{_escape_markdown(finding.suggestion)}",
+    ]
 
-    match = matches[0]
-    before = stdout[: match.start()]
-    after = stdout[match.end() :]
-    if "```" in before or after.strip():
-        raise ReviewOutputError("检视输出必须是完整 JSON 或单一 JSON 代码块")
-    try:
-        return json.loads(match.group("payload"))
-    except json.JSONDecodeError as error:
-        raise ReviewOutputError("检视结果不是有效 JSON") from error
 
-
-def _unique_findings(output: ReviewOutput) -> list:
+def _unique_findings(source: list[ReviewFinding]) -> list[ReviewFinding]:
     seen: set[tuple[str, str, int, int, str, str, str]] = set()
     findings = []
-    for finding in output.findings:
+    for finding in source:
         location = (
             finding.file_path,
             finding.line_side,

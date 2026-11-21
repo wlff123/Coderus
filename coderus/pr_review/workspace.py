@@ -293,6 +293,23 @@ class PRWorkspace:
             cwd=workspace,
         )
         parsed = self._parse_changed_ranges(unified_diff)
+        if not unified_diff.strip():
+            raise PRWorkspaceError("PR 在固定比较基准上没有代码变更")
+        commit_messages = await self._run(
+            "git", "log", "-n", "100", "--format=%B", f"{comparison_sha}..HEAD", "--",
+            cwd=workspace,
+        )
+        tree = await self._run(
+            "git", "ls-tree", "-rz", "HEAD", "--", "docs", "specs", ".scratch", cwd=workspace,
+        )
+        extensions = {".md", ".rst", ".txt", ".adoc"}
+        spec_paths = []
+        for entry in tree.split("\0"):
+            metadata, _, path = entry.partition("\t")
+            if metadata.startswith(("100644 blob ", "100755 blob ")):
+                normalized = normalize_repository_path(path)
+                if normalized and Path(normalized).suffix.lower() in extensions:
+                    spec_paths.append(normalized)
         return ReviewInput(
             ranges=ChangedRanges(
                 parsed.ranges,
@@ -303,6 +320,8 @@ class PRWorkspace:
             ),
             unified_diff=unified_diff,
             review_base=REVIEW_BASE,
+            commit_messages=commit_messages,
+            spec_paths=tuple(spec_paths),
         )
 
     async def assert_pristine(

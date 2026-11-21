@@ -78,6 +78,8 @@ class ReviewInput:
     ranges: ChangedRanges
     unified_diff: str
     review_base: str
+    commit_messages: str = ""
+    spec_paths: tuple[str, ...] = ()
 
 
 class ReviewFinding(BaseModel):

@@ -50,7 +50,7 @@ from coderus.pr_review.orchestrator import PRReviewOrchestrator
 from coderus.pr_review.scheduler import PRReviewScheduler
 from coderus.pr_review.workspace import PRWorkspace
 from coderus.release_gate import ReleaseGate
-from coderus.runner import LocalCodexRunner, RunnerConfig, resolve_codex_command
+from coderus.runner import LocalCodexRunner, RunnerConfig, Stage, resolve_codex_command
 from coderus.security import CredentialCipher
 from coderus.web.forge_runtime import build_gitcode_runtime, build_github_runtime
 from coderus.web.presentation import provider_error_message
@@ -467,8 +467,14 @@ def build_runtime(
     model_proxy_app = None
     runner_api_base = "https://api.openai.com/v1"
     if settings.model_api_key is not None:
+        stage_models = (
+            {Stage.PR_REVIEW.value: settings.codex.review_model}
+            if settings.codex.review_model is not None
+            else {}
+        )
         credential_broker = CredentialBroker(
             configured_model=settings.codex.model,
+            stage_models=stage_models,
             default_ttl_seconds=settings.codex.stage_timeout_seconds + 300,
         )
         model_proxy_app = create_proxy_app(
@@ -485,6 +491,7 @@ def build_runtime(
             codex_command=resolve_codex_command(settings.codex.binary),
             api_base_url=runner_api_base,
             model=settings.codex.model,
+            review_model=settings.codex.review_model,
             network_access=settings.runner.network_access,
             reasoning_effort=settings.codex.reasoning_effort,
             sandbox_mode=settings.codex.sandbox_mode,
@@ -530,6 +537,7 @@ def build_runtime(
     pr_review_orchestrator = PRReviewOrchestrator(
         session_factory=sessions,
         forges=state.forges,
+        providers=state.providers,
         runner=limited_runner,
         workspace=PRWorkspace(settings.workspace.root),
         notifier=feishu_client,

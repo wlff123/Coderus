@@ -204,3 +204,17 @@ def test_revoke_last_token_releases_task_stage_budget() -> None:
         second_token, endpoint="/v1/responses", requested_model="test-model"
     )
     second.release()
+
+
+def test_review_lease_permits_only_the_review_model() -> None:
+    broker = CredentialBroker(
+        configured_model="shared-model", stage_models={"pr_review": "gpt-6.2-sol"},
+    )
+    for stage, model, blocked in (
+        ("pr_review", "gpt-6.2-sol", "shared-model"),
+        ("develop", "shared-model", "gpt-6.2-sol"),
+    ):
+        lease = broker.issue(task_id="task-1", stage=stage)
+        with pytest.raises(LeaseRejected, match="does not permit model"):
+            broker.acquire(lease, endpoint="/v1/responses", requested_model=blocked)
+        broker.acquire(lease, endpoint="/v1/responses", requested_model=model).release()

@@ -42,6 +42,7 @@ class PullRequestDetails:
     base_ref: str
     head_ref: str
     head_repository_url: str
+    body: str = ""
 
 
 @dataclass(frozen=True, slots=True)

@@ -2,6 +2,9 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "properties": {
+    "review_completed": {
+      "type": "boolean"
+    },
     "change_summary": {
       "type": "array",
       "minItems": 1,
@@ -74,6 +77,6 @@
       }
     }
   },
-  "required": ["change_summary", "findings"],
+  "required": ["review_completed", "change_summary", "findings"],
   "additionalProperties": false
 }

@@ -4,7 +4,7 @@ import hashlib
 import secrets
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -92,6 +92,7 @@ class CredentialBroker:
         self,
         *,
         configured_model: str,
+        stage_models: Mapping[str, str] | None = None,
         default_ttl_seconds: float = 300,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -100,6 +101,7 @@ class CredentialBroker:
         if default_ttl_seconds <= 0:
             raise ValueError("default_ttl_seconds must be positive")
         self._configured_model = configured_model
+        self._stage_models = dict(stage_models or {})
         self._default_ttl_seconds = default_ttl_seconds
         self._clock = clock
         self._leases_by_digest: dict[bytes, _Lease] = {}
@@ -154,7 +156,7 @@ class CredentialBroker:
                 expires_at=self._clock() + ttl,
                 task_id=task_id,
                 stage=stage,
-                model=self._configured_model,
+                model=self._stage_models.get(stage, self._configured_model),
                 max_concurrency=max_concurrency,
             )
         return token
