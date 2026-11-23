@@ -117,10 +117,27 @@ class ReviewFinding(BaseModel):
         return self
 
 
+class FindingRecheck(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    id: str = Field(pattern=r"^RV-[0-9]+-[0-9]+$")
+    status: Literal["resolved", "open", "needs_confirmation"]
+    reason: str = Field(min_length=1, max_length=500)
+
+    @field_validator("reason")
+    @classmethod
+    def require_evidence(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("复核需要证据")
+        return value
+
+
 class ReviewOutput(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     _comparison_sha: str | None = PrivateAttr(default=None)
+    _rechecks: list[FindingRecheck] = PrivateAttr(default_factory=list)
 
     change_summary: list[str] = Field(min_length=1, max_length=5)
     findings: list[ReviewFinding]

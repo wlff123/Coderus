@@ -650,6 +650,44 @@ async def test_review_input_tracks_modified_added_and_deleted_lines(
     assert ranges.deletions == 4
 
 
+@pytest.mark.asyncio
+async def test_refresh_target_comparison_preserves_the_reviewed_checkout(
+    tmp_path: Path, allow_local_head_repository: None
+) -> None:
+    upstream, base_sha, head_sha = create_upstream(tmp_path)
+    manager = PRWorkspace(tmp_path / "workspaces")
+    workspace = await manager.prepare(
+        3, upstream.as_uri(), 7, "main", base_sha, head_sha, "review-head", upstream.as_uri()
+    )
+    material = await manager.review_input(workspace, base_sha, head_sha)
+    source = tmp_path / "source"
+    git(source, "checkout", "--detach", base_sha)
+    git(source, "commit", "--allow-empty", "-m", "Unrelated target change")
+    git(source, "push", "upstream", "HEAD:refs/heads/main")
+    new_base = git(source, "rev-parse", "HEAD")
+
+    result = await manager.refresh_target_comparison(
+        workspace, upstream.as_uri(), "main", head_sha,
+    )
+
+    assert result == (new_base, material.ranges.comparison_sha)
+    await manager.assert_pristine(workspace, head_sha, base_sha)
+
+
+@pytest.mark.asyncio
+async def test_can_follow_up_requires_ancestor_and_unchanged_standards(tmp_path: Path) -> None:
+    _, base_sha, head_sha = create_upstream(tmp_path)
+    source = tmp_path / "source"
+    manager = PRWorkspace(tmp_path / "workspaces")
+    assert await manager.can_follow_up(source, base_sha, head_sha)
+    assert not await manager.can_follow_up(source, head_sha, base_sha)
+
+    (source / "CONTRIBUTING.md").write_text("New coding standards", encoding="utf-8")
+    git(source, "add", ".")
+    git(source, "commit", "-m", "Update review rules")
+    assert not await manager.can_follow_up(source, head_sha, git(source, "rev-parse", "HEAD"))
+
+
 def test_changed_ranges_ignores_header_like_hunk_content() -> None:
     ranges = PRWorkspace._parse_changed_ranges(
         "\n".join(

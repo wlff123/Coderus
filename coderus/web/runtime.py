@@ -540,6 +540,7 @@ def build_runtime(
         providers=state.providers,
         runner=limited_runner,
         workspace=PRWorkspace(settings.workspace.root),
+        review_model=settings.codex.review_model or settings.codex.model,
         notifier=feishu_client,
         credential_broker=credential_broker,
         stage_timeout_seconds=settings.codex.stage_timeout_seconds,

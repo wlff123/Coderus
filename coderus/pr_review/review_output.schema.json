@@ -15,6 +15,19 @@
         "maxLength": 300
       }
     },
+    "rechecks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "status": { "type": "string", "enum": ["resolved", "open", "needs_confirmation"] },
+          "reason": { "type": "string", "minLength": 1, "maxLength": 500 }
+        },
+        "required": ["id", "status", "reason"],
+        "additionalProperties": false
+      }
+    },
     "findings": {
       "type": "array",
       "items": {
@@ -77,6 +90,6 @@
       }
     }
   },
-  "required": ["review_completed", "change_summary", "findings"],
+  "required": ["review_completed", "change_summary", "findings", "rechecks"],
   "additionalProperties": false
 }

@@ -44,7 +44,7 @@ REVIEW_JSON = json.dumps(
 )
 
 
-def skill_runner_stdout(message: str) -> str:
+def skill_runner_stdout(message: str, diff_base: str = COMPARISON_SHA) -> str:
     try:
         payload = json.loads(message)
     except ValueError:
@@ -60,7 +60,7 @@ def skill_runner_stdout(message: str) -> str:
                     "type": "item.completed",
                     "item": {
                         "type": "command_execution",
-                        "command": f"git diff {COMPARISON_SHA}...HEAD",
+                        "command": f"git diff {diff_base}...HEAD",
                         "exit_code": 0,
                         "status": "completed",
                     },
@@ -191,6 +191,8 @@ class FakeWorkspace:
         self.remote_heads: list[str | None] = []
         self.remote_bases: list[str | None] = []
         self.resolve_calls: list[tuple[str, str]] = []
+        self.refreshed_target: tuple[str, str] | None = None
+        self.can_followup = True
         self.ranges = ChangedRanges(
             {("src/widget.py", "RIGHT"): ((12, 14),)},
             comparison_sha=COMPARISON_SHA,
@@ -222,6 +224,15 @@ class FakeWorkspace:
             raise self.prepare_error
         return self.path
 
+    async def refresh_target_comparison(self, workspace, repository_url, base_ref, head_sha):
+        return self.refreshed_target
+
+    async def can_follow_up(self, workspace, previous_head, head_sha):
+        return self.can_followup
+
+    async def review_document_oid(self, workspace, head_sha, path):
+        return "f" * 40
+
     async def review_input(self, workspace: Path, base_sha: str, head_sha: str):
         return ReviewInput(
             ranges=self.ranges,
@@ -250,6 +261,7 @@ class FakeRunner:
         self.stdout_factory = None
         self.status_factory = None
         self.before_return = None
+        self.diff_base = COMPARISON_SHA
 
     async def run(self, spec, *, cancel_event=None) -> JobResult:
         self.specs.append(spec)
@@ -262,7 +274,7 @@ class FakeRunner:
             job_id=spec.job_id,
             status=status,
             exit_code=0 if status is JobStatus.SUCCEEDED else 1,
-            stdout=skill_runner_stdout(message),
+            stdout=skill_runner_stdout(message, self.diff_base),
             stderr=self.stderr,
             output_truncated=False,
             duration_seconds=0.1,
@@ -588,6 +600,88 @@ async def test_run_reviews_live_branch_tip_when_api_head_lags(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("history_is_linear", [True, False])
+async def test_review_rounds_reuse_and_explicitly_close_prior_findings(
+    engine, session: Session, tmp_path: Path, history_is_linear: bool,
+) -> None:
+    original = add_review_task(session)
+    orchestrator, publisher, workspace, runner, notifier, _ = build_orchestrator(engine, tmp_path)
+
+    def next_task(suffix):
+        task = PRReviewTask(
+            repository_id=original.repository_id, pr_number=original.pr_number,
+            pr_url=original.pr_url, status="queued", source_chat_id="chat-1",
+            source_message_id=f"round-{suffix}", source_sender_open_id="sender-1",
+        )
+        session.add(task)
+        session.commit()
+        return task.id
+
+    await orchestrator.run(original.id)
+    session.expire_all()
+    baseline = session.get(PRReviewTask, original.id)
+    old_id = baseline.structured_result["review_history"]["open_findings"][0]["id"]
+    assert baseline.structured_result["review_history"]["mode"] == "full"
+
+    reused = next_task("same-commit")
+    await orchestrator.run(reused)
+    session.expire_all()
+    cached = session.get(PRReviewTask, reused)
+    assert cached.status == "completed"
+    assert cached.comment_url == baseline.comment_url
+    assert cached.structured_result["review_history"]["mode"] == "reused"
+    assert cached.structured_result["findings"] == []
+    assert len(runner.specs) == len(publisher.comment_calls) == 1
+    assert "沿用结果" in notifier.messages[-1][2]
+
+    next_head = "e" * 40
+    publisher.details = replace(publisher.details, head_sha=next_head)
+    workspace.can_followup = history_is_linear
+    runner.diff_base = HEAD_SHA if history_is_linear else COMPARISON_SHA
+    payload = json.loads(REVIEW_JSON)
+    payload["rechecks"] = [{"id": old_id, "status": "open", "reason": "当前代码仍会读取空值。"}]
+    runner.stdout = json.dumps(payload, ensure_ascii=False)  # Duplicate finding is suppressed.
+    followup = next_task("still-open")
+    await orchestrator.run(followup)
+    session.expire_all()
+    checked = session.get(PRReviewTask, followup)
+    assert checked.status == "completed"
+    assert checked.structured_result["review_history"]["mode"] == (
+        "followup" if history_is_linear else "full"
+    )
+    assert checked.structured_result["findings"] == []
+    assert len(runner.specs) == len(publisher.comment_calls) == 2
+    expected_diff_base = HEAD_SHA if history_is_linear else "coderus-review-base"
+    assert f"git diff {expected_diff_base}...HEAD" in runner.specs[-1].prompt
+    assert old_id in runner.specs[-1].review_context
+    assert "仍待处理 1 条" in publisher.comment_calls[-1]["body"]
+    assert "这里可能读取空值" not in publisher.comment_calls[-1]["body"]
+
+    publisher.details = replace(publisher.details, head_sha="f" * 40)
+    workspace.can_followup = True
+    runner.diff_base = next_head
+    payload["findings"] = []
+    payload["rechecks"] = []
+    runner.stdout = json.dumps(payload, ensure_ascii=False)
+    incomplete = next_task("missing-check")
+    await orchestrator.run(incomplete)
+    session.expire_all()
+    assert session.get(PRReviewTask, incomplete).status == "failed"
+    assert len(publisher.comment_calls) == 2
+
+    payload["rechecks"] = [{"id": old_id, "status": "resolved", "reason": "读取前已校验空值。"}]
+    runner.stdout = json.dumps(payload, ensure_ascii=False)
+    resolved = next_task("resolved")
+    await orchestrator.run(resolved)
+    session.expire_all()
+    final = session.get(PRReviewTask, resolved)
+    assert final.status == "completed"
+    assert final.structured_result["review_history"]["open_findings"] == []
+    assert "已解决 1 条" in publisher.comment_calls[-2]["body"]
+    assert publisher.comment_calls[-1]["body"].startswith("/lgtm\n")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "final_base, succeeds", [("d" * 40, True), ("e" * 40, False), (None, False)]
 )
@@ -604,6 +698,49 @@ async def test_live_base_overrides_stale_api_and_is_rechecked(
     assert workspace.prepare_calls[0]["base_sha"] == "d" * 40
     assert persisted.status == ("completed" if succeeds else "failed")
     assert bool(publisher.comment_calls) == succeeds
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("comparison", "last_head", "error"),
+    [
+        (COMPARISON_SHA, HEAD_SHA, None),
+        ("d" * 40, HEAD_SHA, "改变了检视基准"),
+        (COMPARISON_SHA, "e" * 40, "源分支有新提交"),
+        (COMPARISON_SHA, None, "无法确认源分支"),
+    ],
+)
+async def test_target_advances_before_publication(
+    engine, session: Session, tmp_path: Path, comparison, last_head, error,
+) -> None:
+    task = add_review_task(session)
+    target = "f" * 40
+    publisher = FakePublisher(engine)
+    # The API reports the update when ls-remote cannot read the target tip.
+    publisher.details_sequence = [publisher.details, replace(publisher.details, base_sha=target)]
+    orchestrator, _, workspace, runner, *_ = build_orchestrator(
+        engine, tmp_path, publisher=publisher,
+    )
+    workspace.remote_bases = [BASE_SHA, None]
+    workspace.remote_heads = [HEAD_SHA, HEAD_SHA, last_head]
+    workspace.refreshed_target = (target, comparison)
+
+    await orchestrator.run(task.id)
+
+    session.expire_all()
+    persisted = session.get(PRReviewTask, task.id)
+    assert len(runner.specs) == 1
+    assert persisted.base_sha == BASE_SHA
+    if error:
+        assert persisted.status == "failed"
+        assert error in persisted.failure_summary
+        assert publisher.comment_calls == []
+    else:
+        assert persisted.status == "completed"
+        audit = persisted.structured_result["review_audit"]
+        assert audit["comparison_sha"] == COMPARISON_SHA
+        assert audit["publication_base_sha"] == target
+        assert len(publisher.comment_calls) == 1
 
 
 @pytest.mark.asyncio
@@ -1229,10 +1366,22 @@ async def test_lost_transition_claim_returns_without_overwriting_or_notifying(
     [
         ("closed", False, BASE_SHA, HEAD_SHA, "main", "feature/review", None, "PR 已关闭"),
         ("closed", True, BASE_SHA, HEAD_SHA, "main", "feature/review", None, "PR 已合并"),
-        ("open", False, BASE_SHA, "c" * 40, "main", "feature/review", None, "PR 版本已变化"),
-        ("open", False, "c" * 40, HEAD_SHA, "main", "feature/review", None, "PR 版本已变化"),
-        ("open", False, BASE_SHA, HEAD_SHA, "release", "feature/review", None, "PR 版本已变化"),
-        ("open", False, BASE_SHA, HEAD_SHA, "main", "feature/changed", None, "PR 版本已变化"),
+        (
+            "open", False, BASE_SHA, "c" * 40, "main", "feature/review", None,
+            "无法确认源分支仍是已检视的版本，请重新发起检视",
+        ),
+        (
+            "open", False, "c" * 40, HEAD_SHA, "main", "feature/review", None,
+            "目标分支已更新，但无法核对检视基准，请重新发起检视",
+        ),
+        (
+            "open", False, BASE_SHA, HEAD_SHA, "release", "feature/review", None,
+            "PR 的目标分支已切换，请重新发起检视",
+        ),
+        (
+            "open", False, BASE_SHA, HEAD_SHA, "main", "feature/changed", None,
+            "PR 的源分支或来源仓库已切换，请重新发起检视",
+        ),
         (
             "open",
             False,
@@ -1241,7 +1390,7 @@ async def test_lost_transition_claim_returns_without_overwriting_or_notifying(
             "main",
             "feature/review",
             "https://github.com/other/widgets-1.git",
-            "PR 版本已变化",
+            "PR 的源分支或来源仓库已切换，请重新发起检视",
         ),
     ],
 )

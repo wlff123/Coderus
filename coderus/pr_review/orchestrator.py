@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import secrets
 import threading
@@ -10,14 +11,21 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol, cast
 
-from sqlalchemy import case, update
+from sqlalchemy import case, select, update
 from sqlalchemy.orm import Session
 
-from coderus.forge import ForgeRegistry, ProviderName, Repository
+from coderus.forge import ForgeRegistry, ProviderName, PullRequestDetails, Repository
 from coderus.model_proxy import issued_stage_token
 from coderus.models import PRReviewTask
+from coderus.pr_review.history import (
+    REVIEW_HISTORY_VERSION,
+    PreviousReview,
+    TrackedFinding,
+    apply_rechecks,
+    scope_digest,
+)
 from coderus.pr_review.instructions import ReviewAxis, build_review_instructions
-from coderus.pr_review.models import ReviewInput, ReviewOutput
+from coderus.pr_review.models import FindingRecheck, ReviewFinding, ReviewInput, ReviewOutput
 from coderus.pr_review.result import (
     ReviewOutputError,
     parse_review_output,
@@ -98,6 +106,7 @@ class PRReviewOrchestrator:
         stage_timeout_seconds: float = 3600,
         model_secrets: tuple[str, ...] = (),
         providers: Mapping[str, object] | None = None,
+        review_model: str | None = None,
     ) -> None:
         self.sessions = session_factory
         self.forges = forges
@@ -108,6 +117,7 @@ class PRReviewOrchestrator:
         self.stage_timeout_seconds = stage_timeout_seconds
         self._model_secrets = model_secrets
         self.providers = providers if providers is not None else {}
+        self.review_model = review_model
 
     async def run(self, task_id: int) -> None:
         claim_token = self._claim(task_id)
@@ -128,7 +138,6 @@ class PRReviewOrchestrator:
                 details = await self.forges.require(task.provider).get_pull_request(
                     task.owner, task.name, task.pr_number
                 )
-                api_head_sha = details.head_sha
                 live_head = await self.workspace.resolve_remote_head(
                     details.head_repository_url, details.head_ref
                 )
@@ -200,14 +209,37 @@ class PRReviewOrchestrator:
                     pr_body=details.body,
                 )
                 self._assert_claim(task_id, claim_token, claim_lost)
+                previous = self._previous_review(task_id)
+                scope = await self._review_scope(
+                    prepared, details, ranges.comparison_sha, spec_source,
+                )
+                matches_scope = (
+                    previous is not None and scope is not None and previous.scope == scope
+                )
+                if matches_scope and previous is not None and previous.head_sha == details.head_sha:
+                    await self._revalidate_publication(
+                        task, prepared, details, ranges.comparison_sha,
+                    )
+                    self._assert_claim(task_id, claim_token, claim_lost)
+                    self._complete(
+                        task_id, state, claim_token, previous.comment_url,
+                        structured_result=previous.reuse_result(),
+                    )
+                    await self._notify(
+                        task.id,
+                        task.source_chat_id,
+                        f"RV-{task.id} 当前版本已检视，沿用结果：{previous.comment_url}",
+                        expected_status="completed",
+                    )
+                    return
+                previous_head = None
+                if matches_scope and previous is not None and await self.workspace.can_follow_up(
+                    prepared, previous.head_sha, details.head_sha,
+                ):
+                    previous_head = previous.head_sha
                 reports = await self._run_review_axes(
-                    task,
-                    prepared,
-                    ranges.comparison_sha,
-                    details.head_sha,
-                    material,
-                    claim_lost,
-                    spec_source,
+                    task, prepared, ranges.comparison_sha, details.head_sha,
+                    material, claim_lost, spec_source, previous, previous_head,
                 )
                 self._assert_claim(task_id, claim_token, claim_lost)
                 await self.workspace.assert_pristine(
@@ -216,48 +248,37 @@ class PRReviewOrchestrator:
                     ranges.comparison_sha,
                 )
                 self._assert_claim(task_id, claim_token, claim_lost)
-                validated = [validate_findings(report, ranges) for report, _ in reports]
-                generated_count = sum(len(report.findings) for report, _ in reports)
+                review_secrets = self._model_secrets + tuple(token for _, token in reports if token)
+                sensitive = self._sensitive_values(prepared, review_secrets)
+                prior = previous.open_findings if previous else ()
+                reviews = [
+                    self._without_repeats(axis, report, prior)
+                    for axis, (report, _) in zip(("standards", "spec"), reports, strict=False)
+                ]
+                rechecks = [check for report in reviews for check in report._rechecks]
+                checked = [
+                    (item, check.model_copy(update={
+                        "reason": self._redact_text(check.reason, sensitive),
+                    }))
+                    for item, check in apply_rechecks(prior, rechecks)
+                ]
+                validated = [validate_findings(report, ranges) for report in reviews]
+                generated_count = sum(len(report.findings) for report in reviews)
                 output = validated[0].model_copy(update={
                     "findings": [finding for report in validated for finding in report.findings],
                 })
                 standards_count = len(validated[0].findings)
                 pending_findings = []
-                for axis, (report, _) in zip(("standards", "spec"), reports, strict=False):
+                for axis, report in zip(("standards", "spec"), reviews, strict=False):
                     pending_findings.extend(
                         {**item, "review_axis": axis} for item in unlocated_findings(report, ranges)
                     )
                 filtered_finding_count = len(pending_findings)
 
                 self._assert_claim(task_id, claim_token, claim_lost)
-                current = await self.forges.require(task.provider).get_pull_request(
-                    task.owner, task.name, task.pr_number
+                publication_base = await self._revalidate_publication(
+                    task, prepared, details, ranges.comparison_sha,
                 )
-                self._validate_pr(
-                    current,
-                    expected_base_ref=details.base_ref,
-                    expected_head_ref=details.head_ref,
-                    expected_head_repository_url=details.head_repository_url,
-                )
-                # 头部版本以源分支实际 tip 为准；分支不可达时退回平台元数据，
-                # 并容忍 API 仍返回检视开始前的滞后值。
-                current_head = await self.workspace.resolve_remote_head(
-                    details.head_repository_url, details.head_ref
-                )
-                if current_head is not None:
-                    if current_head != details.head_sha:
-                        raise PRReviewError("检视期间源分支有新提交，请重新发起检视")
-                elif current.head_sha not in {details.head_sha, api_head_sha}:
-                    raise PRReviewError("PR 版本已变化")
-                current_base = await self.workspace.resolve_remote_head(
-                    task.repository_url, details.base_ref
-                )
-                if current_base is not None:
-                    if current_base != details.base_sha:
-                        raise PRReviewError("检视期间目标分支有新提交，请重新发起检视")
-                elif current.base_sha != details.base_sha:
-                    raise PRReviewError("PR 版本已变化")
-                review_secrets = self._model_secrets + tuple(token for _, token in reports if token)
                 output = self._redact_output(output, None, prepared, review_secrets)
                 for item in pending_findings:
                     pending_output = ReviewOutput(
@@ -286,6 +307,37 @@ class PRReviewOrchestrator:
                     "validated_findings": len(output.findings),
                     "filtered_findings": filtered_finding_count,
                 }
+                if publication_base != details.base_sha:
+                    structured_result["review_audit"]["publication_base_sha"] = publication_base
+                new_findings = [
+                    ("standards" if index < standards_count else "spec", finding)
+                    for index, finding in enumerate(output.findings)
+                ]
+                new_findings.extend(
+                    (item["review_axis"], ReviewFinding.model_validate(item["finding"]))
+                    for item in pending_findings
+                )
+                tracked = [
+                    TrackedFinding(
+                        id=f"RV-{task_id}-{index}",
+                        axis=axis,
+                        head_sha=details.head_sha,
+                        comparison_sha=ranges.comparison_sha,
+                        finding=finding,
+                    )
+                    for index, (axis, finding) in enumerate(new_findings, 1)
+                ]
+                outstanding = [item for item, check in checked if check.status != "resolved"]
+                structured_result["review_history"] = {
+                    "version": REVIEW_HISTORY_VERSION,
+                    "mode": "followup" if previous_head else "full",
+                    "scope": scope,
+                    "previous_task_id": previous.task_id if previous else None,
+                    "open_findings": [
+                        item.model_dump(mode="json") for item in [*outstanding, *tracked]
+                    ],
+                    "rechecks": [check.model_dump(mode="json") for _, check in checked],
+                }
                 self._set_commenting(
                     task_id,
                     state,
@@ -309,6 +361,9 @@ class PRReviewOrchestrator:
                     pending_findings=pending_findings,
                     standards_count=standards_count,
                     spec_reviewed=spec_source is not None,
+                    previous=previous,
+                    checked=checked,
+                    incremental=previous_head is not None,
                 )
                 self._assert_claim(task_id, claim_token, claim_lost)
                 comment = await asyncio.wait_for(
@@ -317,7 +372,7 @@ class PRReviewOrchestrator:
                     ),
                     timeout=COMMENT_TIMEOUT_SECONDS,
                 )
-                if not generated_count:
+                if not generated_count and not outstanding:
                     lgtm_marker = (
                         f"<!-- coderus-pr-review-lgtm:{details.head_sha} -->"
                     )
@@ -389,6 +444,124 @@ class PRReviewOrchestrator:
             claim_lost.set()
             raise _ClaimLost
 
+    def _previous_review(self, task_id: int) -> PreviousReview | None:
+        with self.sessions() as session:
+            task = session.get(PRReviewTask, task_id)
+            row = session.execute(
+                select(
+                    PRReviewTask.id, PRReviewTask.head_sha, PRReviewTask.comment_url,
+                    PRReviewTask.structured_result,
+                )
+                .where(
+                    PRReviewTask.repository_id == task.repository_id,
+                    PRReviewTask.pr_number == task.pr_number,
+                    PRReviewTask.id != task_id,
+                    PRReviewTask.status == "completed",
+                )
+                .order_by(PRReviewTask.finished_at.desc(), PRReviewTask.id.desc())
+                .limit(1)
+            ).first()
+        return PreviousReview.load(*row) if row is not None else None
+
+    async def _review_scope(
+        self, workspace: Path, details: PullRequestDetails, comparison_sha: str,
+        spec_source: SpecSource | None,
+    ) -> str | None:
+        spec_reference = spec_value = ""
+        if spec_source is not None:
+            spec_reference = spec_source.reference
+            if spec_source.text is not None:
+                spec_value = spec_source.text
+            else:
+                oid = await self.workspace.review_document_oid(
+                    workspace, details.head_sha, spec_reference,
+                )
+                if oid is None:
+                    return None
+                spec_value = oid
+        return scope_digest(
+            str(REVIEW_HISTORY_VERSION), self.review_model or "", comparison_sha, details.base_ref,
+            details.head_ref, details.head_repository_url, spec_reference, spec_value,
+        )
+
+    @staticmethod
+    def _without_repeats(
+        axis: str, report: ReviewOutput, prior: tuple[TrackedFinding, ...],
+    ) -> ReviewOutput:
+        repeated = set()
+        fresh = []
+        for finding in report.findings:
+            matches = [item for item in prior if item.axis == axis and item.matches(finding)]
+            if len(matches) == 1:
+                repeated.add(matches[0].id)
+            else:
+                fresh.append(finding)
+        if not repeated:
+            return report
+        output = report.model_copy(update={"findings": fresh})
+        output._rechecks = [
+            FindingRecheck(
+                id=check.id, status="needs_confirmation",
+                reason="本轮又报告了同一问题，需确认是否已解决。",
+            )
+            if check.id in repeated and check.status == "resolved"
+            else check
+            for check in report._rechecks
+        ]
+        return output
+
+    async def _revalidate_publication(
+        self, task: _TaskContext, workspace: Path, details: PullRequestDetails, comparison_sha: str,
+    ) -> str:
+        current = await self.forges.require(task.provider).get_pull_request(
+            task.owner, task.name, task.pr_number,
+        )
+        self._validate_pr(
+            current,
+            expected_base_ref=details.base_ref,
+            expected_head_ref=details.head_ref,
+            expected_head_repository_url=details.head_repository_url,
+        )
+        current_head = await self.workspace.resolve_remote_head(
+            details.head_repository_url, details.head_ref,
+        )
+        if current_head is not None and current_head != details.head_sha:
+            raise PRReviewError("检视期间源分支有新提交，请重新发起检视")
+        if current_head is None and current.head_sha != details.head_sha:
+            raise PRReviewError("无法确认源分支仍是已检视的版本，请重新发起检视")
+        current_base = await self.workspace.resolve_remote_head(
+            task.repository_url, details.base_ref,
+        )
+        if (current_base or current.base_sha) == details.base_sha:
+            return details.base_sha
+        return await self._verify_target_update(task, workspace, details, comparison_sha)
+
+    async def _verify_target_update(
+        self, task: _TaskContext, workspace: Path, details: PullRequestDetails, comparison_sha: str,
+    ) -> str:
+        refreshed = await self.workspace.refresh_target_comparison(
+            workspace, task.repository_url, details.base_ref, details.head_sha,
+        )
+        if refreshed is None:
+            raise PRReviewError("目标分支已更新，但无法核对检视基准，请重新发起检视")
+        target_sha, new_comparison = refreshed
+        if new_comparison != comparison_sha:
+            raise PRReviewError("目标分支更新改变了检视基准，请重新发起检视")
+
+        # Fetching the target introduces another window in which the source can move.
+        try:
+            async with asyncio.timeout(15):
+                head = await self.workspace.resolve_remote_head(
+                    details.head_repository_url, details.head_ref,
+                )
+        except TimeoutError:
+            head = None
+        if head is None:
+            raise PRReviewError("无法确认源分支仍是已检视的版本，请重新发起检视")
+        if head != details.head_sha:
+            raise PRReviewError("检视期间源分支有新提交，请重新发起检视")
+        return target_sha
+
     async def _run_review_axes(
         self,
         task: _TaskContext,
@@ -398,10 +571,13 @@ class PRReviewOrchestrator:
         material: ReviewInput,
         claim_lost: asyncio.Event,
         spec_source: SpecSource | None,
+        previous: PreviousReview | None,
+        previous_head: str | None,
     ) -> list[tuple[ReviewOutput, str | None]]:
         async def review(axis: ReviewAxis, source: SpecSource | None = None):
             return await self._run_review(
-                task, workspace, base_sha, head_sha, material, claim_lost, axis, source
+                task, workspace, base_sha, head_sha, material, claim_lost, axis, source,
+                previous.for_axis(axis) if previous else (), previous_head,
             )
 
         if spec_source is None:
@@ -428,6 +604,8 @@ class PRReviewOrchestrator:
         claim_lost: asyncio.Event,
         axis: ReviewAxis,
         spec_source: SpecSource | None,
+        previous_findings: tuple[TrackedFinding, ...],
+        previous_head: str | None,
     ) -> tuple[ReviewOutput, str | None]:
         prompt = build_review_instructions(
             provider=task.provider,
@@ -438,7 +616,16 @@ class PRReviewOrchestrator:
             head_sha=head_sha,
             material=material,
             axis=axis,
+            previous_head=previous_head,
+            recheck_previous=bool(previous_findings),
         )
+        context = spec_source.prompt() if spec_source else None
+        if previous_findings:
+            history = json.dumps(
+                {"previous_findings": [item.prompt_data() for item in previous_findings]},
+                ensure_ascii=False,
+            )
+            context = f"{context}\n{history}" if context else history
         with issued_stage_token(
             self.credential_broker,
             task_id=f"task-{task.id}",
@@ -459,7 +646,7 @@ class PRReviewOrchestrator:
                 output_schema=review_output_schema_path(),
                 proxy_token=token,
                 review_base=material.review_base,
-                review_context=spec_source.prompt() if spec_source else None,
+                review_context=context,
             )
 
             async def run_agent():
@@ -519,7 +706,11 @@ class PRReviewOrchestrator:
                 if result.output_truncated:
                     raise ReviewOutputError("检视输出被截断")
                 return (
-                    parse_review_output(result.stdout, comparison_sha=base_sha),
+                    parse_review_output(
+                        result.stdout, comparison_sha=previous_head or base_sha,
+                        incremental=previous_head is not None,
+                        previous_ids=tuple(item.id for item in previous_findings),
+                    ),
                     token,
                 )
             except ReviewOutputError as exc:
@@ -604,7 +795,10 @@ class PRReviewOrchestrator:
             structured_result=result,
         )
 
-    def _complete(self, task_id: int, expected: str, claim_token: str, comment_url: str) -> None:
+    def _complete(
+        self, task_id: int, expected: str, claim_token: str, comment_url: str,
+        *, structured_result: dict | None = None,
+    ) -> None:
         self._expected_update(
             task_id,
             expected,
@@ -616,6 +810,7 @@ class PRReviewOrchestrator:
             failure_code=None,
             failure_summary=None,
             finished_at=datetime.now(UTC),
+            **({"structured_result": structured_result} if structured_result is not None else {}),
         )
 
     def _expected_update(self, task_id: int, expected: str, owner_token: str, **values) -> None:
@@ -698,10 +893,8 @@ class PRReviewOrchestrator:
 
     @staticmethod
     def _validate_pr(
-        details,
+        details: PullRequestDetails,
         *,
-        expected_base_sha: str | None = None,
-        expected_head_sha: str | None = None,
         expected_base_ref: str | None = None,
         expected_head_ref: str | None = None,
         expected_head_repository_url: str | None = None,
@@ -710,35 +903,25 @@ class PRReviewOrchestrator:
             raise PRReviewError("PR 已合并")
         if details.state != "open":
             raise PRReviewError("PR 已关闭")
+        if expected_base_ref is not None and details.base_ref != expected_base_ref:
+            raise PRReviewError("PR 的目标分支已切换，请重新发起检视")
         if (
-            (expected_base_sha is not None and details.base_sha != expected_base_sha)
-            or (expected_head_sha is not None and details.head_sha != expected_head_sha)
-            or (expected_base_ref is not None and details.base_ref != expected_base_ref)
-            or (expected_head_ref is not None and details.head_ref != expected_head_ref)
+            (expected_head_ref is not None and details.head_ref != expected_head_ref)
             or (
                 expected_head_repository_url is not None
                 and details.head_repository_url != expected_head_repository_url
             )
         ):
-            raise PRReviewError("PR 版本已变化")
+            raise PRReviewError("PR 的源分支或来源仓库已切换，请重新发起检视")
 
     @staticmethod
     def _redact_output(
         output: ReviewOutput, proxy_token: str | None, workspace: Path,
         extra_secrets: tuple[str, ...] = (),
     ) -> ReviewOutput:
-        absolute = str(Path(workspace).resolve())
-        sensitive = {
-            value
-            for value in (
-                proxy_token,
-                *extra_secrets,
-                absolute,
-                absolute.replace("\\", "/"),
-                absolute.replace("/", "\\"),
-            )
-            if value
-        }
+        sensitive = PRReviewOrchestrator._sensitive_values(workspace, extra_secrets)
+        if proxy_token:
+            sensitive.add(proxy_token)
 
         def redact(value):
             if isinstance(value, str):
@@ -750,6 +933,14 @@ class PRReviewOrchestrator:
             return value
 
         return ReviewOutput.model_validate(redact(output.model_dump(mode="json")))
+
+    @staticmethod
+    def _sensitive_values(workspace: Path, secrets: tuple[str, ...]) -> set[str]:
+        absolute = str(workspace.resolve())
+        return {
+            value for value in (*secrets, absolute, absolute.replace("\\", "/"),
+                                absolute.replace("/", "\\")) if value
+        }
 
     @staticmethod
     async def _wait_upstream_retry(claim_lost: asyncio.Event) -> None:

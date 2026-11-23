@@ -5,14 +5,15 @@ import json
 import re
 import shlex
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from pydantic import ValidationError
 
 from coderus.forge import ProviderName
 from coderus.tasks.error_codes import TaskErrorCode
 
-from .models import ChangedRanges, ReviewFinding, ReviewOutput
+from .history import PreviousReview, TrackedFinding
+from .models import ChangedRanges, FindingRecheck, ReviewFinding, ReviewOutput
 
 MAX_REVIEW_OUTPUT_CHARS = 65_536
 _SAFE_DIFF_OPTIONS = {
@@ -46,7 +47,10 @@ def review_output_schema_path() -> Path:
     return Path(__file__).with_name("review_output.schema.json")
 
 
-def parse_review_output(stdout: str, *, comparison_sha: str) -> ReviewOutput:
+def parse_review_output(
+    stdout: str, *, comparison_sha: str, incremental: bool = False,
+    previous_ids: tuple[str, ...] = (),
+) -> ReviewOutput:
     message = None
     inspected = False
     completed = False
@@ -72,7 +76,7 @@ def parse_review_output(stdout: str, *, comparison_sha: str) -> ReviewOutput:
             and item.get("status") == "completed"
             and item.get("exit_code") == 0
             and isinstance(item.get("command"), str)
-            and _is_fixed_base_git_diff(item["command"], comparison_sha)
+            and _is_fixed_base_git_diff(item["command"], comparison_sha, incremental)
         ):
             inspected = True
 
@@ -91,12 +95,20 @@ def parse_review_output(stdout: str, *, comparison_sha: str) -> ReviewOutput:
     if decoded.pop("review_completed", None) is not True:
         raise ReviewOutputError("Codex 未确认检视完成")
     try:
-        return ReviewOutput.model_validate(decoded)
+        entries = decoded.pop("rechecks", [])
+        if not isinstance(entries, list):
+            raise ReviewOutputError("历史意见复核格式无效")
+        rechecks = [FindingRecheck.model_validate(item) for item in entries]
+        output = ReviewOutput.model_validate(decoded)
     except ValidationError as error:
         raise ReviewOutputError("检视结果格式无效") from error
+    if sorted(entry.id for entry in rechecks) != sorted(previous_ids):
+        raise ReviewOutputError("历史意见复核缺失、重复或编号不匹配")
+    output._rechecks = rechecks
+    return output
 
 
-def _is_fixed_base_git_diff(command: str, comparison_sha: str) -> bool:
+def _is_fixed_base_git_diff(command: str, comparison_sha: str, incremental: bool = False) -> bool:
     try:
         tokens = shlex.split(command)
         if tokens and Path(tokens[0]).name in {"bash", "dash", "sh", "zsh"}:
@@ -120,6 +132,8 @@ def _is_fixed_base_git_diff(command: str, comparison_sha: str) -> bool:
                 return False
         else:
             revisions.append(token)
+    if incremental:
+        return revisions == [f"{comparison_sha}...HEAD"]
     return revisions in [[f"{comparison_sha}...HEAD"], ["coderus-review-base...HEAD"]]
 
 
@@ -176,6 +190,9 @@ def render_pr_comment(
     pending_findings: list[dict] | None = None,
     standards_count: int | None = None,
     spec_reviewed: bool = False,
+    previous: PreviousReview | None = None,
+    checked: list[tuple[TrackedFinding, FindingRecheck]] | None = None,
+    incremental: bool = False,
 ) -> tuple[str, str]:
     hosts = {"github": "github.com", "gitcode": "gitcode.com"}
     if provider not in hosts:
@@ -202,6 +219,12 @@ def render_pr_comment(
         "## Coderus 代码检视",
         f"- 检视版本：{_code_span(head_sha)}",
     ]
+    if previous:
+        mode = "复检" if incremental else "全量检视（含历史复核）"
+        previous_link = _previous_review_link(previous, hosts[provider])
+        sections.append(f"- 本轮模式：{mode}，对照 {previous_link}")
+    elif standards_count is not None:
+        sections.append("- 本轮模式：全量检视")
     if changed_file_count is not None:
         input_summary = f"{changed_file_count} 个变更文件"
         if additions is not None and deletions is not None:
@@ -217,6 +240,13 @@ def render_pr_comment(
         sections[-1] = (
             f"- 结论：{count} 条已定位意见；"
             f"{len(pending_findings)} 条意见待人工确认（位置未验证）"
+        )
+    if previous:
+        statuses = [check.status for _, check in checked or ()]
+        sections[-1] = (
+            f"- 本轮结果：新增 {count} 条，已解决 {statuses.count('resolved')} 条，"
+            f"仍待处理 {statuses.count('open')} 条，"
+            f"待人工确认 {statuses.count('needs_confirmation') + len(pending_findings or ())} 条。"
         )
 
     index = 0
@@ -241,6 +271,15 @@ def render_pr_comment(
                 comparison_sha or output._comparison_sha or base_sha, head_sha,
             ))
 
+    if checked:
+        labels = {"resolved": "已解决", "open": "仍待处理", "needs_confirmation": "待人工确认"}
+        sections.extend(["", "## 历史意见复核"])
+        for old, check in checked:
+            sections.append(
+                f"- {labels[check.status]} · `{old.id}` {_escape_markdown(old.finding.title)}："
+                f"{_escape_markdown(check.reason)}"
+            )
+
     if pending_findings:
         sections.extend(["", "## 待人工确认（位置未验证）", "",
                          "以下为模型提出的疑似问题，尚未确认其位置及有效性，不作为已确认缺陷。"])
@@ -262,6 +301,17 @@ def render_pr_comment(
             ])
     sections.extend(["", "> 本次为静态代码检视，未执行项目测试。", marker])
     return "\n".join(sections), marker
+
+
+def _previous_review_link(previous: PreviousReview, host: str) -> str:
+    label = f"RV-{previous.comment_task_id}"
+    try:
+        url = urlsplit(previous.comment_url)
+    except ValueError:
+        return label
+    if url.scheme != "https" or url.netloc != host:
+        return label
+    return f"[{label}]({quote(previous.comment_url, safe=':/?#=%&@-_.~')})"
 
 
 def _render_finding(

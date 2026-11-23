@@ -154,6 +154,72 @@ class PRWorkspace:
                 return sha
         return None
 
+    async def refresh_target_comparison(
+        self,
+        workspace: Path,
+        repository_url: str,
+        base_ref: str,
+        head_sha: str,
+    ) -> tuple[str, str] | None:
+        """Return the fetched target tip and its single merge base with the reviewed head."""
+        PRWorkspace._validate_head_repository_url(repository_url)
+        self._validate_revisions(head_sha, head_sha)
+        if not self._is_safe_ref(base_ref):
+            raise ValueError("base_ref must be a single safe Git ref")
+
+        try:
+            async with asyncio.timeout(30):
+                await self._run(
+                    "git", "fetch", "--force", "--no-tags", "--", repository_url,
+                    f"refs/heads/{base_ref}", cwd=workspace,
+                )
+                target = (
+                    await self._run("git", "rev-parse", "FETCH_HEAD^{commit}", cwd=workspace)
+                ).strip()
+                if _SHA.fullmatch(target) is None:
+                    return None
+                comparison = (
+                    await self._run("git", "merge-base", "--all", target, head_sha, cwd=workspace)
+                ).strip()
+        except (PRWorkspaceError, TimeoutError):
+            return None
+        if _SHA.fullmatch(comparison) is None:
+            return None
+        return target.lower(), comparison.lower()
+
+    async def can_follow_up(self, workspace: Path, previous_head: str, head_sha: str) -> bool:
+        self._validate_revisions(previous_head, head_sha)
+        try:
+            merge_base = (
+                await self._run("git", "merge-base", previous_head, head_sha, cwd=workspace)
+            ).strip()
+            if merge_base != previous_head:
+                return False
+            paths = await self._run(
+                "git", "diff", "--name-only", "--no-renames", "-z", previous_head, head_sha, "--",
+                cwd=workspace,
+            )
+        except PRWorkspaceError:
+            return False
+        standards_files = {
+            "agents.md", "coding_standards.md", "contributing.md", "style_guide.md",
+            "style-guide.md", ".editorconfig",
+        }
+        return not any(path.rsplit("/", 1)[-1].casefold() in standards_files
+                       for path in paths.split("\0"))
+
+    async def review_document_oid(self, workspace: Path, head_sha: str, path: str) -> str | None:
+        self._validate_revisions(head_sha, head_sha)
+        if normalize_repository_path(path) != path:
+            return None
+        try:
+            oid = (
+                await self._run("git", "rev-parse", "--verify", f"{head_sha}:{path}", cwd=workspace)
+            ).strip()
+        except PRWorkspaceError:
+            return None
+        return oid if _SHA.fullmatch(oid) else None
+
     async def prepare(self, *args, **kwargs) -> Path:
         task_id = kwargs.get("task_id", args[0] if args else None)
         token = _TASK_ID.set(task_id)

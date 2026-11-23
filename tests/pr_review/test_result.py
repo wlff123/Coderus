@@ -90,7 +90,7 @@ def _parse_message(message: str) -> ReviewOutput:
 def test_review_output_schema_is_packaged_with_the_parser() -> None:
     schema = review_output_schema_path()
     assert json.loads(schema.read_text(encoding="utf-8"))["required"] == [
-        "review_completed", "change_summary", "findings",
+        "review_completed", "change_summary", "findings", "rechecks",
     ]
 
 
