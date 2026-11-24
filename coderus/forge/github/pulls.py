@@ -24,6 +24,7 @@ from coderus.forge.models import (
     PublishResult,
     PullRequestDetails,
 )
+from coderus.forge.pr_commits import pull_request_commit_shas
 
 _NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\Z")
 _INVALID_REF_CHARACTERS = re.compile(r"[\x00-\x20\x7f~^:?*\[\\]")
@@ -295,6 +296,16 @@ class GitHubPublisher:
         )
         return PRCommentResult(url=url, created=True)
 
+    def list_pull_request_commits(
+        self, upstream_owner: str, repository_name: str, pr_number: int
+    ) -> frozenset[str]:
+        self._validate_name(upstream_owner, "upstream owner")
+        self._validate_name(repository_name, "repository name")
+        self._validate_pr_number(pr_number)
+        url = f"https://api.github.com/repos/{upstream_owner}/{repository_name}/pulls/{pr_number}"
+        pages = self._get_list_pages(f"{url}/commits", params={})
+        return pull_request_commit_shas(row for page in pages for row in page)
+
     def _push(self, workspace: Path, fork_url: str, branch: str) -> None:
         self._git_pusher.push(workspace, fork_url, branch)
 
@@ -548,6 +559,7 @@ class GitHubPublisher:
             head_ref=head_ref,
             head_repository_url=head_repository_url,
             body=payload["body"] if isinstance(payload.get("body"), str) else "",
+            commit_count=payload["commits"] if type(payload.get("commits")) is int else None,
         )
 
     @staticmethod

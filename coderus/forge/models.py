@@ -43,6 +43,7 @@ class PullRequestDetails:
     head_ref: str
     head_repository_url: str
     body: str = ""
+    commit_count: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

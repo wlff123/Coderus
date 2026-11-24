@@ -26,6 +26,7 @@ from coderus.forge.models import (
     PublishResult,
     PullRequestDetails,
 )
+from coderus.forge.pr_commits import pull_request_commit_shas
 from coderus.forge.urls import parse_pull_request_url
 
 _API_ROOT = "https://api.gitcode.com/api/v5"
@@ -286,6 +287,13 @@ class GitCodePublisher:
         return self._pull_request_details(
             payload, upstream_owner, repository_name, pr_number
         )
+
+    def list_pull_request_commits(
+        self, upstream_owner: str, repository_name: str, pr_number: int
+    ) -> frozenset[str]:
+        self._validate_coordinates(upstream_owner, repository_name, pr_number)
+        url = f"{_API_ROOT}/repos/{upstream_owner}/{repository_name}/pulls/{pr_number}/commits"
+        return pull_request_commit_shas(self._get_list_pages(url, params={}))
 
     def publish_pr_comment(
         self,

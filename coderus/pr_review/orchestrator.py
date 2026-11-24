@@ -144,7 +144,7 @@ class PRReviewOrchestrator:
                 if live_head is not None and live_head != details.head_sha:
                     # 平台 API 的 PR 元数据可能滞后于源分支的实际推送，
                     # 检视必须以分支当前 tip 为准。
-                    details = replace(details, head_sha=live_head)
+                    details = replace(details, head_sha=live_head, commit_count=None)
                 self._record_revision(
                     task_id,
                     state,
@@ -157,11 +157,9 @@ class PRReviewOrchestrator:
                 self._assert_claim(task_id, claim_token, claim_lost)
                 for attempt in range(3):
                     try:
-                        checkout = await self.workspace.prepare(
+                        prepared = await self.workspace.prepare(
                             task_id=task.id,
-                            repository_url=task.repository_url,
                             pr_number=task.pr_number,
-                            base_ref=details.base_ref,
                             head_sha=details.head_sha,
                             head_ref=details.head_ref,
                             head_repository_url=details.head_repository_url,
@@ -176,20 +174,21 @@ class PRReviewOrchestrator:
                         )
                         if live_head is None:
                             raise
-                        details = replace(details, head_sha=live_head)
+                        if live_head != details.head_sha:
+                            details = replace(details, head_sha=live_head, commit_count=None)
                         self._record_revision(
                             task_id, state, claim_token, details.base_sha, details.head_sha
                         )
-                prepared = checkout.path
-                details = replace(details, base_sha=checkout.base_sha)
-                self._record_revision(
-                    task_id, state, claim_token, details.base_sha, details.head_sha,
+                self._assert_claim(task_id, claim_token, claim_lost)
+                commits = await self._pull_request_commits(task, details)
+                comparison_sha = await self.workspace.comparison_from_commits(
+                    prepared, details.head_sha, commits,
                 )
                 self._transition(task_id, state, "reviewing", claim_token)
                 state = "reviewing"
                 self._assert_claim(task_id, claim_token, claim_lost)
                 material = await self.workspace.review_input(
-                    prepared, details.base_sha, details.head_sha
+                    prepared, comparison_sha, details.head_sha
                 )
                 ranges = material.ranges
                 if ranges.comparison_sha is None:
@@ -214,7 +213,7 @@ class PRReviewOrchestrator:
                 )
                 if matches_scope and previous is not None and previous.head_sha == details.head_sha:
                     await self._revalidate_publication(
-                        task, prepared, details, ranges.comparison_sha,
+                        task, details, commits,
                     )
                     self._assert_claim(task_id, claim_token, claim_lost)
                     self._complete(
@@ -273,7 +272,7 @@ class PRReviewOrchestrator:
 
                 self._assert_claim(task_id, claim_token, claim_lost)
                 publication_base = await self._revalidate_publication(
-                    task, prepared, details, ranges.comparison_sha,
+                    task, details, commits,
                 )
                 output = self._redact_output(output, None, prepared, review_secrets)
                 for item in pending_findings:
@@ -302,6 +301,7 @@ class PRReviewOrchestrator:
                     "generated_findings": generated_count,
                     "validated_findings": len(output.findings),
                     "filtered_findings": filtered_finding_count,
+                    "pr_commit_count": len(commits),
                 }
                 if publication_base != details.base_sha:
                     structured_result["review_audit"]["publication_base_sha"] = publication_base
@@ -506,8 +506,25 @@ class PRReviewOrchestrator:
         ]
         return output
 
+    async def _pull_request_commits(
+        self, task: _TaskContext, details: PullRequestDetails,
+    ) -> frozenset[str]:
+        # GitHub's pull-request commits endpoint is capped at 250.
+        if task.provider == "github" and (details.commit_count or 0) > 250:
+            raise PRReviewError("GitHub 无法通过 PR 接口返回超过 250 条的完整提交清单")
+        commits = await self.forges.require(task.provider).list_pull_request_commits(
+            task.owner, task.name, task.pr_number,
+        )
+        if task.provider == "github" and details.commit_count is None and len(commits) >= 250:
+            raise PRReviewError("无法确认 GitHub PR 提交清单是否完整")
+        if details.commit_count is not None and len(commits) != details.commit_count:
+            raise PRReviewError("平台返回的 PR 提交清单不完整，请稍后重新发起检视")
+        if details.head_sha not in commits:
+            raise PRReviewError("平台提交清单尚未匹配已拉取的源提交，请稍后重新发起检视")
+        return commits
+
     async def _revalidate_publication(
-        self, task: _TaskContext, workspace: Path, details: PullRequestDetails, comparison_sha: str,
+        self, task: _TaskContext, details: PullRequestDetails, commits: frozenset[str],
     ) -> str:
         current = await self.forges.require(task.provider).get_pull_request(
             task.owner, task.name, task.pr_number,
@@ -525,38 +542,11 @@ class PRReviewOrchestrator:
             raise PRReviewError("检视期间源分支有新提交，请重新发起检视")
         if current_head is None and current.head_sha != details.head_sha:
             raise PRReviewError("无法确认源分支仍是已检视的版本，请重新发起检视")
-        current_base = await self.workspace.resolve_remote_head(
-            task.repository_url, details.base_ref,
-        )
-        if (current_base or current.base_sha) == details.base_sha:
-            return details.base_sha
-        return await self._verify_target_update(task, workspace, details, comparison_sha)
-
-    async def _verify_target_update(
-        self, task: _TaskContext, workspace: Path, details: PullRequestDetails, comparison_sha: str,
-    ) -> str:
-        refreshed = await self.workspace.refresh_target_comparison(
-            workspace, task.repository_url, details.base_ref, details.head_sha,
-        )
-        if refreshed is None:
-            raise PRReviewError("目标分支已更新，但无法核对检视基准，请重新发起检视")
-        target_sha, new_comparison = refreshed
-        if new_comparison != comparison_sha:
-            raise PRReviewError("目标分支更新改变了检视基准，请重新发起检视")
-
-        # Fetching the target introduces another window in which the source can move.
-        try:
-            async with asyncio.timeout(15):
-                head = await self.workspace.resolve_remote_head(
-                    details.head_repository_url, details.head_ref,
-                )
-        except TimeoutError:
-            head = None
-        if head is None:
-            raise PRReviewError("无法确认源分支仍是已检视的版本，请重新发起检视")
-        if head != details.head_sha:
-            raise PRReviewError("检视期间源分支有新提交，请重新发起检视")
-        return target_sha
+        if current.head_sha != details.head_sha:
+            current = replace(current, head_sha=details.head_sha, commit_count=None)
+        if await self._pull_request_commits(task, current) != commits:
+            raise PRReviewError("检视期间 PR 提交范围已变化，请重新发起检视")
+        return current.base_sha
 
     async def _run_review_axes(
         self,

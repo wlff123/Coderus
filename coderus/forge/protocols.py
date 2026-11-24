@@ -66,6 +66,10 @@ class Forge(Protocol):
         self, owner: str, name: str, pr_number: int
     ) -> PullRequestDetails: ...
 
+    async def list_pull_request_commits(
+        self, owner: str, name: str, pr_number: int
+    ) -> frozenset[str]: ...
+
     async def publish_pr_comment(
         self, owner: str, name: str, pr_number: int, body: str, marker: str
     ) -> PRCommentResult: ...

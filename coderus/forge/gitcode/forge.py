@@ -43,6 +43,10 @@ class GitCodeForge:
         publisher = self._registered_publisher(owner, name)
         return await asyncio.to_thread(publisher.get_pull_request, owner, name, pr_number)
 
+    async def list_pull_request_commits(self, owner: str, name: str, pr_number: int):
+        publisher = self._registered_publisher(owner, name)
+        return await asyncio.to_thread(publisher.list_pull_request_commits, owner, name, pr_number)
+
     async def publish_pr_comment(
         self, owner: str, name: str, pr_number: int, body: str, marker: str
     ):

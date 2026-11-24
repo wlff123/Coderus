@@ -645,6 +645,14 @@ def test_get_pull_request_accepts_gitcode_merge_request_url() -> None:
     assert details.url == "https://gitcode.com/acme/widgets/merge_requests/17"
 
 
+def test_list_pull_request_commits_handles_newest_first_and_missing_parents() -> None:
+    head, oldest = "b" * 40, "a" * 40
+    client = FakeHttpClient(FakeResponse(200, [{"sha": head}, {"sha": oldest}]))
+
+    assert publisher(client).list_pull_request_commits("acme", "widgets", 17) == {head, oldest}
+    assert client.calls[0]["url"].endswith("/repos/acme/widgets/pulls/17/commits")
+
+
 def test_get_pull_request_does_not_depend_on_unofficial_clone_url() -> None:
     payload = pr_payload()
     payload["head"]["repo"]["clone_url"] = "https://token@evil.example/widgets.git"

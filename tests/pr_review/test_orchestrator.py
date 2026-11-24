@@ -18,7 +18,7 @@ from coderus.models import PRReviewTask, Repository, User
 from coderus.pr_review import orchestrator as orchestrator_module
 from coderus.pr_review.models import ChangedRanges, ReviewInput
 from coderus.pr_review.orchestrator import PRReviewOrchestrator, _ClaimLost
-from coderus.pr_review.workspace import PreparedWorkspace, RevisionChanged
+from coderus.pr_review.workspace import RevisionChanged
 from coderus.runner import AgentRole, JobResult, JobStatus, RetryableAgentError, Stage
 
 BASE_SHA = "a" * 40
@@ -145,6 +145,7 @@ class FakePublisher:
         self.statuses: list[str] = []
         self.details_sequence = details_sequence
         self.get_calls = 0
+        self.commit_lists: list[frozenset[str]] = []
         self.comment_calls: list[dict[str, object]] = []
         self.comment_error: Exception | None = None
 
@@ -155,6 +156,9 @@ class FakePublisher:
         if self.details_sequence is not None:
             return self.details_sequence[index]
         return self.details
+
+    async def list_pull_request_commits(self, owner: str, name: str, pr_number: int):
+        return self.commit_lists.pop(0) if self.commit_lists else frozenset({self.details.head_sha})
 
     async def publish_pr_comment(
         self, owner: str, name: str, pr_number: int, body: str, marker: str
@@ -186,15 +190,13 @@ class FakeWorkspace:
         self.engine = engine
         self.path = path
         self.prepare_calls: list[dict[str, object]] = []
-        self.fetched_base = BASE_SHA
+        self.comparison_inputs: list[tuple[Path, str, frozenset[str]]] = []
         self.review_inputs: list[tuple[Path, str, str]] = []
         self.prepare_error: Exception | None = None
         self.pristine_error: Exception | None = None
         self.pristine_calls: list[tuple[Path, str, str]] = []
         self.remote_heads: list[str | None] = []
-        self.remote_bases: list[str | None] = []
         self.resolve_calls: list[tuple[str, str]] = []
-        self.refreshed_target: tuple[str, str] | None = None
         self.can_followup = True
         self.ranges = ChangedRanges(
             {("src/widget.py", "RIGHT"): ((12, 14),)},
@@ -215,20 +217,19 @@ class FakeWorkspace:
 
     async def resolve_remote_head(self, repository_url: str, ref: str) -> str | None:
         self.resolve_calls.append((repository_url, ref))
-        if ref == "main":
-            return self.remote_bases.pop(0) if self.remote_bases else None
         if self.remote_heads:
             return self.remote_heads.pop(0)
         return None
 
-    async def prepare(self, **kwargs) -> PreparedWorkspace:
+    async def prepare(self, **kwargs) -> Path:
         self.prepare_calls.append(kwargs)
         if self.prepare_error is not None:
             raise self.prepare_error
-        return PreparedWorkspace(self.path, self.fetched_base)
+        return self.path
 
-    async def refresh_target_comparison(self, workspace, repository_url, base_ref, head_sha):
-        return self.refreshed_target
+    async def comparison_from_commits(self, workspace, head_sha, commits):
+        self.comparison_inputs.append((workspace, head_sha, commits))
+        return COMPARISON_SHA
 
     async def can_follow_up(self, workspace, previous_head, head_sha):
         return self.can_followup
@@ -442,6 +443,7 @@ async def test_run_reviews_fixed_pr_revision_once_and_persists_safe_result(
         "generated_findings": 1,
         "validated_findings": 1,
         "filtered_findings": 0,
+        "pr_commit_count": 1,
     }
     assert persisted.workspace_path is None
     assert persisted.failure_code is None
@@ -468,9 +470,7 @@ async def test_run_reviews_fixed_pr_revision_once_and_persists_safe_result(
     assert workspace.prepare_calls == [
         {
             "task_id": task.id,
-            "repository_url": "https://github.com/acme/widgets-1",
             "pr_number": 7,
-            "base_ref": "main",
             "head_sha": HEAD_SHA,
             "head_ref": "feature/review",
             "head_repository_url": "https://github.com/contributor/widgets-1.git",
@@ -585,6 +585,7 @@ async def test_run_reviews_live_branch_tip_when_api_head_lags(
     live_tip = "d" * 40
     orchestrator, publisher, workspace, *_ = build_orchestrator(engine, tmp_path)
     workspace.remote_heads = [live_tip, live_tip]  # 检视前后两次解析
+    publisher.commit_lists = [frozenset({live_tip})] * 2
 
     await orchestrator.run(task.id)
 
@@ -595,7 +596,6 @@ async def test_run_reviews_live_branch_tip_when_api_head_lags(
     assert workspace.resolve_calls == [
         ("https://github.com/contributor/widgets-1.git", "feature/review"),
         ("https://github.com/contributor/widgets-1.git", "feature/review"),
-        ("https://github.com/acme/widgets-1", "main"),
     ]
     assert workspace.prepare_calls[0]["head_sha"] == live_tip
     assert publisher.comment_calls[0]["marker"] == (
@@ -686,50 +686,62 @@ async def test_review_rounds_reuse_and_explicitly_close_prior_findings(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "final_base, succeeds", [("d" * 40, True), ("e" * 40, False), (None, False)]
-)
-async def test_fetched_base_overrides_stale_api_and_is_rechecked(
-    engine, session: Session, tmp_path: Path, final_base, succeeds
+async def test_review_input_uses_platform_commits_instead_of_target_sha(
+    engine, session: Session, tmp_path: Path,
 ) -> None:
     task = add_review_task(session)
     orchestrator, publisher, workspace, *_ = build_orchestrator(engine, tmp_path)
-    workspace.fetched_base = "d" * 40
-    workspace.remote_bases = [final_base]
+    commits = frozenset({HEAD_SHA, "d" * 40})
+    publisher.commit_lists = [commits, commits]
     await orchestrator.run(task.id)
     session.expire_all()
     persisted = session.get(PRReviewTask, task.id)
-    assert persisted.base_sha == "d" * 40
+    assert persisted.base_sha == BASE_SHA
     assert len(workspace.prepare_calls) == 1
-    assert workspace.review_inputs == [(workspace.path, "d" * 40, HEAD_SHA)]
-    assert persisted.status == ("completed" if succeeds else "failed")
-    assert bool(publisher.comment_calls) == succeeds
+    assert workspace.comparison_inputs == [(workspace.path, HEAD_SHA, commits)]
+    assert workspace.review_inputs == [(workspace.path, COMPARISON_SHA, HEAD_SHA)]
+    assert persisted.status == "completed"
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("comparison", "last_head", "error"),
-    [
-        (COMPARISON_SHA, HEAD_SHA, None),
-        ("d" * 40, HEAD_SHA, "改变了检视基准"),
-        (COMPARISON_SHA, "e" * 40, "源分支有新提交"),
-        (COMPARISON_SHA, None, "无法确认源分支"),
-    ],
+    ("commits", "message"),
+    [(frozenset({"d" * 40}), "尚未匹配"), (frozenset({HEAD_SHA}), "清单不完整")],
 )
+async def test_platform_commit_list_must_match_the_source_before_review(
+    engine, session: Session, tmp_path: Path, commits, message,
+) -> None:
+    task = add_review_task(session)
+    orchestrator, publisher, _, runner, *_ = build_orchestrator(engine, tmp_path)
+    publisher.commit_lists = [commits]
+    if HEAD_SHA in commits:
+        publisher.details = replace(publisher.details, commit_count=2)
+
+    await orchestrator.run(task.id)
+
+    session.expire_all()
+    persisted = session.get(PRReviewTask, task.id)
+    assert persisted.status == "failed"
+    assert message in persisted.failure_summary
+    assert runner.specs == publisher.comment_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("commits_changed", [True, False])
 async def test_target_advances_before_publication(
-    engine, session: Session, tmp_path: Path, comparison, last_head, error,
+    engine, session: Session, tmp_path: Path, commits_changed: bool,
 ) -> None:
     task = add_review_task(session)
     target = "f" * 40
     publisher = FakePublisher(engine)
-    # The API reports the update when ls-remote cannot read the target tip.
     publisher.details_sequence = [publisher.details, replace(publisher.details, base_sha=target)]
+    initial = frozenset({HEAD_SHA, "d" * 40})
+    current = frozenset({HEAD_SHA}) if commits_changed else initial
+    publisher.commit_lists = [initial, current]
     orchestrator, _, workspace, runner, *_ = build_orchestrator(
         engine, tmp_path, publisher=publisher,
     )
-    workspace.remote_bases = [None]
-    workspace.remote_heads = [HEAD_SHA, HEAD_SHA, last_head]
-    workspace.refreshed_target = (target, comparison)
+    workspace.remote_heads = [HEAD_SHA, HEAD_SHA]
 
     await orchestrator.run(task.id)
 
@@ -737,9 +749,9 @@ async def test_target_advances_before_publication(
     persisted = session.get(PRReviewTask, task.id)
     assert len(runner.specs) == 1
     assert persisted.base_sha == BASE_SHA
-    if error:
+    if commits_changed:
         assert persisted.status == "failed"
-        assert error in persisted.failure_summary
+        assert "PR 提交范围已变化" in persisted.failure_summary
         assert publisher.comment_calls == []
     else:
         assert persisted.status == "completed"
@@ -1153,6 +1165,7 @@ async def test_run_drops_unpublishable_locations_and_completes(
         "generated_findings": 1,
         "validated_findings": 0,
         "filtered_findings": 1,
+        "pr_commit_count": 1,
     }
     assert len(publisher.comment_calls) == 1
     assert "1 条意见待人工确认" in publisher.comment_calls[0]["body"]
@@ -1370,10 +1383,6 @@ async def test_lost_transition_claim_returns_without_overwriting_or_notifying(
         (
             "open", False, BASE_SHA, "c" * 40, "main", "feature/review", None,
             "无法确认源分支仍是已检视的版本，请重新发起检视",
-        ),
-        (
-            "open", False, "c" * 40, HEAD_SHA, "main", "feature/review", None,
-            "目标分支已更新，但无法核对检视基准，请重新发起检视",
         ),
         (
             "open", False, BASE_SHA, HEAD_SHA, "release", "feature/review", None,

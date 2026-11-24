@@ -436,7 +436,7 @@ def test_get_pr_status_distinguishes_merged_from_closed(payload, expected) -> No
 
 
 def test_get_pull_request_returns_verified_metadata() -> None:
-    client = FakeHttpClient(FakeResponse(200, pull_request_payload()))
+    client = FakeHttpClient(FakeResponse(200, {**pull_request_payload(), "commits": 101}))
     publisher = GitHubPublisher(
         "github-secret", registered_forks={}, http_client=client, git_runner=FakeGitRunner()
     )
@@ -452,12 +452,28 @@ def test_get_pull_request_returns_verified_metadata() -> None:
     assert result.base_ref == "main"
     assert result.head_ref == "feature/review"
     assert result.head_repository_url == "https://github.com/contributor/widgets.git"
+    assert result.commit_count == 101
     assert client.calls == [{
         "method": "GET",
         "url": "https://api.github.com/repos/acme/widgets/pulls/7",
         "headers": client.calls[0]["headers"],
         "params": None,
     }]
+
+
+def test_list_pull_request_commits_paginates_the_pr_endpoint() -> None:
+    shas = [f"{index:040x}" for index in range(1, 102)]
+    client = FakeHttpClient(
+        FakeResponse(200, [{"sha": sha} for sha in shas[:100]]),
+        FakeResponse(200, [{"sha": shas[-1]}]),
+    )
+    publisher = GitHubPublisher(
+        "github-secret", registered_forks={}, http_client=client, git_runner=FakeGitRunner(),
+    )
+
+    assert publisher.list_pull_request_commits("acme", "widgets", 7) == frozenset(shas)
+    assert [call["params"]["page"] for call in client.calls] == [1, 2]
+    assert client.calls[0]["url"].endswith("/repos/acme/widgets/pulls/7/commits")
 
 
 def test_publisher_exports_pull_request_result_models() -> None:

@@ -11,7 +11,6 @@ import time
 from collections import defaultdict
 from collections.abc import Mapping
 from contextvars import ContextVar
-from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -79,12 +78,6 @@ class GitNetworkError(PRWorkspaceError):
 
 class RevisionChanged(PRWorkspaceError):
     """The source branch moved while preparing an isolated review checkout."""
-
-
-@dataclass(frozen=True, slots=True)
-class PreparedWorkspace:
-    path: Path
-    base_sha: str
 
 
 def _git_failure_reason(stderr: bytes) -> str:
@@ -157,39 +150,6 @@ class PRWorkspace:
                 return sha
         return None
 
-    async def refresh_target_comparison(
-        self,
-        workspace: Path,
-        repository_url: str,
-        base_ref: str,
-        head_sha: str,
-    ) -> tuple[str, str] | None:
-        """Return the fetched target tip and its single merge base with the reviewed head."""
-        PRWorkspace._validate_head_repository_url(repository_url)
-        self._validate_revisions(head_sha, head_sha)
-        if not self._is_safe_ref(base_ref):
-            raise ValueError("base_ref must be a single safe Git ref")
-
-        try:
-            async with asyncio.timeout(30):
-                await self._run(
-                    "git", "fetch", "--force", "--no-tags", "--", repository_url,
-                    f"refs/heads/{base_ref}", cwd=workspace,
-                )
-                target = (
-                    await self._run("git", "rev-parse", "FETCH_HEAD^{commit}", cwd=workspace)
-                ).strip()
-                if _SHA.fullmatch(target) is None:
-                    return None
-                comparison = (
-                    await self._run("git", "merge-base", "--all", target, head_sha, cwd=workspace)
-                ).strip()
-        except (PRWorkspaceError, TimeoutError):
-            return None
-        if _SHA.fullmatch(comparison) is None:
-            return None
-        return target.lower(), comparison.lower()
-
     async def can_follow_up(self, workspace: Path, previous_head: str, head_sha: str) -> bool:
         self._validate_revisions(previous_head, head_sha)
         try:
@@ -223,7 +183,7 @@ class PRWorkspace:
             return None
         return oid if _SHA.fullmatch(oid) else None
 
-    async def prepare(self, *args, **kwargs) -> PreparedWorkspace:
+    async def prepare(self, *args, **kwargs) -> Path:
         task_id = kwargs.get("task_id", args[0] if args else None)
         token = _TASK_ID.set(task_id)
         try:
@@ -247,21 +207,13 @@ class PRWorkspace:
     async def _prepare_once(
         self,
         task_id: int,
-        repository_url: str,
         pr_number: int,
-        base_ref: str,
         head_sha: str,
         head_ref: str,
         head_repository_url: str,
-    ) -> PreparedWorkspace:
+    ) -> Path:
         self._validate_prepare_inputs(
-            task_id,
-            repository_url,
-            pr_number,
-            base_ref,
-            head_sha,
-            head_ref,
-            head_repository_url,
+            task_id, pr_number, head_sha, head_ref, head_repository_url,
         )
         self.workspace_root.mkdir(parents=True, exist_ok=True)
         workspace_name = f"pr-review-{task_id}"
@@ -280,29 +232,7 @@ class PRWorkspace:
         )
         try:
             checkout = staging / "checkout"
-            await self._run(
-                "git",
-                "clone",
-                "--no-checkout",
-                "--no-tags",
-                "--single-branch",
-                "--origin",
-                "upstream",
-                "--",
-                repository_url,
-                str(checkout),
-                cwd=staging_root,
-            )
-            await self._run(
-                "git", "fetch", "--force", "--no-tags", "--", "upstream",
-                f"refs/heads/{base_ref}", cwd=checkout,
-            )
-            # Capture the fetched target before the source fetch replaces FETCH_HEAD.
-            resolved_base = (
-                await self._run("git", "rev-parse", "FETCH_HEAD^{commit}", cwd=checkout)
-            ).strip().lower()
-            if _SHA.fullmatch(resolved_base) is None:
-                raise PRWorkspaceError("无法读取 Git 拉取到的目标分支提交")
+            await self._run("git", "init", "--", str(checkout), cwd=staging_root)
             await self._run(
                 "git",
                 "fetch",
@@ -325,7 +255,48 @@ class PRWorkspace:
             await asyncio.to_thread(shutil.rmtree, staging, ignore_errors=True)
 
         workspace.chmod(0o700)
-        return PreparedWorkspace(workspace, resolved_base)
+        return workspace
+
+    async def comparison_from_commits(
+        self, workspace: Path, head_sha: str, commits: frozenset[str],
+    ) -> str:
+        self._validate_revisions(head_sha, head_sha)
+        if head_sha not in commits or any(_SHA.fullmatch(sha) is None for sha in commits):
+            raise PRWorkspaceError("PR 提交清单与已拉取的源提交不一致")
+
+        # A valid range has one boundary commit that contains any other boundary parents.
+        # Use local parent links because the forge can omit parents or return any list order.
+        frontier: set[str] = set()
+        commit_ids = sorted(commits)
+        for start in range(0, len(commit_ids), 100):
+            batch = commit_ids[start:start + 100]
+            try:
+                graph = await self._run(
+                    "git", "rev-list", "--parents", "--no-walk=unsorted",
+                    *batch, "--", cwd=workspace,
+                )
+            except PRWorkspaceError:
+                raise PRWorkspaceError("源分支历史中缺少平台列出的 PR 提交") from None
+            for line in graph.splitlines():
+                _, *parents = line.split()
+                frontier.update(parent for parent in parents if parent not in commits)
+        if not frontier:
+            raise PRWorkspaceError("无法从 PR 提交清单确定比较基准")
+        candidates = sorted(frontier)
+        if len(candidates) > 1:
+            candidates = (
+                await self._run("git", "merge-base", "--independent", *candidates, cwd=workspace)
+            ).split()
+        if len(candidates) != 1 or _SHA.fullmatch(candidates[0]) is None:
+            raise PRWorkspaceError("PR 提交清单没有唯一的比较基准")
+        comparison = candidates[0]
+        actual = await self._run(
+            "git", "rev-list", f"--max-count={len(commits) + 1}",
+            f"{comparison}..{head_sha}", "--", cwd=workspace,
+        )
+        if set(actual.split()) != commits:
+            raise PRWorkspaceError("PR 提交清单与源分支历史不一致，无法安全确定检视范围")
+        return comparison
 
     async def review_input(self, workspace: Path, base_sha: str, head_sha: str) -> ReviewInput:
         self._validate_revisions(base_sha, head_sha)
@@ -471,9 +442,7 @@ class PRWorkspace:
     @staticmethod
     def _validate_prepare_inputs(
         task_id: int,
-        repository_url: str,
         pr_number: int,
-        base_ref: str,
         head_sha: str,
         head_ref: str,
         head_repository_url: str,
@@ -481,14 +450,6 @@ class PRWorkspace:
         for field, value in (("task_id", task_id), ("pr_number", pr_number)):
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{field} must be a positive integer")
-        if (
-            not isinstance(repository_url, str)
-            or not repository_url
-            or repository_url.startswith("-")
-        ):
-            raise ValueError("repository_url must not be a Git option")
-        if not PRWorkspace._is_safe_ref(base_ref):
-            raise ValueError("base_ref must be a single safe Git ref")
         if not PRWorkspace._is_safe_ref(head_ref):
             raise ValueError("head_ref must be a single safe Git ref")
         PRWorkspace._validate_head_repository_url(head_repository_url)

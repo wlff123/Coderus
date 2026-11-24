@@ -38,13 +38,12 @@ async def test_network_preparation_retry_is_bounded(tmp_path, monkeypatch, caplo
     calls = []
     delays = []
     manager = PRWorkspace(tmp_path)
-    prepared = module.PreparedWorkspace(tmp_path, "a" * 40)
 
     async def prepare_once(*args, **kwargs):
         calls.append(module._TASK_ID.get())
         if len(calls) <= failures:
             raise module.GitNetworkError("网络异常")
-        return prepared
+        return tmp_path
 
     async def sleep(delay):
         delays.append(delay)
@@ -55,7 +54,7 @@ async def test_network_preparation_retry_is_bounded(tmp_path, monkeypatch, caplo
         with pytest.raises(module.GitNetworkError, match="自动重试 2 次"):
             await manager.prepare(task_id=595)
     else:
-        assert await manager.prepare(task_id=595) == prepared
+        assert await manager.prepare(task_id=595) == tmp_path
     assert calls == [595] * min(failures + 1, 3)
     assert delays == [5, 15][:min(failures, 2)]
     assert module._TASK_ID.get() is None
@@ -91,24 +90,23 @@ def test_git_diagnostics_never_echo_credentials():
 
 
 @pytest.mark.asyncio
-async def test_retry_discards_partial_clone_and_uses_fresh_staging(tmp_path, monkeypatch):
+async def test_retry_discards_partial_fetch_and_uses_fresh_staging(tmp_path, monkeypatch):
     manager = PRWorkspace(tmp_path / "workspaces", staging_root=tmp_path / "staging")
     checkouts = []
-    revisions = iter(["a" * 40, "b" * 40])
 
     async def run(*args, cwd):
-        if args[1] == "clone":
+        if args[1] == "init":
             checkout = module.Path(args[-1])
             if checkouts:
                 assert not checkouts[0].exists()
                 assert checkout != checkouts[0]
             checkout.mkdir()
             checkouts.append(checkout)
-            if len(checkouts) == 1:
-                (checkout / "partial").touch()
-                raise module.GitNetworkError("网络异常")
+        if args[1] == "fetch" and len(checkouts) == 1:
+            (cwd / "partial").touch()
+            raise module.GitNetworkError("网络异常")
         if args[1] == "rev-parse":
-            return next(revisions)
+            return "b" * 40
         return ""
 
     async def sleep(_):
@@ -116,10 +114,9 @@ async def test_retry_discards_partial_clone_and_uses_fresh_staging(tmp_path, mon
 
     monkeypatch.setattr(manager, "_run", run)
     monkeypatch.setattr(module.asyncio, "sleep", sleep)
-    prepared = await manager.prepare(
-        595, "https://gitcode.com/acme/example", 1, "main", "b" * 40,
-        "feature", "https://gitcode.com/acme/example",
+    workspace = await manager.prepare(
+        595, 1, "b" * 40, "feature", "https://gitcode.com/acme/example",
     )
     assert len(checkouts) == 2
-    assert not (prepared.path / "partial").exists()
+    assert not (workspace / "partial").exists()
     assert list(manager.staging_root.iterdir()) == []
