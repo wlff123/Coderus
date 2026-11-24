@@ -11,6 +11,7 @@ import time
 from collections import defaultdict
 from collections.abc import Mapping
 from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -77,11 +78,13 @@ class GitNetworkError(PRWorkspaceError):
 
 
 class RevisionChanged(PRWorkspaceError):
-    """A remote branch moved while preparing an isolated review checkout."""
+    """The source branch moved while preparing an isolated review checkout."""
 
 
-class BaseRevisionChanged(RevisionChanged):
-    """Target moved between resolution and fetch; preparation may be retried."""
+@dataclass(frozen=True, slots=True)
+class PreparedWorkspace:
+    path: Path
+    base_sha: str
 
 
 def _git_failure_reason(stderr: bytes) -> str:
@@ -220,7 +223,7 @@ class PRWorkspace:
             return None
         return oid if _SHA.fullmatch(oid) else None
 
-    async def prepare(self, *args, **kwargs) -> Path:
+    async def prepare(self, *args, **kwargs) -> PreparedWorkspace:
         task_id = kwargs.get("task_id", args[0] if args else None)
         token = _TASK_ID.set(task_id)
         try:
@@ -247,17 +250,15 @@ class PRWorkspace:
         repository_url: str,
         pr_number: int,
         base_ref: str,
-        base_sha: str,
         head_sha: str,
         head_ref: str,
         head_repository_url: str,
-    ) -> Path:
+    ) -> PreparedWorkspace:
         self._validate_prepare_inputs(
             task_id,
             repository_url,
             pr_number,
             base_ref,
-            base_sha,
             head_sha,
             head_ref,
             head_repository_url,
@@ -296,9 +297,12 @@ class PRWorkspace:
                 "git", "fetch", "--force", "--no-tags", "--", "upstream",
                 f"refs/heads/{base_ref}", cwd=checkout,
             )
-            resolved_base = await self._run("git", "rev-parse", "FETCH_HEAD^{commit}", cwd=checkout)
-            if resolved_base.strip().lower() != base_sha.lower():
-                raise BaseRevisionChanged("目标分支 base SHA 在准备期间变化，请稍后重新触发检视")
+            # Capture the fetched target before the source fetch replaces FETCH_HEAD.
+            resolved_base = (
+                await self._run("git", "rev-parse", "FETCH_HEAD^{commit}", cwd=checkout)
+            ).strip().lower()
+            if _SHA.fullmatch(resolved_base) is None:
+                raise PRWorkspaceError("无法读取 Git 拉取到的目标分支提交")
             await self._run(
                 "git",
                 "fetch",
@@ -321,7 +325,7 @@ class PRWorkspace:
             await asyncio.to_thread(shutil.rmtree, staging, ignore_errors=True)
 
         workspace.chmod(0o700)
-        return workspace
+        return PreparedWorkspace(workspace, resolved_base)
 
     async def review_input(self, workspace: Path, base_sha: str, head_sha: str) -> ReviewInput:
         self._validate_revisions(base_sha, head_sha)
@@ -470,7 +474,6 @@ class PRWorkspace:
         repository_url: str,
         pr_number: int,
         base_ref: str,
-        base_sha: str,
         head_sha: str,
         head_ref: str,
         head_repository_url: str,
@@ -489,7 +492,8 @@ class PRWorkspace:
         if not PRWorkspace._is_safe_ref(head_ref):
             raise ValueError("head_ref must be a single safe Git ref")
         PRWorkspace._validate_head_repository_url(head_repository_url)
-        PRWorkspace._validate_revisions(base_sha, head_sha)
+        if not isinstance(head_sha, str) or _SHA.fullmatch(head_sha) is None:
+            raise ValueError("head_sha must be a 40-character hexadecimal SHA")
 
     @staticmethod
     def _validate_revisions(base_sha: str, head_sha: str) -> None:

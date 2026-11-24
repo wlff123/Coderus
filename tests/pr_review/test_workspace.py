@@ -145,11 +145,13 @@ async def test_prepare_replaces_only_expected_directory_with_full_head_checkout(
 
     staging_root = tmp_path / "manager-staging"
     manager = PRWorkspace(workspace_root, staging_root=staging_root)
-    workspace = await manager.prepare(
-        3, upstream.as_uri(), 7, "main", base_sha, head_sha, "review-head", upstream.as_uri()
+    prepared = await manager.prepare(
+        3, upstream.as_uri(), 7, "main", head_sha, "review-head", upstream.as_uri()
     )
+    workspace = prepared.path
 
     assert workspace.name == "pr-review-3"
+    assert prepared.base_sha == base_sha
     assert (workspace / ".git").is_dir()
     assert (workspace / "src" / "app.py").is_file()
     assert git(workspace, "rev-parse", "HEAD") == head_sha
@@ -176,10 +178,11 @@ async def test_prepare_force_syncs_rewritten_branch_despite_same_named_tag(
     new_head = git(source, "rev-parse", "HEAD")
     git(source, "push", "--force", "upstream", "HEAD:refs/heads/review-head")
     manager = PRWorkspace(tmp_path / "workspaces", staging_root=tmp_path / "staging")
-    workspace = await manager.prepare(
-        42, upstream.as_uri(), 7, "main", base_sha, new_head,
+    prepared = await manager.prepare(
+        42, upstream.as_uri(), 7, "main", new_head,
         "review-head", upstream.as_uri(),
     )
+    workspace = prepared.path
     assert git(workspace, "rev-parse", "HEAD") == new_head
     assert (workspace / "fresh.txt").is_file()
     assert not (workspace / "src" / "new.py").exists()
@@ -195,7 +198,7 @@ async def test_prepare_rejects_a_fetched_pr_head_that_does_not_match_requested_s
 
     with pytest.raises(RuntimeError, match="head SHA"):
         await manager.prepare(
-            4, upstream.as_uri(), 7, "main", base_sha, base_sha, "review-head", upstream.as_uri()
+            4, upstream.as_uri(), 7, "main", base_sha, "review-head", upstream.as_uri()
         )
 
 
@@ -220,16 +223,16 @@ async def test_prepare_fetches_base_then_cross_repository_head_without_tokens(
 
     monkeypatch.setattr(manager, "_run", fake_run)
 
-    await manager.prepare(
+    prepared = await manager.prepare(
         task_id=8,
         repository_url="https://github.com/acme/widgets",
         pr_number=17,
         base_ref="main",
-        base_sha=base_sha,
         head_sha=head_sha,
         head_ref="feature/review",
         head_repository_url="https://github.com/contributor/widgets.git",
     )
+    assert prepared.base_sha == base_sha
 
     clone = next(command for command in calls if "clone" in command)
     assert "--no-checkout" in clone
@@ -280,7 +283,6 @@ async def test_prepare_rejects_credential_bearing_head_repository_url_before_git
             "https://github.com/acme/widgets",
             17,
             "main",
-            "a" * 40,
             "b" * 40,
             "feature/review",
             head_repository_url,
@@ -290,27 +292,30 @@ async def test_prepare_rejects_credential_bearing_head_repository_url_before_git
 
 
 @pytest.mark.asyncio
-async def test_prepare_rejects_an_unreachable_base_sha(
+async def test_prepare_uses_newly_fetched_target_tip(
     tmp_path: Path, allow_local_head_repository: None
 ) -> None:
-    upstream, _, head_sha = create_upstream(tmp_path)
+    upstream, _, first_change = create_upstream(tmp_path)
+    source = tmp_path / "source"
+    (source / "follow-up.txt").write_text("Remaining review change", encoding="utf-8")
+    git(source, "add", "follow-up.txt")
+    git(source, "commit", "-m", "Add another change to the review")
+    head_sha = git(source, "rev-parse", "HEAD")
+    git(source, "push", "upstream", "HEAD:refs/heads/review-head")
+    git(source, "push", "upstream", f"{first_change}:refs/heads/main")
     manager = PRWorkspace(tmp_path / "workspaces", staging_root=tmp_path / "manager-staging")
-
-    with pytest.raises(RuntimeError, match="base SHA"):
-        await manager.prepare(
-            5,
-            upstream.as_uri(),
-            7,
-            "main",
-            "f" * 40,
-            head_sha,
-            "review-head",
-            upstream.as_uri(),
-        )
+    prepared = await manager.prepare(
+        5, upstream.as_uri(), 7, "main", head_sha, "review-head", upstream.as_uri(),
+    )
+    assert prepared.base_sha == first_change
+    material = await manager.review_input(prepared.path, prepared.base_sha, head_sha)
+    assert material.ranges.comparison_sha == first_change
+    assert "follow-up.txt" in material.unified_diff
+    assert "src/app.py" not in material.unified_diff
 
 
 @pytest.mark.asyncio
-async def test_prepare_rejects_a_base_sha_not_reachable_from_fetched_base_ref(
+async def test_prepare_uses_requested_target_ref_when_remote_default_is_unrelated(
     tmp_path: Path,
     allow_local_head_repository: None,
 ) -> None:
@@ -330,19 +335,11 @@ async def test_prepare_rejects_a_base_sha_not_reachable_from_fetched_base_ref(
 
     manager = PRWorkspace(tmp_path / "workspaces", staging_root=tmp_path / "manager-staging")
 
-    with pytest.raises(RuntimeError, match="base SHA"):
-        await manager.prepare(
-            6,
-            upstream.as_uri(),
-            7,
-            "main",
-            unrelated_sha,
-            head_sha,
-            "review-head",
-            upstream.as_uri(),
-        )
-
+    prepared = await manager.prepare(
+        6, upstream.as_uri(), 7, "main", head_sha, "review-head", upstream.as_uri(),
+    )
     assert unrelated_sha != base_sha
+    assert prepared.base_sha == base_sha
 
 
 @pytest.mark.asyncio
@@ -355,7 +352,6 @@ async def test_prepare_rejects_a_base_sha_not_reachable_from_fetched_base_ref(
         ("pr_number", 0),
         ("pr_number", -1),
         ("pr_number", True),
-        ("base_sha", "a" * 39),
         ("head_sha", "not-a-sha"),
         ("base_ref", "--upload-pack=evil"),
         ("repository_url", "--upload-pack=evil"),
@@ -374,7 +370,6 @@ async def test_prepare_rejects_unsafe_inputs_before_running_git(
         "repository_url": (tmp_path / "source").as_uri(),
         "pr_number": 7,
         "base_ref": "main",
-        "base_sha": "a" * 40,
         "head_sha": "b" * 40,
         "head_ref": "review-head",
         "head_repository_url": "https://github.com/acme/source.git",
@@ -434,7 +429,6 @@ async def test_prepare_rejects_unsafe_base_refs_before_running_git(
             "https://example.invalid/repository.git",
             7,
             base_ref,
-            "a" * 40,
             "b" * 40,
             "review-head",
             "https://github.com/acme/source.git",
@@ -607,21 +601,22 @@ async def test_prepare_ignores_hostile_global_url_rewrite(
     monkeypatch.setenv("HOME", str(hostile_home))
     monkeypatch.setenv("USERPROFILE", str(hostile_home))
 
-    workspace = await PRWorkspace(
+    prepared = await PRWorkspace(
         tmp_path / "workspaces", staging_root=tmp_path / "staging"
     ).prepare(
         8,
         upstream.as_uri(),
         7,
         "main",
-        base_sha,
         head_sha,
         "review-head",
         upstream.as_uri(),
     )
 
+    workspace = prepared.path
     assert (workspace / ".git").is_dir()
     assert git(workspace, "rev-parse", "HEAD") == head_sha
+    assert prepared.base_sha == base_sha
 
 
 @pytest.mark.asyncio
@@ -630,9 +625,10 @@ async def test_review_input_tracks_modified_added_and_deleted_lines(
 ) -> None:
     upstream, base_sha, head_sha = create_upstream(tmp_path)
     manager = PRWorkspace(tmp_path / "workspaces")
-    workspace = await manager.prepare(
-        3, upstream.as_uri(), 7, "main", base_sha, head_sha, "review-head", upstream.as_uri()
+    prepared = await manager.prepare(
+        3, upstream.as_uri(), 7, "main", head_sha, "review-head", upstream.as_uri()
     )
+    workspace = prepared.path
 
     material = await manager.review_input(workspace, base_sha, head_sha)
     ranges = material.ranges
@@ -656,9 +652,10 @@ async def test_refresh_target_comparison_preserves_the_reviewed_checkout(
 ) -> None:
     upstream, base_sha, head_sha = create_upstream(tmp_path)
     manager = PRWorkspace(tmp_path / "workspaces")
-    workspace = await manager.prepare(
-        3, upstream.as_uri(), 7, "main", base_sha, head_sha, "review-head", upstream.as_uri()
+    prepared = await manager.prepare(
+        3, upstream.as_uri(), 7, "main", head_sha, "review-head", upstream.as_uri()
     )
+    workspace = prepared.path
     material = await manager.review_input(workspace, base_sha, head_sha)
     source = tmp_path / "source"
     git(source, "checkout", "--detach", base_sha)

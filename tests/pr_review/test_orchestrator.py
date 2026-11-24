@@ -18,6 +18,7 @@ from coderus.models import PRReviewTask, Repository, User
 from coderus.pr_review import orchestrator as orchestrator_module
 from coderus.pr_review.models import ChangedRanges, ReviewInput
 from coderus.pr_review.orchestrator import PRReviewOrchestrator, _ClaimLost
+from coderus.pr_review.workspace import PreparedWorkspace, RevisionChanged
 from coderus.runner import AgentRole, JobResult, JobStatus, RetryableAgentError, Stage
 
 BASE_SHA = "a" * 40
@@ -185,6 +186,8 @@ class FakeWorkspace:
         self.engine = engine
         self.path = path
         self.prepare_calls: list[dict[str, object]] = []
+        self.fetched_base = BASE_SHA
+        self.review_inputs: list[tuple[Path, str, str]] = []
         self.prepare_error: Exception | None = None
         self.pristine_error: Exception | None = None
         self.pristine_calls: list[tuple[Path, str, str]] = []
@@ -218,11 +221,11 @@ class FakeWorkspace:
             return self.remote_heads.pop(0)
         return None
 
-    async def prepare(self, **kwargs) -> Path:
+    async def prepare(self, **kwargs) -> PreparedWorkspace:
         self.prepare_calls.append(kwargs)
         if self.prepare_error is not None:
             raise self.prepare_error
-        return self.path
+        return PreparedWorkspace(self.path, self.fetched_base)
 
     async def refresh_target_comparison(self, workspace, repository_url, base_ref, head_sha):
         return self.refreshed_target
@@ -234,6 +237,7 @@ class FakeWorkspace:
         return "f" * 40
 
     async def review_input(self, workspace: Path, base_sha: str, head_sha: str):
+        self.review_inputs.append((workspace, base_sha, head_sha))
         return ReviewInput(
             ranges=self.ranges,
             unified_diff=self.material.unified_diff,
@@ -467,7 +471,6 @@ async def test_run_reviews_fixed_pr_revision_once_and_persists_safe_result(
             "repository_url": "https://github.com/acme/widgets-1",
             "pr_number": 7,
             "base_ref": "main",
-            "base_sha": BASE_SHA,
             "head_sha": HEAD_SHA,
             "head_ref": "feature/review",
             "head_repository_url": "https://github.com/contributor/widgets-1.git",
@@ -591,8 +594,9 @@ async def test_run_reviews_live_branch_tip_when_api_head_lags(
     assert persisted.head_sha == live_tip
     assert workspace.resolve_calls == [
         ("https://github.com/contributor/widgets-1.git", "feature/review"),
+        ("https://github.com/contributor/widgets-1.git", "feature/review"),
         ("https://github.com/acme/widgets-1", "main"),
-    ] * 2
+    ]
     assert workspace.prepare_calls[0]["head_sha"] == live_tip
     assert publisher.comment_calls[0]["marker"] == (
         f"<!-- coderus-pr-review:{persisted.review_key}:{BASE_SHA}:{live_tip} -->"
@@ -685,17 +689,19 @@ async def test_review_rounds_reuse_and_explicitly_close_prior_findings(
 @pytest.mark.parametrize(
     "final_base, succeeds", [("d" * 40, True), ("e" * 40, False), (None, False)]
 )
-async def test_live_base_overrides_stale_api_and_is_rechecked(
+async def test_fetched_base_overrides_stale_api_and_is_rechecked(
     engine, session: Session, tmp_path: Path, final_base, succeeds
 ) -> None:
     task = add_review_task(session)
     orchestrator, publisher, workspace, *_ = build_orchestrator(engine, tmp_path)
-    workspace.remote_bases = ["d" * 40, final_base]
+    workspace.fetched_base = "d" * 40
+    workspace.remote_bases = [final_base]
     await orchestrator.run(task.id)
     session.expire_all()
     persisted = session.get(PRReviewTask, task.id)
     assert persisted.base_sha == "d" * 40
-    assert workspace.prepare_calls[0]["base_sha"] == "d" * 40
+    assert len(workspace.prepare_calls) == 1
+    assert workspace.review_inputs == [(workspace.path, "d" * 40, HEAD_SHA)]
     assert persisted.status == ("completed" if succeeds else "failed")
     assert bool(publisher.comment_calls) == succeeds
 
@@ -721,7 +727,7 @@ async def test_target_advances_before_publication(
     orchestrator, _, workspace, runner, *_ = build_orchestrator(
         engine, tmp_path, publisher=publisher,
     )
-    workspace.remote_bases = [BASE_SHA, None]
+    workspace.remote_bases = [None]
     workspace.remote_heads = [HEAD_SHA, HEAD_SHA, last_head]
     workspace.refreshed_target = (target, comparison)
 
@@ -745,24 +751,19 @@ async def test_target_advances_before_publication(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("keeps_moving", [False, True])
-@pytest.mark.parametrize("moving_branch", ["base", "head"])
-async def test_prepare_retries_target_movement_with_a_bound(
-    engine, session: Session, tmp_path: Path, monkeypatch, keeps_moving, moving_branch
+async def test_prepare_retries_source_movement_with_a_bound(
+    engine, session: Session, tmp_path: Path, monkeypatch, keeps_moving
 ) -> None:
-    from coderus.pr_review.workspace import BaseRevisionChanged, RevisionChanged
-
     task = add_review_task(session)
     orchestrator, publisher, workspace, *_ = build_orchestrator(engine, tmp_path)
-    workspace.remote_bases = [BASE_SHA, "d" * 40, "d" * 40, "d" * 40]
     workspace.remote_heads = [HEAD_SHA] * 4
     attempts = []
     original = workspace.prepare
 
     async def moving_prepare(**kwargs):
-        attempts.append(kwargs["base_sha"])
+        attempts.append(kwargs["head_sha"])
         if keeps_moving or len(attempts) == 1:
-            error = BaseRevisionChanged if moving_branch == "base" else RevisionChanged
-            raise error("远端分支持续更新")
+            raise RevisionChanged("远端源分支持续更新")
         return await original(**kwargs)
 
     monkeypatch.setattr(workspace, "prepare", moving_prepare)
@@ -771,7 +772,7 @@ async def test_prepare_retries_target_movement_with_a_bound(
     persisted = session.get(PRReviewTask, task.id)
     assert len(attempts) == (3 if keeps_moving else 2)
     assert persisted.status == ("failed" if keeps_moving else "completed")
-    assert persisted.base_sha == "d" * 40
+    assert persisted.base_sha == BASE_SHA
     assert bool(publisher.comment_calls) == (not keeps_moving)
 
 

@@ -38,12 +38,13 @@ async def test_network_preparation_retry_is_bounded(tmp_path, monkeypatch, caplo
     calls = []
     delays = []
     manager = PRWorkspace(tmp_path)
+    prepared = module.PreparedWorkspace(tmp_path, "a" * 40)
 
     async def prepare_once(*args, **kwargs):
         calls.append(module._TASK_ID.get())
         if len(calls) <= failures:
             raise module.GitNetworkError("网络异常")
-        return tmp_path
+        return prepared
 
     async def sleep(delay):
         delays.append(delay)
@@ -54,7 +55,7 @@ async def test_network_preparation_retry_is_bounded(tmp_path, monkeypatch, caplo
         with pytest.raises(module.GitNetworkError, match="自动重试 2 次"):
             await manager.prepare(task_id=595)
     else:
-        assert await manager.prepare(task_id=595) == tmp_path
+        assert await manager.prepare(task_id=595) == prepared
     assert calls == [595] * min(failures + 1, 3)
     assert delays == [5, 15][:min(failures, 2)]
     assert module._TASK_ID.get() is None
@@ -115,10 +116,10 @@ async def test_retry_discards_partial_clone_and_uses_fresh_staging(tmp_path, mon
 
     monkeypatch.setattr(manager, "_run", run)
     monkeypatch.setattr(module.asyncio, "sleep", sleep)
-    workspace = await manager.prepare(
-        595, "https://gitcode.com/acme/example", 1, "main", "a" * 40, "b" * 40,
+    prepared = await manager.prepare(
+        595, "https://gitcode.com/acme/example", 1, "main", "b" * 40,
         "feature", "https://gitcode.com/acme/example",
     )
     assert len(checkouts) == 2
-    assert not (workspace / "partial").exists()
+    assert not (prepared.path / "partial").exists()
     assert list(manager.staging_root.iterdir()) == []

@@ -145,11 +145,6 @@ class PRReviewOrchestrator:
                     # 平台 API 的 PR 元数据可能滞后于源分支的实际推送，
                     # 检视必须以分支当前 tip 为准。
                     details = replace(details, head_sha=live_head)
-                live_base = await self.workspace.resolve_remote_head(
-                    task.repository_url, details.base_ref
-                )
-                if live_base is not None:
-                    details = replace(details, base_sha=live_base)
                 self._record_revision(
                     task_id,
                     state,
@@ -162,12 +157,11 @@ class PRReviewOrchestrator:
                 self._assert_claim(task_id, claim_token, claim_lost)
                 for attempt in range(3):
                     try:
-                        prepared = await self.workspace.prepare(
+                        checkout = await self.workspace.prepare(
                             task_id=task.id,
                             repository_url=task.repository_url,
                             pr_number=task.pr_number,
                             base_ref=details.base_ref,
-                            base_sha=details.base_sha,
                             head_sha=details.head_sha,
                             head_ref=details.head_ref,
                             head_repository_url=details.head_repository_url,
@@ -177,18 +171,20 @@ class PRReviewOrchestrator:
                         if attempt == 2:
                             raise
                         self._assert_claim(task_id, claim_token, claim_lost)
-                        live_base = await self.workspace.resolve_remote_head(
-                            task.repository_url, details.base_ref
-                        )
                         live_head = await self.workspace.resolve_remote_head(
                             details.head_repository_url, details.head_ref
                         )
-                        if live_base is None or live_head is None:
+                        if live_head is None:
                             raise
-                        details = replace(details, base_sha=live_base, head_sha=live_head)
+                        details = replace(details, head_sha=live_head)
                         self._record_revision(
                             task_id, state, claim_token, details.base_sha, details.head_sha
                         )
+                prepared = checkout.path
+                details = replace(details, base_sha=checkout.base_sha)
+                self._record_revision(
+                    task_id, state, claim_token, details.base_sha, details.head_sha,
+                )
                 self._transition(task_id, state, "reviewing", claim_token)
                 state = "reviewing"
                 self._assert_claim(task_id, claim_token, claim_lost)
