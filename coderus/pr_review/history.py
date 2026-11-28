@@ -65,7 +65,8 @@ class PreviousReview:
         if len({item.id for item in items}) != len(items):
             return None
         scope = history.get("scope")
-        return cls(task_id, head_sha, comment_url, result, scope, items)
+        reportable = tuple(item for item in items if item.finding.priority != "P3")
+        return cls(task_id, head_sha, comment_url, result, scope, reportable)
 
     def for_axis(self, axis: ReviewAxis) -> tuple[TrackedFinding, ...]:
         return tuple(item for item in self.open_findings if item.axis == axis)

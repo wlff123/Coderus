@@ -686,6 +686,52 @@ async def test_review_rounds_reuse_and_explicitly_close_prior_findings(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("same_head", [True, False])
+async def test_review_ignores_legacy_p3_history(
+    engine, session: Session, tmp_path: Path, same_head: bool,
+) -> None:
+    original = add_review_task(session)
+    payload = json.loads(REVIEW_JSON)
+    runner = FakeRunner(engine, stdout=json.dumps(payload, ensure_ascii=False))
+    orchestrator, publisher, workspace, *_ = build_orchestrator(engine, tmp_path, runner=runner)
+    await orchestrator.run(original.id)
+    session.expire_all()
+    legacy = json.loads(json.dumps(original.structured_result))
+    legacy["review_history"].pop("lowest_reported_priority")
+    item = legacy["review_history"]["open_findings"][0]
+    item["finding"]["priority"] = legacy["findings"][0]["priority"] = "P3"
+    original.structured_result = legacy
+    session.commit()
+
+    next_head = HEAD_SHA if same_head else "e" * 40
+    publisher.details = replace(publisher.details, head_sha=next_head)
+    workspace.can_followup = True
+    runner.diff_base = COMPARISON_SHA if same_head else HEAD_SHA
+    payload["findings"] = []
+    payload["rechecks"] = []
+    runner.stdout = json.dumps(payload, ensure_ascii=False)
+    followup = PRReviewTask(
+        repository_id=original.repository_id, pr_number=original.pr_number,
+        pr_url=original.pr_url, status="queued", source_chat_id="chat-1",
+        source_message_id="p3-followup", source_sender_open_id="sender-1",
+    )
+    session.add(followup)
+    session.commit()
+    publisher.comment_calls.clear()
+
+    await orchestrator.run(followup.id)
+
+    session.expire_all()
+    assert followup.status == "completed"
+    history = followup.structured_result["review_history"]
+    assert history["mode"] == ("full" if same_head else "followup")
+    assert history["open_findings"] == history["rechecks"] == []
+    assert runner.specs[-1].review_context is None
+    assert "P3" not in publisher.comment_calls[0]["body"]
+    assert publisher.comment_calls[1]["body"].startswith("/lgtm\n")
+
+
+@pytest.mark.asyncio
 async def test_review_input_uses_platform_commits_instead_of_target_sha(
     engine, session: Session, tmp_path: Path,
 ) -> None:
@@ -1148,7 +1194,12 @@ async def test_run_drops_unpublishable_locations_and_completes(
         additions=1,
         deletions=0,
     )
-    orchestrator, publisher, _, _, _, _ = build_orchestrator(engine, tmp_path, workspace=workspace)
+    payload = json.loads(REVIEW_JSON)
+    payload["findings"].append(dict(payload["findings"][0], priority="P3", title="忽略的建议"))
+    runner = FakeRunner(engine, stdout=json.dumps(payload, ensure_ascii=False))
+    orchestrator, publisher, _, _, _, _ = build_orchestrator(
+        engine, tmp_path, workspace=workspace, runner=runner,
+    )
 
     await orchestrator.run(task.id)
 
@@ -1171,11 +1222,12 @@ async def test_run_drops_unpublishable_locations_and_completes(
     assert "1 条意见待人工确认" in publisher.comment_calls[0]["body"]
     pending = persisted.structured_result["unlocated_findings"]
     assert len(pending) == 1
+    assert pending[0]["finding"]["priority"] != "P3"
+    assert "忽略的建议" not in repr(persisted.structured_result) + repr(publisher.comment_calls)
     assert pending[0]["finding"]["title"] == "空值处理缺失"
     assert "没有可定位的修改行" in pending[0]["reason"]
     assert "#L" not in publisher.comment_calls[0]["body"]
     assert "未发现需要反馈的具体问题" not in publisher.comment_calls[0]["body"]
-    assert all(call["body"] != "/lgtm" for call in publisher.comment_calls)
 
 
 @pytest.mark.asyncio
@@ -1212,17 +1264,21 @@ async def test_pending_findings_are_redacted_before_storage_and_publication(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("completed", [True, False])
-async def test_only_a_completed_clean_review_posts_lgtm(
-    engine, session: Session, tmp_path: Path, completed: bool
+@pytest.mark.parametrize("priorities", [(), ("P3", "P3"), ("P3", "P2")])
+async def test_completed_review_with_no_blocking_findings_posts_lgtm(
+    engine, session: Session, tmp_path: Path, completed: bool, priorities: tuple[str, ...]
 ) -> None:
     task = add_review_task(session)
+    payload = json.loads(REVIEW_JSON)
+    finding = payload["findings"][0]
+    payload["review_completed"] = completed
+    payload["findings"] = [
+        dict(finding, priority=priority, line_start=line, line_end=line)
+        for line, priority in enumerate(priorities, start=12)
+    ]
     runner = FakeRunner(
         engine,
-        stdout=json.dumps({
-            "review_completed": completed,
-            "change_summary": ["本次修改完善了检视任务的完成流程。"],
-            "findings": [],
-        }, ensure_ascii=False),
+        stdout=json.dumps(payload, ensure_ascii=False),
     )
     orchestrator, publisher, _, _, _, _ = build_orchestrator(
         engine, tmp_path, runner=runner
@@ -1238,13 +1294,18 @@ async def test_only_a_completed_clean_review_posts_lgtm(
         assert publisher.comment_calls == []
         return
     assert persisted.status == "completed"
-    lgtm_marker = f"<!-- coderus-pr-review-lgtm:{HEAD_SHA} -->"
-    lgtm_calls = [
-        call for call in publisher.comment_calls if str(call["body"]).startswith("/lgtm\n")
+    assert [f["priority"] for f in persisted.structured_result["findings"]] == [
+        priority for priority in priorities if priority != "P3"
     ]
-    assert len(lgtm_calls) == 1
-    assert lgtm_calls[0]["body"] == f"/lgtm\n{lgtm_marker}"
-    assert lgtm_calls[0]["marker"] == lgtm_marker
+    assert "P3" not in repr(persisted.structured_result) + publisher.comment_calls[0]["body"]
+    if "P2" in priorities:
+        assert len(publisher.comment_calls) == 1
+        return
+    assert len(publisher.comment_calls) == 2
+    assert "未发现需要反馈的具体问题" in publisher.comment_calls[0]["body"]
+    lgtm_marker = f"<!-- coderus-pr-review-lgtm:{HEAD_SHA} -->"
+    assert publisher.comment_calls[1]["body"] == f"/lgtm\n{lgtm_marker}"
+    assert publisher.comment_calls[1]["marker"] == lgtm_marker
 
 
 @pytest.mark.asyncio

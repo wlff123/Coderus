@@ -99,6 +99,12 @@ def parse_review_output(
         if not isinstance(entries, list):
             raise ReviewOutputError("历史意见复核格式无效")
         rechecks = [FindingRecheck.model_validate(item) for item in entries]
+        findings = decoded.get("findings")
+        if isinstance(findings, list):
+            decoded["findings"] = [
+                item for item in findings
+                if not (isinstance(item, dict) and item.get("priority") == "P3")
+            ]
         output = ReviewOutput.model_validate(decoded)
     except ValidationError as error:
         raise ReviewOutputError("检视结果格式无效") from error

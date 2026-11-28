@@ -210,6 +210,10 @@ class PRReviewOrchestrator:
                 )
                 matches_scope = (
                     previous is not None and scope is not None and previous.scope == scope
+                    and (
+                        previous.head_sha != details.head_sha
+                        or previous.result["review_history"].get("lowest_reported_priority") == "P2"
+                    )
                 )
                 if matches_scope and previous is not None and previous.head_sha == details.head_sha:
                     await self._revalidate_publication(
@@ -326,6 +330,7 @@ class PRReviewOrchestrator:
                 outstanding = [item for item, check in checked if check.status != "resolved"]
                 structured_result["review_history"] = {
                     "version": REVIEW_HISTORY_VERSION,
+                    "lowest_reported_priority": "P2",
                     "mode": "followup" if previous_head else "full",
                     "scope": scope,
                     "previous_task_id": previous.task_id if previous else None,
@@ -368,7 +373,12 @@ class PRReviewOrchestrator:
                     ),
                     timeout=COMMENT_TIMEOUT_SECONDS,
                 )
-                if not generated_count and not outstanding:
+                can_lgtm = (
+                    not pending_findings
+                    and not output.findings
+                    and all(check.status == "resolved" for _, check in checked)
+                )
+                if can_lgtm:
                     lgtm_marker = (
                         f"<!-- coderus-pr-review-lgtm:{details.head_sha} -->"
                     )
